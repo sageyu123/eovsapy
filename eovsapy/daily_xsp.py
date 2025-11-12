@@ -191,6 +191,9 @@ def allday_udb(t=None, doplot=True, goes_plot=True, savfig=False, savfits=False,
         tdif = out['time'][1:] - out['time'][:-1]
         bad, = np.where(tdif > 120./86400)  # Time gaps > 2 minutes
         pdata[:,bad] = 0
+        ## mask out unreasonably high values
+        bad_high = np.where(pdata>1000)
+        pdata[bad_high] = 0
         vmax = X[int(len(X)*0.85)]  # Clip at 15% of points
         im = ax.pcolormesh(Time(out['time'],format='jd').plot_date,out['fghz'],pdata,vmax=vmax)
         plt.colorbar(im,ax=ax,label='Amplitude [arb. units]')
