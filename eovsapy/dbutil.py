@@ -73,6 +73,7 @@ def get_cursor(host=None, database=None):
             If not None, use the provided one
     '''
     import netrc
+    connected_host = None
     if host is None:
         try:
             import pyodbc
@@ -82,6 +83,7 @@ def get_cursor(host=None, database=None):
                 acct = database
             cnxn = pyodbc.connect("DRIVER={FreeTDS};SERVER="+HOST+",1433; \
                                  DATABASE="+acct+";UID="+username+";PWD="+password+";")
+            connected_host = HOST
         except:
             try:
                 HOST = 'localhost'
@@ -89,6 +91,7 @@ def get_cursor(host=None, database=None):
                 if not (database is None):
                     acct = database
                 cnxn = mysql.connector.connect(user=username, passwd=password, host=HOST, database=acct)
+                connected_host = HOST
             except:
                 try:
                     HOST = 'eovsa-db0.cgb0fabhwkos.us-west-2.rds.amazonaws.com'
@@ -96,6 +99,7 @@ def get_cursor(host=None, database=None):
                     if not (database is None):
                         acct = database
                     cnxn = mysql.connector.connect(user=username, passwd=password, host=HOST, database=acct)
+                    connected_host = HOST
                 except:
                     print('Error: Could not attach to any database')
                     return None, None
@@ -108,6 +112,7 @@ def get_cursor(host=None, database=None):
                 acct = database
             cnxn = pyodbc.connect("DRIVER={FreeTDS};SERVER="+HOST+",1433; \
                                  DATABASE="+acct+";UID="+username+";PWD="+password+";")
+            connected_host = HOST
         except:
             return None, None
     elif host == 'localhost':
@@ -117,6 +122,7 @@ def get_cursor(host=None, database=None):
             if not (database is None):
                 acct = database
             cnxn = mysql.connector.connect(user=username, passwd=password, host=HOST, database=acct)
+            connected_host = HOST
         except:
             return None, None
     elif host == 'amazonaws.com':
@@ -127,8 +133,11 @@ def get_cursor(host=None, database=None):
                 acct = database
             HOST = 'eovsa-db0.cgb0fabhwkos.us-west-2.rds.'+host
             cnxn = mysql.connector.connect(user=username, passwd=password, host=HOST, database=acct)
+            connected_host = HOST
         except:
             return None, None
+    if connected_host:
+        print(f'Connected to database host: {connected_host}')
     return cnxn, cnxn.cursor()
     
 def find_table_version(cursor,timestamp,scan_header=False):
@@ -662,4 +671,3 @@ def plot27mtemps(trange,fld=None,plottitle=None,ignore=None,interval=None,rng=No
         plt.ylim(rng[0], rng[1])
     plt.legend(handles=handles)
     
-
