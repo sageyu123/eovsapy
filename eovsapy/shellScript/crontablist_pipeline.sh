@@ -34,12 +34,18 @@
 # Run the process that creates the daily annotated 1-min resolution cross-power spectrum
 0 9 * * * cd /data1/workdir; /bin/csh /home/user/test_svn/shell_scripts/daily_xsp.csh > /tmp/daily_xsp.log 2>&1
 
+# Run the process that creates a summary of the antenna tracking status every 5 minutes
+# Use flock to prevent multiple instances from running simultaneously
+# Run every 5 minutes between 12:00 and 23:59 UT
+*/5 12-23 * * * /usr/bin/flock -n /tmp/cron_fig_ant_track.lock -c "bash /common/python/eovsapy-src/eovsapy/shellScript/daily_track_plot.sh" >> /tmp/daily_track_plot.log 2>&1
+# Run every 5 minutes between 00:00 and 02:59 UT
+*/5 0-2 * * * /usr/bin/flock -n /tmp/cron_fig_ant_track.lock -c "bash /common/python/eovsapy-src/eovsapy/shellScript/daily_track_plot.sh" >> /tmp/daily_track_plot.log 2>&1
+
 # Run the image pipeline that creates the full-disk images every day
-# 0 8 * * * cd /data1/workdir; /bin/bash /common/python/suncasa/shellScript/pipeline_fdimg.bash
-0 4 * * * cd /data1/workdir; /bin/bash /common/python/eovsapy-src/eovsapy/shellScript/pipeline_fdimg.sh
+0 4 * * * cd /data1/workdir; /bin/bash /common/python/eovsapy-src/eovsapy/shellScript/pipeline_fdimg.sh > /tmp/pipeline_fdimg.log 2>&1
 
 # Run OVSAs spectrogram script every day
-0 13 * * * /bin/bash -c "cd /data1/workdir; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /common/python/suncasa-src/suncasa/utils/ovsas_spectrogram.py"
+0 */6 * * * /bin/bash -c "cd /data1/workdir; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /common/python/suncasa-src/suncasa/utils/ovsa_spectrogram.py" >> /tmp/ovsa_spectrogram.log 2>&1
 
 # Run the process that creates the raw UDBms files
 # 0,30 * * * * touch /data1/eovsa/fits/UDBms/LOG/UDB2MS$(date +%Y%m%d).log;/bin/tcsh /home/user/sjyu/udb2ms.csh >> /data1/eovsa/fits/UDBms/LOG/UDB2MS$(date +%Y%m%d).log 2>&1
@@ -71,3 +77,8 @@
 0 3 * * * touch /nas6/ovro-lwa-data/LOG/beamcopy_$(date +\%Y\%m\%d).log; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /home/user/bchen/daily_lwa_file_transfer.py --beam --ndays 7 >> /nas6/ovro-lwa-data/LOG/beamcopy_$(date +\%Y\%m\%d).log 2>&1
 # Sync LWA calibration tables every day at 3 UT
 0 3 * * * bash /home/user/bchen/lwa_sync_cal.sh
+# Sync spectrum from tmp to database dir
+0 4 * * * rsync -av  /sbdata/lwa-spec-tmp/spec_lv1/ /nas7a/beam/fits_v1/ >> /nas6/ovro-lwa-data/LOG/beamfits_copy_$(date +\%Y\%m\%d).log 2>&1
+
+## run flare detection routine (find_flare4date.py) after each reboot
+@reboot /common/python/current/start_flare_detect.sh

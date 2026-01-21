@@ -1,4 +1,4 @@
-#
+# -*- coding: utf-8 -*-
 # History:
 #  2014-Dec-07  DG
 #    The schedule was dying today due to one of the GEOSAT satellites
@@ -8,7 +8,7 @@
 #
 #  2015-Apr-21  JV
 #    The schedule was crashing due to an error in readtle b/c of a formatting error
-#    in the geosat file online at http://www.celestrak.com/NORAD/elements/geo.txt.
+#    in the geosat file online at http://www.celestrak.org/NORAD/elements/geo.txt.
 #    Added error checking to load_geosats() function so that it prints an error w/o
 #    crashing the schedule.
 #  2015-May-30  DG
@@ -31,6 +31,32 @@
 #      GEO: https://celestrak.org/NORAD/elements/gp.php?GROUP=geo&FORMAT=tle
 #      GPS: https://celestrak.org/NORAD/elements/gp.php?GROUP=gps-ops&FORMAT=tle
 #      O3B: https://celestrak.org/NORAD/elements/gp.php?GROUP=other-comm&FORMAT=tle
+#  2025-Aug-05  DG
+#    TS Kelso limits the number of times one can access the above pages, so now
+#    I write the data to make a disk copy and if later the access fails it just reads
+#    from the disk copy.
+# 2025-Sep-17 SY
+#   Updated handling of geo.txt, gps.txt, and ob3.txt from celestrak.org:
+#     - Check for a recent local copy (<24 hours old) before downloading.
+#       If found, use it; otherwise, fetch a fresh copy.
+#     - Added timeout to urlopen to avoid hanging if the site is unreachable.
+#     - Added unified helper (get_cached_text) for cached fetch with remote refresh fallback.
+#     - Updated all CelesTrak URLs from .com to .org.
+#
+#   Based on CelesTrak FAQ: https://celestrak.org/NORAD/documentation/gp-data-formats.php
+#     - New GP data is updated only once every 2 hours.
+#     - Primary domain switched to https://celestrak.org (since Apr 26, 2021).
+#       Using the old .com domain causes 301 redirects, which automated scripts
+#       may mishandle, leading to repeated requests and possible blocking.
+#     - Excess HTTP errors (301, 403, 404) can trigger IP blocking:
+#         * >100 errors in 2 hours -> temporary block
+#         * >1,000 errors in a day -> firewall block requiring manual review
+#
+#   Note: The original code used .com URLs with no timeout. If Helios’ IP was
+#   blocked by CelesTrak, loading stateframe.py could take several minutes.
+#   Although a cache existed, the logic always tried downloading first, so
+#   caching did not actually prevent repeated requests or avoid blocks.
+
 
 import aipy, ephem, numpy
 from math import cos, sin
@@ -40,6 +66,11 @@ from .eovsa_array import *
 import urllib.request, urllib.error, urllib.parse
 import re
 import os
+import time
+try:
+    from importlib.resources import files as resource_files
+except ImportError:
+    from importlib_resources import files as resource_files
 
 global lat
 lat = 37.233170*numpy.pi/180       # OVSA Latitude (radians)
@@ -67,24 +98,76 @@ class RadioGeosat(aipy.phs.RadioBody, object):
         self.Body.compute(observer)
         aipy.phs.RadioBody.compute(self, observer)
 
+def get_cached_text(url, cache_path, max_age_hours=24.0, timeout=10, err_msg=None):
+    """
+    Return file lines from a local cache if fresh, else download and refresh cache.
+    Uses mtime for freshness. Returns a list of lines (with \n).
+    """
+    # 1) Try fresh cache first
+    try:
+        mtime = os.stat(cache_path).st_mtime
+        if (time.time() - mtime) / 3600.0 <= max_age_hours:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                return f.readlines()
+    except OSError:
+        pass  # cache missing or unreadable
+
+    # 2) Cache stale/missing: try to download
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'eovsapy/1.0'})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read().decode('utf-8')
+        # atomic-ish write
+        tmp = cache_path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fout:
+            fout.write(data)
+        os.replace(tmp, cache_path)
+        return data.splitlines(True)  # keep line breaks
+
+    except urllib.error.HTTPError as e:
+        print('%s: HTTP error %d %s' % (err_msg or 'Download failed', e.code, e.reason))
+    except urllib.error.URLError as e:
+        print('%s: URL error %s' % (err_msg or 'Download failed', e.reason))
+    except Exception as e:
+        print('%s: Other error %s' % (err_msg or 'Download failed', e))
+
+    # 3) Download failed: fall back to whatever cache exists (even if stale)
+    if os.path.exists(cache_path):
+        print('Warning: using stale cache %s' % cache_path)
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            return f.readlines()
+
+    # 4) Nothing available
+    print('Error: no data available for %s and no cache %s' % (url, cache_path))
+    return []
+
 def load_geosats():
     ''' Read the list of geostationary satellites from the Celestrak site and create a list
         of RadioGeosat objects containing all satellites. (List contains 399 sats as of 6/19/14.)
     '''
     # Retrieve TLE file for geostationary satellites from Celestrak site.
-    try:
-        f = urllib.request.urlopen('https://celestrak.org/NORAD/elements/gp.php?GROUP=geo&FORMAT=tle')
-    except urllib.error.URLError as err:
-        print('Error reading GEO satellite web file:', err)
-        return []
-        
-    olines = f.readlines()
-    f.close()
-    # Convert from bytes to strings for Python3
-    olines = [line.decode('UTF-8') for line in olines]
-    lines = []
-    for line in olines:
-        lines.append(line.strip())
+
+    # try:
+    #     f = urllib2.urlopen('https://celestrak.org/NORAD/elements/gp.php?GROUP=geo&FORMAT=tle', timeout=10)
+    #     lines = f.readlines()
+    #     fout = open('geo.txt','w')
+    #     for line in lines:
+    #         fout.write(line)
+    #     fout.close()
+    # except urllib2.URLError as err:
+    #     print 'Error reading GEO satellite web file:', err
+    #     print 'Will read from disk copy geo.txt'
+    #     f = open('geo.txt','r')
+    #     lines = f.readlines()
+    # f.close()
+    lines = get_cached_text(
+        url='https://celestrak.org/NORAD/elements/gp.php?GROUP=geo&FORMAT=tle',
+        cache_path='geo.txt',
+        max_age_hours=24.0,
+        timeout=10,
+        err_msg='Error reading GEO satellite web file. Will read from disk copy geo.txt'
+    )
+
     nlines = len(lines)
     
     # use every 3 lines to create another RadioGeosat object
@@ -108,18 +191,28 @@ def load_gpssats():
         of RadioGeosat objects containing all satellites. (List contains 31 sats as of 2/26/2019.)
     '''
     # Retrieve TLE file for geostationary satellites from Celestrak site.
-    try:
-        f = urllib.request.urlopen('https://celestrak.org/NORAD/elements/gp.php?GROUP=gps-ops&FORMAT=tle')
-    except urllib.error.URLError as err:
-        print('Error reading GPS satellite web file:', err)
-        return []
-    olines = f.readlines()
-    f.close()
-    # Convert from bytes to strings for Python3
-    olines = [line.decode('UTF-8') for line in olines]
-    lines = []
-    for line in olines:
-        lines.append(line.strip())
+    # try:
+    #     f = urllib2.urlopen('https://celestrak.org/NORAD/elements/gp.php?GROUP=gps-ops&FORMAT=tle', timeout=10)
+    #     lines = f.readlines()
+    #     fout = open('gps.txt','w')
+    #     for line in lines:
+    #         fout.write(line)
+    #     fout.close()
+    # except urllib2.URLError as err:
+    #     print('Error reading GPS satellite web file:', err)
+    #     print('Will read from disk copy gps.txt')
+    #     f = open('gps.txt','r')
+    #     lines = f.readlines()
+    #
+    # f.close()
+
+    lines = get_cached_text(
+        url='https://celestrak.org/NORAD/elements/gp.php?GROUP=gps-ops&FORMAT=tle',
+        cache_path='gps.txt',
+        max_age_hours=24.0,
+        timeout=10,
+        err_msg='Error reading GPS satellite web file. Will read from disk copy gps.txt'
+    )
     nlines = len(lines)
     
     # use every 3 lines to create another RadioGeosat object
@@ -142,20 +235,28 @@ def load_o3bsats():
     ''' Read the list of ob3 satellites from the Celestrak site and create a list
         of RadioGeosat objects containing all satellites.  
     '''
-    # Retrieve TLE file for o3b satellites from Celestrak site.
-    try:
-        f = urllib.request.urlopen('https://celestrak.org/NORAD/elements/gp.php?GROUP=other-comm&FORMAT=tle')
-    except urllib.error.URLError as err:
-        print('Error reading ob3 satellite web file:', err)
-        return []
+    # Retrieve TLE file for ob3 satellites from Celestrak site.
+    # try:
+    #     f = urllib2.urlopen('https://celestrak.org/NORAD/elements/gp.php?GROUP=other-comm&FORMAT=tle', timeout=10)
+    #     lines = f.readlines()
+    #     fout = open('ob3.txt','w')
+    #     for line in lines:
+    #         fout.write(line)
+    #     fout.close()
+    # except urllib2.URLError as err:
+    #     print('Error reading ob3 satellite web file:', err)
+    #     print('Will read from disk copy ob3.txt')
+    #     f = open('ob3.txt','r')
+    #     lines = f.readlines()
+    # f.close()
 
-    olines = f.readlines()
-    f.close()
-    # Convert from bytes to strings for Python3
-    olines = [line.decode('UTF-8') for line in olines]
-    lines = []
-    for line in olines:
-        lines.append(line.strip())
+    lines = get_cached_text(
+        url='https://celestrak.org/NORAD/elements/gp.php?GROUP=other-comm&FORMAT=tle',
+        cache_path='ob3.txt',
+        max_age_hours=24.0,
+        timeout=10,
+        err_msg='Error reading ob3 satellite web file. Will read from disk copy ob3.txt'
+    )
     nlines = len(lines)
     
     # use every 3 lines to create another RadioGeosat object
@@ -198,7 +299,7 @@ def load_VLAcals():
     return srclist
 
 def load_sidereal_cats():
-    ''' Read all files in directory SourceCat with extension .srclist
+    ''' Read all files in directory Dropbox/PythonCode/Current/SourceCat with extension .srclist
         and for each line make a RadioFixedBody object and return a list of these objects.
         
         The SourceCat files should have name, RA (h:m:s), dec (d:m:s) in the first 3 columns,
@@ -206,9 +307,8 @@ def load_sidereal_cats():
     '''
     # both \r and \n can be used in files to mark new lines and sometimes both
     # so split lines based on either and don't split twice if there is more than one in a row
-    from importlib_resources import files
     from glob import glob
-    filenames = glob(str(files('eovsapy').joinpath('SourceCat/'))+'/*.srclist')
+    filenames = glob(str(resource_files('eovsapy').joinpath('SourceCat/'))+'/*.srclist')
     lines = []
     for filen in filenames:
         f = open(filen)

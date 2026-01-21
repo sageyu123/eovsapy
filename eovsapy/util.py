@@ -1382,10 +1382,9 @@ def lin_phase_fit(f, pha, doplot=False):
         return np.array((0, 0, np.pi))
     f_ = f[good]
     pha_ = pha[good]
-    for i in range(len(f_) - 1):
-        dpdf.append((pha_[i + 1] - pha_[i]) / (f_[i + 1] - f_[i]))
-    dpdf = np.array(dpdf)
-    slp = np.median(dpdf)
+    df = np.diff(f_)
+    dpdf = np.divide(np.diff(pha_), df, out=np.full(df.shape, np.nan), where=df != 0)
+    slp = np.nanmedian(dpdf)
     p = np.polyfit(f_, np.unwrap((pha_ - f_ * slp)), 1)
     p[0] = p[0] + slp
     stdev = np.std(lobe(pha_ - np.polyval(p, f_)))
@@ -1566,9 +1565,15 @@ def azel_from_sqldict(sqldict, antlist=None):
         antlist = list(range(nant))
 
     az1 = copy.deepcopy(sqldict['Ante_Cont_Azimuth1'].astype('float'))/10000.
-    az_corr = copy.deepcopy(sqldict['Ante_Cont_AzimuthPositionCorre'].astype('float'))/10000.
+    try:
+        az_corr = copy.deepcopy(sqldict['Ante_Cont_AzimuthPositionCorre'].astype('float'))/10000.
+    except:
+        az_corr = copy.deepcopy(sqldict['Ante_Cont_AzimuthPositionCorrected'].astype('float'))/10000.
     el1 = copy.deepcopy(sqldict['Ante_Cont_Elevation1'].astype('float'))/10000.
-    el_corr = copy.deepcopy(sqldict['Ante_Cont_ElevationPositionCor'].astype('float'))/10000.
+    try:
+        el_corr = copy.deepcopy(sqldict['Ante_Cont_ElevationPositionCor'].astype('float'))/10000.
+    except:
+        el_corr = copy.deepcopy(sqldict['Ante_Cont_ElevationPositionCorrected'].astype('float'))/10000.
     az_req = copy.deepcopy(sqldict['Ante_Cont_AzimuthPosition'].astype('float'))/10000.
     el_req = copy.deepcopy(sqldict['Ante_Cont_ElevationPosition'].astype('float'))/10000.
     # Use alternate source of requested positions where RunMode is 4

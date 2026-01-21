@@ -687,9 +687,13 @@ def udb_corr(filelist, outpath='./', calibrate=False, new=True, gctime=None, att
             t1 = time.time()
         else:
             cout = out
-        # Correct data for differential feed rotation
-        coutu = unrot(cout, azeldict)
-        print('Applying feed rotation correction took', time.time() - t1, 's')
+        if trange[0] < Time('2025-07-15'):
+            # Correct data for differential feed rotation
+            coutu = unrot(cout, azeldict)
+            print('Applying feed rotation correction took', time.time() - t1, 's')
+        else:
+            print('New Az-El antennas installed.  No feed rotation correction needed.')
+            coutu = cout
         sys.stdout.flush()
         # Optionally apply calibration to convert to solar flux units
         if calibrate:
