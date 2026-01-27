@@ -45,7 +45,7 @@
 0 4 * * * cd /data1/workdir; /bin/bash /common/python/eovsapy-src/eovsapy/shellScript/pipeline_fdimg.sh > /tmp/pipeline_fdimg.log 2>&1
 
 # Run OVSAs spectrogram script every day
-0 */6 * * * /bin/bash -c "cd /data1/workdir; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /common/python/suncasa-src/suncasa/utils/ovsa_spectrogram.py" >> /tmp/ovsa_spectrogram.log 2>&1
+0 */6 * * * /bin/bash -c "cd /data1/workdir; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /common/python/suncasa-src/suncasa/utils/ovsa_spectrogram.py" > /tmp/ovsa_spectrogram.log 2>&1
 
 # Run the process that creates the raw UDBms files
 # 0,30 * * * * touch /data1/eovsa/fits/UDBms/LOG/UDB2MS$(date +%Y%m%d).log;/bin/tcsh /home/user/sjyu/udb2ms.csh >> /data1/eovsa/fits/UDBms/LOG/UDB2MS$(date +%Y%m%d).log 2>&1
@@ -63,22 +63,31 @@
 #should quit at 0300 the following day
 0 13 * * * cd /data1/workdir; /home/user/jimm/python3/flaretest_move_script.py > /tmp/flaretest_move_script.log 2>&1
 
+# Archive webplots older than 7 days every day at 6 UT
+0 6 * * * /bin/bash /common/python/eovsapy-src/eovsapy/shellScript/archive_webplots.sh --days 7 > /tmp/archive_webplots.log 2>&1
+
 ## OVRO-LWA scripts go below this line:
 
 #* * * * * cd /nas5/ovro-lwa-data; touch LOG/beamcopy_$(date +\%Y\%m\%d).log; beam/software/auto_beamcopy.sh >> LOG/beamcopy_$(date +\%Y\%m\%d).log 2>&1
 # Sync LWA quicklook plots at 1-min cadence for the day
 #* * * * * touch /nas6/ovro-lwa-data/LOG/plotscopy_$(date +\%Y\%m\%d).log; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /home/user/bchen/daily_lwa_file_transfer.py --plots --ndays 2 >> /nas6/ovro-lwa-data/LOG/plotscopy_$(date +\%Y\%m\%d).log 2>&1
-* * * * * touch /nas6/ovro-lwa-data/LOG/plotscopy_$(date +\%Y\%m\%d).log; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /home/user/bchen/daily_lwa_file_transfer.py --plots --ndays 2 >> /nas6/ovro-lwa-data/LOG/plotscopy_$(date +\%Y\%m\%d).log 2>&1
+* * * * * touch /nas6/ovro-lwa-data/LOG/plotscopy_$(date +\%Y\%m\%d).log; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /home/user/lwa-op/daily_lwa_file_transfer.py --plots --ndays 2 >> /nas6/ovro-lwa-data/LOG/plotscopy_$(date +\%Y\%m\%d).log 2>&1
 # Sync LWA quicklook plots every day at 3 UT for the past 7 days
-0 3 * * * touch /nas6/ovro-lwa-data/LOG/hdfcopy_$(date +\%Y\%m\%d).log; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /home/user/bchen/daily_lwa_file_transfer.py --plots --ndays 7 >> /nas6/ovro-lwa-data/LOG/hdfcopy_$(date +\%Y\%m\%d).log 2>&1
+0 3 * * * touch /nas6/ovro-lwa-data/LOG/hdfcopy_$(date +\%Y\%m\%d).log; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /home/user/lwa-op/daily_lwa_file_transfer.py --plots --ndays 7 >> /nas6/ovro-lwa-data/LOG/hdfcopy_$(date +\%Y\%m\%d).log 2>&1
 # Sync LWA hdf files every day at 3 UT for the past 7 days
-0 3 * * * touch /nas6/ovro-lwa-data/LOG/hdfcopy_$(date +\%Y\%m\%d).log; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /home/user/bchen/daily_lwa_file_transfer.py --hdf --ndays 7 >> /nas6/ovro-lwa-data/LOG/hdfcopy_$(date +\%Y\%m\%d).log 2>&1
+0 3 * * * touch /nas6/ovro-lwa-data/LOG/hdfcopy_$(date +\%Y\%m\%d).log; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /home/user/lwa-op/daily_lwa_file_transfer.py --hdf --ndays 7 >> /nas6/ovro-lwa-data/LOG/hdfcopy_$(date +\%Y\%m\%d).log 2>&1
 # Sync LWA beamforming data every day at 3 UT for the past 7 days
-0 3 * * * touch /nas6/ovro-lwa-data/LOG/beamcopy_$(date +\%Y\%m\%d).log; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /home/user/bchen/daily_lwa_file_transfer.py --beam --ndays 7 >> /nas6/ovro-lwa-data/LOG/beamcopy_$(date +\%Y\%m\%d).log 2>&1
+0 3 * * * touch /nas6/ovro-lwa-data/LOG/beamcopy_$(date +\%Y\%m\%d).log; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /home/user/lwa-op/daily_lwa_file_transfer.py --beam --ndays 7 >> /nas6/ovro-lwa-data/LOG/beamcopy_$(date +\%Y\%m\%d).log 2>&1
 # Sync LWA calibration tables every day at 3 UT
 0 3 * * * bash /home/user/bchen/lwa_sync_cal.sh
 # Sync spectrum from tmp to database dir
 0 4 * * * rsync -av  /sbdata/lwa-spec-tmp/spec_lv1/ /nas7a/beam/fits_v1/ >> /nas6/ovro-lwa-data/LOG/beamfits_copy_$(date +\%Y\%m\%d).log 2>&1
+# Make LWA slow image file number plot every 10 minutes
+2,12,22,32,42,52 * * * * rsync -av solarpipe@lwacalim07:/opt/devel/solarpipe/operation/lwa_hourly_image_counts_db.fch.csv /home/user/lwa-op/
+5,15,25,35,45,55 * * * * cd /home/user/lwa-op/; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /home/user/lwa-op/lwa_count_daily_images.py --doplot
+# * * * * * source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /home/user/lwa-op/lwa_count_daily_images.py --doplot >> /home/user/lwa-op/LOG/lwa_number_plot_$(date +\%Y\%m\%d).log 2>&1
+# Update LWA slow viz hdf level 1 daily image file number counts every day
+0 10 * * * cd /home/user/lwa-op/; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /home/user/lwa-op/lwa_count_daily_images.py --scandays --ndays 3
 
 ## run flare detection routine (find_flare4date.py) after each reboot
 @reboot /common/python/current/start_flare_detect.sh
