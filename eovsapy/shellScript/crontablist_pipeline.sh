@@ -41,6 +41,10 @@
 # Run every 5 minutes between 00:00 and 02:59 UT
 */5 0-2 * * * /usr/bin/flock -n /tmp/cron_fig_ant_track.lock -c "bash /common/python/eovsapy-src/eovsapy/shellScript/daily_track_plot.sh" >> /tmp/daily_track_plot.log 2>&1
 
+# Run the SOLPNTCAL system-gain inspection plots after the expected 18:30 and 21:30 UT scans
+# (about 20 minutes later, at 18:50 and 21:50 UT)
+50 18,21 * * * /usr/bin/flock -n /tmp/cron_fig_sys_gain.lock -c "bash /common/python/eovsapy-src/eovsapy/shellScript/sys_gain_inspect_plot.sh" >> /tmp/sys_gain_inspect_plot.log 2>&1
+
 # Run the image pipeline that creates the full-disk images every day
 0 4 * * * cd /data1/workdir; /bin/bash /common/python/eovsapy-src/eovsapy/shellScript/pipeline_fdimg.sh > /tmp/pipeline_fdimg.log 2>&1
 

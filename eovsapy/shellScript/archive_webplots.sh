@@ -18,6 +18,9 @@ Default behavior (matches pipeline webplot conventions):
   3) /common/webplots/phasecal/*.{npz,png} (maxdepth 1)
      -> /common/webplots/phasecal/YYYY/YYYYMMDD/
 
+  4) /common/webplots/solpntcal/sys_gain_*20*.jpg (maxdepth 1)
+     -> /common/webplots/solpntcal/YYYY/
+
 Options:
   --days N     Age threshold in days (default: 31). Uses find -mtime +N.
   --dry-run    Print planned moves without executing.
@@ -27,7 +30,7 @@ Options:
 Notes:
   - Only files in the top-level of each source directory are considered (maxdepth 1).
   - A date (YYYYMMDD) is extracted from the filename; files without a date are skipped.
-  - Override locations with env vars: ANT_TRACK_SRC, ANT_TRACK_DEST, FLAREMON_SRC, FLAREMON_DEST, PHASECAL_ROOT.
+  - Override locations with env vars: ANT_TRACK_SRC, ANT_TRACK_DEST, FLAREMON_SRC, FLAREMON_DEST, PHASECAL_ROOT, SOLPNTCAL_ROOT.
 EOF
 }
 
@@ -165,6 +168,7 @@ ANT_TRACK_DEST="${ANT_TRACK_DEST:-/common/webplots/ant_track}"
 FLAREMON_SRC="${FLAREMON_SRC:-/common/webplots/flaremon}"
 FLAREMON_DEST="${FLAREMON_DEST:-/common/webplots/flaremon}"
 PHASECAL_ROOT="${PHASECAL_ROOT:-/common/webplots/phasecal}"
+SOLPNTCAL_ROOT="${SOLPNTCAL_ROOT:-/common/webplots/solpntcal}"
 
 move_older_than_days \
   "ant_track jpg -> ant_track/YYYY" \
@@ -186,3 +190,10 @@ move_older_than_days \
   "$PHASECAL_ROOT" \
   "year_day" \
   -name '*.npz' -o -name 'pc*.png'
+
+move_older_than_days \
+  "solpntcal jpg -> solpntcal/YYYY" \
+  "$SOLPNTCAL_ROOT" \
+  "$SOLPNTCAL_ROOT" \
+  "year" \
+  -name 'sys_gain_*20*.jpg'
