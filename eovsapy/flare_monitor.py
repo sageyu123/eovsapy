@@ -104,8 +104,9 @@
 #      when calibration is available (without creating FITS files). Falls back
 #      to cross-correlation amplitude plot when calibration path fails.
 
+import functools
 import numpy as np
-from eovsapy.util import Time, get_idbdir
+from eovsapy.util import Time, get_idbdir, nearest_val_idx, bl2ord
 
 
 def RT_flare_monitor():
@@ -392,35 +393,67 @@ def read_idb_calibrated(files, t):
         return {}, False
 
 
-def _tp_sfu_spectrogram(out):
-    ''' Build TP spectrogram (nf x nt) in SFU from calibrated read_idb output.
+def _build_monitor_spectrogram(out, data_key='p'):
+    '''Build TP or XP monitor spectrogram (nf x nt) from read_idb output.
 
-        Follows the antenna-selection strategy in pipeline_cal.allday_process(),
-        but does not write FITS files.
+    For data_key == 'p', uses TP antenna-selection strategy from
+    pipeline_cal.allday_process().
+
+    For data_key == 'x', returns the mean cross-correlation dynamic
+    spectrum from selected short baselines/polarizations.
     '''
-    from eovsapy import pipeline_cal as pc
-    from eovsapy.util import nearest_val_idx
-
-    pdat = np.array(out['p'], copy=True)
-    nant, npol, nf, nt = pdat.shape
-    if nt == 0 or nf == 0:
+    if data_key not in ('p', 'x'):
         return None
 
     if out['time'][0] < Time('2025-05-22').jd:
         nsolant = 13
     else:
         nsolant = 15
+    if 'p' in out and out['p'] is not None:
+        nsolant = min(nsolant, out['p'].shape[0])
+
+    tidx = None
+    tracking = None
+    try:
+        tidx, tracking = _get_tracking_mask(out, nsolant)
+    except Exception as err:
+        print('Warning: tracking mask unavailable for monitor plot: {0}'.format(err))
+
+    if data_key == 'x':
+        data = out.get('x')
+        if data is None:
+            return None
+        # Match pipeline_cal.allday_process() XP definition for consistency.
+        baseidx = np.array([29, 30, 31, 32, 33, 34, 42, 43, 44, 45, 46,
+                            54, 55, 56, 57, 65, 66, 67, 75, 76, 84], dtype=int)
+        nbl = data.shape[0]
+        keep = baseidx[baseidx < nbl]
+        if len(keep) == 0:
+            return None
+        xdat = np.array(data[keep], copy=True)
+        # Drop XP baselines with any untracking antenna.
+        if tracking is not None:
+            bmap = {int(k): i for i, k in enumerate(keep)}
+            for i in range(nsolant):
+                for j in range(i, nsolant):
+                    k = int(bl2ord[i, j])
+                    if k in bmap:
+                        good = np.logical_and(tracking[i, tidx], tracking[j, tidx])
+                        xdat[bmap[k], :, :, np.logical_not(good)] = np.nan
+        return np.abs(np.nansum(np.nansum(xdat, 0), 0))
+    
+
+    pdat = np.array(out['p'], copy=True)
+    nant, npol, nf, nt = pdat.shape
+    if nt == 0 or nf == 0:
+        return None
+
     nsolant = min(nsolant, nant)
 
     # Use only data from tracking antennas, as in allday_process().
-    try:
-        azeldict = pc.get_sql_info(Time(out['time'], format='jd')[[0, -1]])
-        tidx = nearest_val_idx(out['time'], azeldict['Time'].jd)
-        tracking = azeldict['TrackFlag'].T
+    if tracking is not None:
         for i in range(nsolant):
             pdat[i, :, :, np.logical_not(tracking[i, tidx])] = np.nan
-    except Exception as err:
-        print('Warning: tracking mask unavailable for TP SFU plot: {0}'.format(err))
 
     med = np.nanmean(np.nanmedian(pdat[:nsolant], 3), 1)  # nant, nf
     medspec = np.nanmedian(med, 0)  # nf
@@ -436,11 +469,20 @@ def _tp_sfu_spectrogram(out):
         except Exception as err:
             print('Warning: best-antenna selection failed for TP SFU plot: {0}'.format(err))
 
-    # Final median total-power dynamic spectrum in SFU.
+    # Final median total-power dynamic spectrum.
     return np.nanmean(np.nanmedian(pdat[best], 0), 0)
 
 
-def _get_xsp_cache_file(t, files):
+def _get_tracking_mask(out, nsolant):
+    '''Return tracking mask inputs (tidx, tracking) for monitor products.'''
+    from eovsapy import pipeline_cal as pc
+    azeldict = pc.get_sql_info(Time(out['time'], format='jd')[[0, -1]])
+    tidx = nearest_val_idx(out['time'], azeldict['Time'].jd)
+    tracking = azeldict['TrackFlag'].T
+    return tidx, tracking[:nsolant]
+
+
+def _get_xsp_cache_file(t, files, cache_mode='auto'):
     '''Return per-day cache file path for XSP spectrogram products.'''
     import os
 
@@ -454,7 +496,7 @@ def _get_xsp_cache_file(t, files):
     cache_dir = '/tmp/flaremon_cache'
     if not os.path.isdir(cache_dir):
         os.makedirs(cache_dir)
-    return os.path.join(cache_dir, 'XSP_cache_' + datstr + '.npz')
+    return os.path.join(cache_dir, 'XSP_cache_' + datstr + '_' + str(cache_mode) + '.npz')
 
 
 def _load_xsp_cache(cache_file):
@@ -465,9 +507,16 @@ def _load_xsp_cache(cache_file):
         return None
     try:
         with np.load(cache_file, allow_pickle=False) as npz:
-            required = ['scanid', 'mode', 'files', 'fghz', 'times_jd', 'pdata']
+            required = ['scanid', 'mode', 'files', 'fghz', 'times_jd']
             for key in required:
                 if key not in npz:
+                    return None
+            spec_key = 'spec'
+            if spec_key not in npz:
+                # Backward compatibility for old cache files.
+                if 'pdata' in npz:
+                    spec_key = 'pdata'
+                else:
                     return None
             out = {
                 'scanid': str(npz['scanid'].tolist()),
@@ -475,13 +524,16 @@ def _load_xsp_cache(cache_file):
                 'files': [str(f) for f in npz['files'].tolist()],
                 'fghz': np.asarray(npz['fghz'], dtype=float),
                 'times_jd': np.asarray(npz['times_jd'], dtype=float),
-                'pdata': np.asarray(npz['pdata'], dtype=float),
+                'spec': np.asarray(npz[spec_key], dtype=float),
+                'units': str(npz['units'].tolist()) if 'units' in npz else None,
             }
-            if out['pdata'].ndim != 2:
+            if out['units'] is None:
+                out['units'] = 'sfu' if out['mode'] == 'tp' else 'arb'
+            if out['spec'].ndim != 2:
                 return None
-            if out['pdata'].shape[0] != len(out['fghz']):
+            if out['spec'].shape[0] != len(out['fghz']):
                 return None
-            if out['pdata'].shape[1] != len(out['times_jd']):
+            if out['spec'].shape[1] != len(out['times_jd']):
                 return None
             return out
     except Exception as err:
@@ -489,7 +541,7 @@ def _load_xsp_cache(cache_file):
         return None
 
 
-def _save_xsp_cache(cache_file, scanid, mode, files, fghz, times_jd, pdata):
+def _save_xsp_cache(cache_file, scanid, mode, files, fghz, times_jd, spec, units):
     '''Save spectrogram payload cache to npz.'''
     np.savez_compressed(
         cache_file,
@@ -498,39 +550,63 @@ def _save_xsp_cache(cache_file, scanid, mode, files, fghz, times_jd, pdata):
         files=np.asarray(files),
         fghz=np.asarray(fghz, dtype=float),
         times_jd=np.asarray(times_jd, dtype=float),
-        pdata=np.asarray(pdata, dtype=float),
+        spec=np.asarray(spec, dtype=float),
+        units=np.asarray(units),
     )
 
 
-def _spectrogram_from_out(out, cal_ok, scanid):
+def _spectrogram_from_out(out, cal_ok, scanid, preferred_mode='auto'):
     '''Convert read_idb output to a plottable spectrogram payload.'''
-    mode = 'xdata'
-    pdata = None
-    if cal_ok:
-        pdata = _tp_sfu_spectrogram(out)
-        if pdata is not None:
-            print('Successfully created TP spectrogram for scan ID {0}'.format(scanid))
+    mode = None
+    spec = None
+    units = 'sfu' if cal_ok else 'arb'
+    if preferred_mode == 'xp':
+        spec = _build_monitor_spectrogram(out, data_key='x')
+        if spec is None:
+            return None, None, None, None, None
+        mode = 'xp'
+    else:
+        spec = _build_monitor_spectrogram(out, data_key='p')
+        if spec is not None:
             mode = 'tp'
-    if mode != 'tp':
-        data = out['x']
-        pdata = np.nansum(np.nansum(np.abs(data[0:11, :]), 1), 0)
-    return mode, np.asarray(out['fghz'], dtype=float), np.asarray(out['time'], dtype=float), np.asarray(pdata, dtype=float)
+            if cal_ok:
+                print('Successfully created TP spectrogram for scan ID {0}'.format(scanid))
+        if mode is None:
+            spec = _build_monitor_spectrogram(out, data_key='x')
+            if spec is None:
+                return None, None, None, None, None
+            mode = 'xp'
+    return mode, np.asarray(out['fghz'], dtype=float), np.asarray(out['time'], dtype=float), np.asarray(spec, dtype=float), units
 
 
-def _merge_spectrogram_payload(fghz, old_times, old_pdata, new_times, new_pdata):
+def _merge_spectrogram_payload(fghz, old_times, old_spec, new_times, new_spec):
     '''Append and de-duplicate spectrogram time samples.'''
     times = np.concatenate((old_times, new_times))
-    pdata = np.concatenate((old_pdata, new_pdata), 1)
+    spec = np.concatenate((old_spec, new_spec), 1)
     order = np.argsort(times)
     times = times[order]
-    pdata = pdata[:, order]
+    spec = spec[:, order]
     key = np.round(times * 86400.).astype(np.int64)
     _, idx = np.unique(key, return_index=True)
     keep = np.sort(idx)
-    return fghz, times[keep], pdata[:, keep]
+    return fghz, times[keep], spec[:, keep]
 
 
-def xdata_display(t, ax=None):
+def timestamp_decor(func):
+    '''Log start/end timestamps for a function call.'''
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        t0 = Time.now()
+        print('[{0}] START {1}'.format(t0.iso[:19], func.__name__))
+        out = func(*args, **kwargs)
+        t1 = Time.now()
+        print('[{0}] END   {1}'.format(t1.iso[:19], func.__name__))
+        return out
+    return wrapper
+
+
+@timestamp_decor
+def xdata_display(t, ax=None, preferred_mode='auto'):
     ''' Given the time as a Time object, search the FDB file for files
         associated with the scan for that time and create a dynamic spectrogram
         on the axis specified by ax, or on a new plot if no ax. If the requested
@@ -544,6 +620,8 @@ def xdata_display(t, ax=None):
     # import get_X_data2 as gd
     from eovsapy import spectrogram_fit as sp
     import astropy.units as u
+
+    print('xdata_display requested mode:', preferred_mode)
 
     utc2pst = -8 * u.hour  # The difference between UTC and pst time. The diff between pst and pdt does not matter here.
     t_pst = t + utc2pst
@@ -614,12 +692,13 @@ def xdata_display(t, ax=None):
                     return scan, tlevel, bflag, times
             else:
                 files = [os.path.join(path, file) for file in filelist]
-            cache_file = _get_xsp_cache_file(t, files)
+            cache_file = _get_xsp_cache_file(t, files, cache_mode=preferred_mode)
             cache = _load_xsp_cache(cache_file)
             mode = None
             fghz = None
             times_jd = None
-            pdata = None
+            spec = None
+            units = None
 
             if cache is not None and cache['scanid'] == str(scan):
                 cached_files = cache['files']
@@ -632,7 +711,8 @@ def xdata_display(t, ax=None):
                     mode = cache['mode']
                     fghz = cache['fghz']
                     times_jd = cache['times_jd']
-                    pdata = cache['pdata']
+                    spec = cache['spec']
+                    units = cache.get('units', 'arb')
                 else:
                     print('Cache hit for scan {0}: {1} files reused from cache, {2} new files to process.'.format(
                         scan, len(cached_files), len(new_files)
@@ -642,26 +722,39 @@ def xdata_display(t, ax=None):
                     print('New files: {0}'.format([os.path.basename(f) for f in new_files]))
                     out_new, cal_ok_new = read_idb_calibrated(new_files, t)
                     if out_new:
-                        mode_new, fghz_new, times_jd_new, pdata_new = _spectrogram_from_out(out_new, cal_ok_new, scan)
-                        same_mode = (mode_new == cache['mode'])
-                        same_fghz = len(fghz_new) == len(cache['fghz']) and (
-                            len(fghz_new) == 0 or np.nanmax(np.abs(fghz_new - cache['fghz'])) < 1e-6
+                        mode_new, fghz_new, times_jd_new, spec_new, units_new = _spectrogram_from_out(
+                            out_new, cal_ok_new, scan, preferred_mode=preferred_mode
                         )
-                        if same_mode and same_fghz:
-                            fghz, times_jd, pdata = _merge_spectrogram_payload(
-                                cache['fghz'], cache['times_jd'], cache['pdata'], times_jd_new, pdata_new
+                        if mode_new is not None:
+                            same_mode = (mode_new == cache['mode'])
+                            same_units = (units_new == cache.get('units', 'arb'))
+                            same_fghz = len(fghz_new) == len(cache['fghz']) and (
+                                len(fghz_new) == 0 or np.nanmax(np.abs(fghz_new - cache['fghz'])) < 1e-6
                             )
-                            mode = mode_new
-                            _save_xsp_cache(cache_file, scan, mode, files, fghz, times_jd, pdata)
-                            print('Updated XSP cache with new files.')
+                            if same_mode and same_fghz and same_units:
+                                fghz, times_jd, spec = _merge_spectrogram_payload(
+                                    cache['fghz'], cache['times_jd'], cache['spec'], times_jd_new, spec_new
+                                )
+                                mode = mode_new
+                                units = units_new
+                                _save_xsp_cache(cache_file, scan, mode, files, fghz, times_jd, spec, units)
+                                print('Updated XSP cache with new files.')
+                            else:
+                                print('Cache payload incompatible with new data. Rebuilding from full file list.')
                         else:
-                            print('Cache payload incompatible with new data. Rebuilding from full file list.')
+                            print('No spectrogram payload returned for new files.')
+                            mode = cache['mode']
+                            fghz = cache['fghz']
+                            times_jd = cache['times_jd']
+                            spec = cache['spec']
+                            units = cache.get('units', 'arb')
                     else:
                         print('No payload returned for new files. Reusing existing cache.')
                         mode = cache['mode']
                         fghz = cache['fghz']
                         times_jd = cache['times_jd']
-                        pdata = cache['pdata']
+                        spec = cache['spec']
+                        units = cache.get('units', 'arb')
             elif cache is not None:
                 print('Cache exists but scan mismatch. Cache scan: {0}, requested scan: {1}. Rebuilding from files.'.format(
                     cache['scanid'], scan
@@ -677,11 +770,19 @@ def xdata_display(t, ax=None):
                     return scan, tlevel, bflag, times
                 print('Files read at', Time.now())
                 print(files)
-                mode, fghz, times_jd, pdata = _spectrogram_from_out(out, cal_ok, scan)
-                _save_xsp_cache(cache_file, scan, mode, files, fghz, times_jd, pdata)
+                mode, fghz, times_jd, spec, units = _spectrogram_from_out(
+                    out, cal_ok, scan, preferred_mode=preferred_mode
+                )
+                if mode is None:
+                    print('No spectrogram payload returned for scan ID {0}'.format(scan))
+                    scan = None
+                    times = None
+                    return scan, tlevel, bflag, times
+                _save_xsp_cache(cache_file, scan, mode, files, fghz, times_jd, spec, units)
                 print('Wrote XSP cache to {0}'.format(cache_file))
 
             times = Time(times_jd, format='jd')
+            print('Flare monitor resolved mode: {0} ({1})'.format(mode, units))
             if ax is not None:
                 datstr = times[0].iso[:10]
                 ax.set_xlabel('Time [UT on ' + datstr + ']')
@@ -690,16 +791,18 @@ def xdata_display(t, ax=None):
             if mode == 'tp':
                 if ax is not None:
                     ax.set_title('EOVSA Total Power for ' + datstr)
-                finite = pdata[np.isfinite(pdata)]
+                finite = spec[np.isfinite(spec)]
                 finite = finite[np.where(finite > 0.0)]
                 dmin = 1.0
                 dmax = None
                 if len(finite) > 0:
                     dmin = max(1.0, np.nanpercentile(finite, 5))
                     dmax = np.nanpercentile(finite, 95)
-                sp.plot_spectrogram(fghz, times, pdata,
-                                    ax=ax, logsample=None, cbar=True, dmin=dmin, dmax=dmax)
-                if ax is not None:
+                cbar_label = 'Flux Density [sfu]' if units == 'sfu' else 'Amplitude [arb. units]'
+                sp.plot_spectrogram(fghz, times, spec,
+                                    ax=ax, logsample=None, cbar=True, dmin=dmin, dmax=dmax,
+                                    cbar_label=cbar_label)
+                if ax is not None and units == 'sfu':
                     ax.text(
                         0.01, 0.98,
                         'TP calibration from previous day. Not for science use.',
@@ -709,13 +812,18 @@ def xdata_display(t, ax=None):
                     )
             else:
                 if ax is not None:
-                    ax.set_title('EOVSA Summed Cross-Correlation Amplitude for ' + datstr)
-                finite = pdata[np.isfinite(pdata)]
+                    if units == 'sfu':
+                        ax.set_title('EOVSA Mean Cross-Correlation Flux for ' + datstr)
+                    else:
+                        ax.set_title('EOVSA Mean Cross-Correlation Amplitude for ' + datstr)
+                finite = spec[np.isfinite(spec)]
                 dmax = None
                 if len(finite) > 0:
                     dmax = np.nanpercentile(finite, 95)
-                sp.plot_spectrogram(fghz, times, pdata,
-                                    ax=ax, logsample=None, xdata=True, cbar=True, dmax=dmax)
+                cbar_label = 'Flux Density [sfu]' if units == 'sfu' else 'Amplitude [arb. units]'
+                sp.plot_spectrogram(fghz, times, spec,
+                                    ax=ax, logsample=None, xdata=True, cbar=True, dmax=dmax,
+                                    cbar_label=cbar_label)
             # tlevel, bflag = flaremeter(data)
         else:
             print('Time', dt.sec, 'is > 1200 s after last file of last NormalObserving scan.  No plot created.')
@@ -849,6 +957,7 @@ if __name__ == "__main__":
           python /common/python/eovsapy-src/eovsapy/flare_monitor.py
           python /common/python/eovsapy-src/eovsapy/flare_monitor.py --timestamp "2026-02-19 20:10:00"
           python /common/python/eovsapy-src/eovsapy/flare_monitor.py --timestamp "2026-02-19T20:10:00" --skip-xsp
+          python /common/python/eovsapy-src/eovsapy/flare_monitor.py --xdata
           python /common/python/eovsapy-src/eovsapy/flare_monitor.py --rt
     '''
     import argparse
@@ -866,6 +975,7 @@ if __name__ == "__main__":
             '  python flare_monitor.py\n'
             '  python flare_monitor.py --timestamp "2026-02-19 20:10:00"\n'
             '  python flare_monitor.py --timestamp "2026-02-19T20:10:00" --skip-xsp\n'
+            '  python flare_monitor.py --xdata\n'
             '  python flare_monitor.py --rt'
         )
     )
@@ -876,6 +986,10 @@ if __name__ == "__main__":
     parser.add_argument(
         '--skip-xsp', action='store_true',
         help='Skip generating XSP20*.png.'
+    )
+    parser.add_argument(
+        '--xdata', action='store_true',
+        help='Force mean cross-power (XP) mode; uses shared calibration state (SFU if available, otherwise arb. units).'
     )
     parser.add_argument(
         '--rt', action='store_true',
@@ -895,6 +1009,8 @@ if __name__ == "__main__":
     else:
         t = Time.now()
     skip = args.skip_xsp
+    preferred_mode = 'xp' if args.xdata else 'auto'
+    print('Flare monitor mode request:', preferred_mode)
     print(t.iso[:19], ': ', )
     # if (t.mjd % 1) < 3./24:
     # # Special case of being run at or before 3 AM (UT), so change to late "yesterday" to finish out
@@ -906,7 +1022,7 @@ if __name__ == "__main__":
         # Check if cross-correlation plot already exists
         f, ax = plt.subplots(1, 1)
         f.set_size_inches(12.5, 5)
-        scanid, tlevel, bflag, times = xdata_display(t, ax)
+        scanid, tlevel, bflag, times = xdata_display(t, ax, preferred_mode=preferred_mode)
         if times is None:
             plt.close(f)
         else:

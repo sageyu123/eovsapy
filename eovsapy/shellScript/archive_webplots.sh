@@ -167,7 +167,7 @@ ANT_TRACK_DEST="${ANT_TRACK_DEST:-/common/webplots/ant_track}"
 
 FLAREMON_SRC="${FLAREMON_SRC:-/common/webplots/flaremon}"
 FLAREMON_DEST="${FLAREMON_DEST:-/common/webplots/flaremon}"
-PHASECAL_ROOT="${PHASECAL_ROOT:-/common/webplots/phasecal}"
+PHASECAL_ROOT="${PHASECAL_ROOT:-/nas8/eovsa/phasecal}"
 SOLPNTCAL_ROOT="${SOLPNTCAL_ROOT:-/common/webplots/solpntcal}"
 
 move_older_than_days \

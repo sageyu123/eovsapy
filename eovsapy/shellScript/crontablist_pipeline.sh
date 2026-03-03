@@ -21,7 +21,8 @@
 #
 # m h  dom mon dow   command
 # Run the UDB process script every 5 minutes all day
-0,5,10,15,20,25,30,35,40,45,50,55 * * * * cd /data1/workdir; /bin/csh /home/user/test_svn/shell_scripts/udb_process.csh > /dev/null 2>&1
+# 0,5,10,15,20,25,30,35,40,45,50,55 * * * * cd /data1/workdir; /bin/csh /home/user/test_svn/shell_scripts/udb_process.csh > /dev/null 2>&1
+*/5 * * * * /usr/bin/flock -n /data1/processing/udb_process.flock -c "/bin/csh /home/user/test_svn/shell_scripts/udb_process.csh"
 # Add directories for next years UDB, IDB, IFDB, etc
 0 12 25 12 * cd /data1/workdir; /bin/csh /home/user/test_svn/shell_scripts/add_yrdir.csh > /dev/null 2>&1
 # This job is run from DPP, not Pipeline, so commented out here
@@ -48,7 +49,7 @@
 # Run the image pipeline that creates the full-disk images every day
 0 4 * * * cd /data1/workdir; /bin/bash /common/python/eovsapy-src/eovsapy/shellScript/pipeline_fdimg.sh > /tmp/pipeline_fdimg.log 2>&1
 
-# Run OVSAs spectrogram script every day
+# Run OVSA spectrogram script every day
 0 */6 * * * /bin/bash -c "cd /data1/workdir; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /common/python/suncasa-src/suncasa/utils/ovsa_spectrogram.py" > /tmp/ovsa_spectrogram.log 2>&1
 
 # Run the process that creates the raw UDBms files
@@ -95,3 +96,5 @@
 
 ## run flare detection routine (find_flare4date.py) after each reboot
 @reboot /common/python/current/start_flare_detect.sh
+# health check every 5 minutes: restart if missing or likely hung
+*/5 * * * * /bin/bash /common/python/eovsapy-src/eovsapy/shellScript/flare_detect_watchdog.sh

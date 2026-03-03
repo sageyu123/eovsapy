@@ -137,16 +137,20 @@ def _normalize_pols(pols, npol):
     return valid
 
 
-def _good_ants_for_ylim(p, pols, threshold=10.0, ant_count=None):
+def _good_ants_for_ylim(p, pols, threshold=10.0, ant_count=None, ant_indices=None):
     """Return mask of antennas to include for y-lim determination."""
     nant = p.shape[0]
-    if ant_count is None:
-        ant_count = nant
-    n = min(int(ant_count), nant)
+    if ant_indices:
+        ant_idx = [int(i) for i in ant_indices if 0 <= int(i) < nant]
+    else:
+        if ant_count is None:
+            ant_count = nant
+        n = min(int(ant_count), nant)
+        ant_idx = list(range(n))
     pols = _normalize_pols(pols, p.shape[1])
-    mask = np.zeros(n, dtype=bool)
-    for i in range(n):
-        y = p[i, pols, :, :].ravel()
+    mask = np.zeros(len(ant_idx), dtype=bool)
+    for i, ai in enumerate(ant_idx):
+        y = p[ai, pols, :, :].ravel()
         y = y[np.isfinite(y)]
         if y.size == 0:
             continue
@@ -217,6 +221,100 @@ def _parse_tidx_pair(text, defaults=DEFAULT_TIDXS):
     return int(defaults[0]), int(defaults[1])
 
 
+def _parse_ylim_pair(text):
+    """Parse y-limit text 'lo,hi' (or 'lo hi') into (float(lo), float(hi))."""
+    if text is None:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+    parts = s.replace(",", " ").split()
+    if len(parts) != 2:
+        raise ValueError("Invalid y-limit '{}'. Use 'lo,hi'.".format(text))
+    try:
+        lo = float(parts[0])
+        hi = float(parts[1])
+    except Exception:
+        raise ValueError("Invalid y-limit '{}'. Use numeric values.".format(text))
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        raise ValueError("Invalid y-limit '{}'. Limits must be finite.".format(text))
+    if hi <= lo:
+        raise ValueError("Invalid y-limit '{}'. Require hi > lo.".format(text))
+    return lo, hi
+
+
+def _parse_ant_selection(text, max_ant=None):
+    """
+    Parse 1-based antenna selection text into 0-based antenna indices.
+
+    Accepted examples: "ant5-7,10,12", "5-7,10,12", "ant1 ant3".
+    """
+    if text is None:
+        return []
+    cleaned = re.sub(r"(?i)\bant", "", str(text)).strip()
+    if not cleaned:
+        return []
+    one_based = _parse_idx_list(cleaned)
+    if max_ant is None:
+        valid_one_based = [a for a in one_based if a >= 1]
+    else:
+        m = int(max_ant)
+        valid_one_based = [a for a in one_based if 1 <= a <= m]
+    return [a - 1 for a in valid_one_based]
+
+
+def _format_ant_selection_tag(ant_indices):
+    """Return compact antenna selection tag like 'ant5-7,10,12'."""
+    if not ant_indices:
+        return ""
+    ants = sorted(set(int(a) + 1 for a in ant_indices if int(a) >= 0))
+    if not ants:
+        return ""
+
+    ranges = []
+    start = ants[0]
+    prev = ants[0]
+    for a in ants[1:]:
+        if a == prev + 1:
+            prev = a
+            continue
+        if start == prev:
+            ranges.append(str(start))
+        else:
+            ranges.append("{}-{}".format(start, prev))
+        start = a
+        prev = a
+    if start == prev:
+        ranges.append(str(start))
+    else:
+        ranges.append("{}-{}".format(start, prev))
+    return "ant{}".format(",".join(ranges))
+
+
+def _resolve_ant_indices(p, axes, ant_count=15, ant_indices=None):
+    """Resolve antenna index list to plot, constrained by data and axes."""
+    nant = p.shape[0]
+    max_axes = len(axes)
+    if ant_indices:
+        idx = sorted(set(int(i) for i in ant_indices if 0 <= int(i) < nant))
+        return idx[:max_axes]
+    if ant_count is None:
+        ant_count = nant
+    nants = min(int(ant_count), nant, max_axes)
+    return list(range(nants))
+
+
+def _axes_grid_shape(axes):
+    """Infer (nrows, ncols) from the subplot grid."""
+    if not axes:
+        return 1, 1
+    try:
+        gs = axes[0].get_subplotspec().get_gridspec()
+        return int(gs.nrows), int(gs.ncols)
+    except Exception:
+        return len(axes), 1
+
+
 def _remove_figure_legends(fig):
     try:
         for leg in list(fig.legends):
@@ -240,6 +338,32 @@ def _pol_label(pol):
     if pol == 1:
         return "pol 1 (Y)"
     return "pol {}".format(pol)
+
+
+def _freq_value_for_fidx(out, fidx):
+    """Return frequency in GHz for a frequency index, or None if unavailable."""
+    try:
+        fghz = out.get("fghz", None)
+        if fghz is None:
+            return None
+        arr = np.asarray(fghz).ravel()
+        i = int(fidx)
+        if i < 0 or i >= arr.size:
+            return None
+        val = float(arr[i])
+        if not np.isfinite(val):
+            return None
+        return val
+    except Exception:
+        return None
+
+
+def _format_fidx_label(out, fidx):
+    """Format legend label for frequency index with optional GHz value."""
+    fval = _freq_value_for_fidx(out, fidx)
+    if fval is None:
+        return "fidx {}".format(int(fidx))
+    return "fidx {} ({:.3f} GHz)".format(int(fidx), fval)
 
 
 def _scan_label_from_idb_name(idb_name):
@@ -274,13 +398,14 @@ def _extract_scan_datetime_from_text(text):
         return None
 
 
-def _newest_saved_scan_datetime(save_dir, kind):
+def _newest_saved_scan_datetime(save_dir, kind, ant_tag=""):
     """
     Return newest timestamp from dated sys_gain files of one kind ('t' or 'f').
     Excludes *_latest.jpg.
     """
     newest = None
-    pattern = os.path.join(save_dir, "sys_gain_{}_*".format(kind))
+    suffix = "_{}".format(ant_tag) if ant_tag else ""
+    pattern = os.path.join(save_dir, "sys_gain_{}_*{}.jpg".format(kind, suffix))
     for pth in glob(pattern):
         base = os.path.basename(pth)
         if base.endswith("_latest.jpg"):
@@ -319,14 +444,17 @@ def plot_sys_gain_t(
         fidxs=DEFAULT_FIDXS,
         tidx1=DEFAULT_TIDXS[0],
         tidx2=DEFAULT_TIDXS[1],
-        ant_count=15,
+        ant_count=None,
+        ant_indices=None,
+        y_limits=None,
         ylog=True,
         scan_label=None):
     """
     Time-series plot: p[ant, pol, freq, time] at selected frequency indices.
     """
     p = _get_power_array(out)
-    nants = min(ant_count, p.shape[0], len(axes))
+    ant_idx = _resolve_ant_indices(p, axes, ant_count=ant_count, ant_indices=ant_indices)
+    nants = len(ant_idx)
     npol = p.shape[1]
     nf = p.shape[2]
     nt = p.shape[3]
@@ -367,40 +495,50 @@ def plot_sys_gain_t(
 
     if ylog:
         try:
-            good = _good_ants_for_ylim(p, pols, threshold=10.0, ant_count=nants)
+            good = _good_ants_for_ylim(p, pols, threshold=10.0, ant_indices=ant_idx)
             if np.any(good):
-                all_y = p[:nants][:, pols][:, :, fidxs, :][good].ravel()
+                all_y = p[ant_idx][:, pols][:, :, fidxs, :][good].ravel()
             else:
-                all_y = p[:nants][:, pols][:, :, fidxs, :].ravel()
+                all_y = p[ant_idx][:, pols][:, :, fidxs, :].ravel()
         except Exception:
             all_y = np.array([])
         ylo, yhi = _log_ylim_for_values(all_y, floor=1.0)
     else:
-        good = _good_ants_for_ylim(p, pols, threshold=10.0, ant_count=nants)
+        good = _good_ants_for_ylim(p, pols, threshold=10.0, ant_indices=ant_idx)
 
     colors = ["tab:green", "tab:purple", "tab:brown", "tab:pink", "tab:gray", "tab:olive", "tab:cyan"]
+    _, ncols = _axes_grid_shape(axes)
+    nrows = int(np.ceil(float(nants) / float(ncols))) if ncols > 0 else 1
 
     for i in range(nants):
         ax = axes[i]
+        ai = ant_idx[i]
+        col = i % ncols
+        row = i // ncols
         x = np.arange(nt)
         for k, fi in enumerate(fidxs):
             c = colors[k % len(colors)]
             for ip, pol in enumerate(pols):
                 ls = _linestyle_for_pol_index(ip)
-                ax.plot(x, p[i, pol, fi, :], color=c, linestyle=ls, alpha=0.9, lw=1.1)
+                ax.plot(x, p[ai, pol, fi, :], color=c, linestyle=ls, alpha=0.9, lw=1.1)
         if tidx1 is not None:
             ax.axvline(tidx1, color="tab:orange", linestyle="--", linewidth=1, alpha=0.7)
         if tidx2 is not None:
             ax.axvline(tidx2, color="tab:blue", linestyle="--", linewidth=1, alpha=0.7)
         if ylog:
             ax.set_yscale("log")
-            ax.set_ylim(ylo, yhi)
+            if y_limits is not None:
+                ax.set_ylim(y_limits[0], y_limits[1])
+            else:
+                ax.set_ylim(ylo, yhi)
             if i < len(good) and not good[i]:
                 _draw_low_arrow(ax, label="<10")
-        ax.text(0.02, 0.92, "Ant {0}".format(i + 1), transform=ax.transAxes)
-        if i >= (len(axes) - 4):
+        elif y_limits is not None:
+            ax.set_ylim(y_limits[0], y_limits[1])
+        ax.text(0.02, 0.92, "Ant {0}".format(ai + 1), transform=ax.transAxes)
+        if row == (nrows - 1):
             ax.set_xlabel("Time index")
-        if i % 4 == 0:
+        if col == 0:
             ax.set_ylabel("Power")
 
     for j in range(nants, len(axes)):
@@ -409,7 +547,16 @@ def plot_sys_gain_t(
     _remove_figure_legends(fig)
     handles = []
     for k, fi in enumerate(fidxs):
-        handles.append(Line2D([0], [0], color=colors[k % len(colors)], linestyle="-", lw=1.8, label="fidx {}".format(fi)))
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=colors[k % len(colors)],
+                linestyle="-",
+                lw=1.8,
+                label=_format_fidx_label(out, fi),
+            )
+        )
     for ip, pol in enumerate(pols):
         handles.append(Line2D([0], [0], color="k", linestyle=_linestyle_for_pol_index(ip), lw=1.8, label=_pol_label(pol)))
     if tidx1 is not None:
@@ -449,14 +596,17 @@ def plot_sys_gain_f(
         tidx1=DEFAULT_TIDXS[0],
         tidx2=DEFAULT_TIDXS[1],
         fidxs=DEFAULT_FIDXS,
-        ant_count=15,
+        ant_count=None,
+        ant_indices=None,
+        y_limits=None,
         ylog=True,
         scan_label=None):
     """
     Frequency plot: p[ant, pol, freq, time] at selected time index/indices.
     """
     p = _get_power_array(out)
-    nants = min(ant_count, p.shape[0], len(axes))
+    ant_idx = _resolve_ant_indices(p, axes, ant_count=ant_count, ant_indices=ant_indices)
+    nants = len(ant_idx)
     npol = p.shape[1]
     nf = p.shape[2]
     nt = p.shape[3]
@@ -498,11 +648,11 @@ def plot_sys_gain_f(
 
     if ylog:
         try:
-            good = _good_ants_for_ylim(p, pols, threshold=10.0, ant_count=nants)
+            good = _good_ants_for_ylim(p, pols, threshold=10.0, ant_indices=ant_idx)
             all_chunks = []
             for pol in pols:
-                y1 = p[:nants, pol, :, tidx1]
-                y2 = p[:nants, pol, :, tidx2]
+                y1 = p[ant_idx, pol, :, tidx1]
+                y2 = p[ant_idx, pol, :, tidx2]
                 if np.any(good):
                     y1 = y1[good]
                     y2 = y2[good]
@@ -512,25 +662,35 @@ def plot_sys_gain_f(
             all_y = np.array([])
         ylo, yhi = _log_ylim_for_values(all_y, floor=None)
     else:
-        good = _good_ants_for_ylim(p, pols, threshold=10.0, ant_count=nants)
+        good = _good_ants_for_ylim(p, pols, threshold=10.0, ant_indices=ant_idx)
+    _, ncols = _axes_grid_shape(axes)
+    nrows = int(np.ceil(float(nants) / float(ncols))) if ncols > 0 else 1
 
     for i in range(nants):
         ax = axes[i]
+        ai = ant_idx[i]
+        col = i % ncols
+        row = i // ncols
         for ip, pol in enumerate(pols):
             ls = _linestyle_for_pol_index(ip)
-            ax.plot(x, p[i, pol, :, tidx1], color="tab:orange", linestyle=ls, lw=1.1)
-            ax.plot(x, p[i, pol, :, tidx2], color="tab:blue", linestyle=ls, lw=1.1)
+            ax.plot(x, p[ai, pol, :, tidx1], color="tab:orange", linestyle=ls, lw=1.1)
+            ax.plot(x, p[ai, pol, :, tidx2], color="tab:blue", linestyle=ls, lw=1.1)
         for fi in fidxs:
             ax.axvline(fi, color="0.3", linestyle="--", linewidth=1, alpha=0.4)
         if ylog:
             ax.set_yscale("log")
-            ax.set_ylim(ylo, yhi)
+            if y_limits is not None:
+                ax.set_ylim(y_limits[0], y_limits[1])
+            else:
+                ax.set_ylim(ylo, yhi)
             if i < len(good) and not good[i]:
                 _draw_low_arrow(ax, label="<10")
-        ax.text(0.02, 0.92, "Ant {0}".format(i + 1), transform=ax.transAxes)
-        if i >= (len(axes) - 4):
+        elif y_limits is not None:
+            ax.set_ylim(y_limits[0], y_limits[1])
+        ax.text(0.02, 0.92, "Ant {0}".format(ai + 1), transform=ax.transAxes)
+        if row == (nrows - 1):
             ax.set_xlabel("Freq index")
-        if i % 4 == 0:
+        if col == 0:
             ax.set_ylabel("Power")
 
     for j in range(nants, len(axes)):
@@ -543,7 +703,17 @@ def plot_sys_gain_f(
     handles.append(Line2D([0], [0], color="tab:orange", linestyle="-", lw=1.5, label="tidx1 {}".format(tidx1)))
     handles.append(Line2D([0], [0], color="tab:blue", linestyle="-", lw=1.5, label="tidx2 {}".format(tidx2)))
     if fidxs:
-        handles.append(Line2D([0], [0], color="0.35", linestyle="--", lw=1.2, label="selected fidx"))
+        for fi in fidxs:
+            handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    color="0.35",
+                    linestyle="--",
+                    lw=1.2,
+                    label=_format_fidx_label(out, fi),
+                )
+            )
     fig.legend(
         handles=handles,
         loc="upper right",
@@ -640,7 +810,7 @@ def _cleanup_legacy_latest_files(save_dir):
                 pass
 
 
-def _save_scan_figures(idb_path, date_tag, outdir, fidxs, tidxs, ant_count=15, ylog=True):
+def _save_scan_figures(idb_path, date_tag, outdir, fidxs, tidxs, ant_count=None, ant_text=None, ylog=True, y_limits_t=None, y_limits_f=None):
     out = ri.read_idb([idb_path])
     p = _get_power_array(out)
     if p.ndim != 4:
@@ -654,11 +824,21 @@ def _save_scan_figures(idb_path, date_tag, outdir, fidxs, tidxs, ant_count=15, y
     scan_tag = _scan_file_tag_from_idb_name(scan_name)
     scan_dt = _extract_scan_datetime_from_text(scan_name) or _extract_scan_datetime_from_text(scan_tag)
 
-    prev_latest_t_dt = _newest_saved_scan_datetime(save_dir, "t")
-    prev_latest_f_dt = _newest_saved_scan_datetime(save_dir, "f")
+    ant_idx = _parse_ant_selection(ant_text, max_ant=p.shape[0])
+    ant_tag = _format_ant_selection_tag(ant_idx)
+    nsel = len(ant_idx) if ant_idx else p.shape[0]
+    if ant_idx:
+        ncols = 2
+    else:
+        ncols = 5
+    nrows = int(np.ceil(float(nsel) / float(ncols)))
+    nrows = max(1, nrows)
+
+    prev_latest_t_dt = _newest_saved_scan_datetime(save_dir, "t", ant_tag=ant_tag)
+    prev_latest_f_dt = _newest_saved_scan_datetime(save_dir, "f", ant_tag=ant_tag)
 
     fig_t = Figure(figsize=(12, 8))
-    axes_t = _make_axes_grid(fig_t, 3, 5, sharex=True, sharey=True)
+    axes_t = _make_axes_grid(fig_t, nrows, ncols, sharex=True, sharey=True)
     plot_sys_gain_t(
         fig_t,
         axes_t,
@@ -668,14 +848,19 @@ def _save_scan_figures(idb_path, date_tag, outdir, fidxs, tidxs, ant_count=15, y
         tidx1=tidx1,
         tidx2=tidx2,
         ant_count=ant_count,
+        ant_indices=ant_idx,
+        y_limits=y_limits_t,
         ylog=ylog,
         scan_label=scan_label,
     )
-    t_path = os.path.join(save_dir, "sys_gain_t_{}.jpg".format(scan_tag))
+    t_name = "sys_gain_t_{}".format(scan_tag)
+    if ant_tag:
+        t_name = "{}_{}".format(t_name, ant_tag)
+    t_path = os.path.join(save_dir, "{}.jpg".format(t_name))
     fig_t.savefig(t_path, dpi=110, bbox_inches="tight")
 
     fig_f = Figure(figsize=(12, 8))
-    axes_f = _make_axes_grid(fig_f, 3, 5, sharex=True, sharey=True)
+    axes_f = _make_axes_grid(fig_f, nrows, ncols, sharex=True, sharey=True)
     plot_sys_gain_f(
         fig_f,
         axes_f,
@@ -685,27 +870,42 @@ def _save_scan_figures(idb_path, date_tag, outdir, fidxs, tidxs, ant_count=15, y
         tidx2=tidx2,
         fidxs=fidxs,
         ant_count=ant_count,
+        ant_indices=ant_idx,
+        y_limits=y_limits_f,
         ylog=ylog,
         scan_label=scan_label,
     )
-    f_path = os.path.join(save_dir, "sys_gain_f_{}.jpg".format(scan_tag))
+    f_name = "sys_gain_f_{}".format(scan_tag)
+    if ant_tag:
+        f_name = "{}_{}".format(f_name, ant_tag)
+    f_path = os.path.join(save_dir, "{}.jpg".format(f_name))
     fig_f.savefig(f_path, dpi=110, bbox_inches="tight")
 
     written = [t_path, f_path]
 
-    t_latest = os.path.join(save_dir, "sys_gain_t_latest.jpg")
-    f_latest = os.path.join(save_dir, "sys_gain_f_latest.jpg")
-    if _should_update_latest(t_latest, scan_dt, prev_latest_t_dt):
-        shutil.copy(t_path, t_latest)
-        written.append(t_latest)
-    if _should_update_latest(f_latest, scan_dt, prev_latest_f_dt):
-        shutil.copy(f_path, f_latest)
-        written.append(f_latest)
+    # For antenna-subset outputs, only write dated files and skip *_latest.
+    if not ant_tag:
+        t_latest = os.path.join(save_dir, "sys_gain_t_latest.jpg")
+        f_latest = os.path.join(save_dir, "sys_gain_f_latest.jpg")
+        if _should_update_latest(t_latest, scan_dt, prev_latest_t_dt):
+            shutil.copy(t_path, t_latest)
+            written.append(t_latest)
+        if _should_update_latest(f_latest, scan_dt, prev_latest_f_dt):
+            shutil.copy(f_path, f_latest)
+            written.append(f_latest)
 
     return written
 
 
-def run_batch(date_text=None, outdir=DEFAULT_OUTDIR, fidxs=DEFAULT_FIDXS, tidxs=DEFAULT_TIDXS, idb_root=DEFAULT_IDB_ROOT):
+def run_batch(
+        date_text=None,
+        outdir=DEFAULT_OUTDIR,
+        fidxs=DEFAULT_FIDXS,
+        tidxs=DEFAULT_TIDXS,
+        idb_root=DEFAULT_IDB_ROOT,
+        ant_text=None,
+        y_limits_t=None,
+        y_limits_f=None):
     date_tag = _normalize_date_tag(date_text)
     try:
         scan_paths = find_solpntcal_idbs_for_date(date_tag, idb_root=idb_root)
@@ -719,7 +919,18 @@ def run_batch(date_text=None, outdir=DEFAULT_OUTDIR, fidxs=DEFAULT_FIDXS, tidxs=
     written = []
     for scan_path in scan_paths:
         try:
-            written.extend(_save_scan_figures(scan_path, date_tag, outdir, fidxs, tidxs))
+            written.extend(
+                _save_scan_figures(
+                    scan_path,
+                    date_tag,
+                    outdir,
+                    fidxs,
+                    tidxs,
+                    ant_text=ant_text,
+                    y_limits_t=y_limits_t,
+                    y_limits_f=y_limits_f,
+                )
+            )
         except Exception as exc:
             print("Failed to process {}: {}".format(scan_path, exc), file=sys.stderr)
     return written
@@ -894,7 +1105,7 @@ if TK_AVAILABLE:
             tidx1 = int(self.f_tidx1.get())
             tidx2 = int(self.f_tidx2.get())
             info = plot_sys_gain_t(
-                self.fig_t, self.axes_t, self.out, pols=[pol], fidxs=fidxs, tidx1=tidx1, tidx2=tidx2, ant_count=15
+                self.fig_t, self.axes_t, self.out, pols=[pol], fidxs=fidxs, tidx1=tidx1, tidx2=tidx2, ant_count=None
             )
             fmark = ",".join([str(f) for f in info["fidxs"]])
             if len(info.get("tidxs", ())) > 0:
@@ -912,7 +1123,7 @@ if TK_AVAILABLE:
             tidx2 = int(self.f_tidx2.get())
             fidxs = _parse_idx_list(self.t_fidx_text.get(), max_inclusive=self.p_shape[2] - 1)
             info = plot_sys_gain_f(
-                self.fig_f, self.axes_f, self.out, pols=[pol], tidx1=tidx1, tidx2=tidx2, fidxs=fidxs, ant_count=15
+                self.fig_f, self.axes_f, self.out, pols=[pol], tidx1=tidx1, tidx2=tidx2, fidxs=fidxs, ant_count=None
             )
             if len(info.get("fidxs", ())) > 0:
                 fmark = ",".join([str(f) for f in info["fidxs"]])
@@ -950,6 +1161,15 @@ def _build_parser():
   # Batch mode with custom output directory and indices
   python /common/python/eovsapy-src/eovsapy/sys_gain_inspect.py --date 2026-02-18 --outdir /common/webplots/solpntcal --fidxs 120,320 --tidxs 405,415
 
+  # Batch mode with selected antennas (1-based)
+  python /common/python/eovsapy-src/eovsapy/sys_gain_inspect.py --date 2026-02-18 --ants ant5-7,10,12
+
+  # Batch mode for one specific IDB dataset (non-GUI)
+  python /common/python/eovsapy-src/eovsapy/sys_gain_inspect.py --idbfile /data1/eovsa/fits/IDB/20260218/IDB20260218183022
+
+  # Batch mode with explicit y-limits for T/F figures
+  python /common/python/eovsapy-src/eovsapy/sys_gain_inspect.py --date 2026-02-18 --ylim-t 1,1000 --ylim-f 0.5,500
+
   # GUI mode with a specific IDB dataset
   python /common/python/eovsapy-src/eovsapy/sys_gain_inspect.py --gui /data1/eovsa/fits/IDB/20260218/IDB20260218183022
 """
@@ -962,8 +1182,22 @@ def _build_parser():
     parser.add_argument("--gui", action="store_true", help="Launch interactive Tk GUI mode.")
     parser.add_argument("--date", type=str, default=None, help="UTC date (YYYYMMDD or YYYY-MM-DD). Default: today UTC.")
     parser.add_argument("--outdir", type=str, default=DEFAULT_OUTDIR, help="Output directory for batch-mode JPG files.")
+    parser.add_argument(
+        "--idbfile",
+        type=str,
+        default=None,
+        help="Optional single IDB dataset path for non-GUI batch mode.",
+    )
     parser.add_argument("--fidxs", type=str, default="120,320", help="Frequency indices, e.g. '120,320'.")
     parser.add_argument("--tidxs", type=str, default="405,415", help="Time indices, e.g. '405,415'.")
+    parser.add_argument(
+        "--ants",
+        type=str,
+        default=None,
+        help="Optional antenna selection (1-based), e.g. 'ant5-7,10,12' or '5-7,10,12'.",
+    )
+    parser.add_argument("--ylim-t", type=str, default=None, help="Optional y-limits for T plot: 'lo,hi'.")
+    parser.add_argument("--ylim-f", type=str, default=None, help="Optional y-limits for F plot: 'lo,hi'.")
     parser.add_argument("--idb-root", type=str, default=DEFAULT_IDB_ROOT, help="IDB root directory (contains YYYYMMDD subdirs).")
     return parser
 
@@ -971,6 +1205,50 @@ def _build_parser():
 def main():
     parser = _build_parser()
     args = parser.parse_args()
+
+    if args.idbfile and (args.gui or args.idb_path):
+        parser.error("--idbfile is non-GUI mode; do not combine it with --gui or positional idb_path.")
+
+    fidxs = _parse_idx_list(args.fidxs)
+    if len(fidxs) == 0:
+        fidxs = list(DEFAULT_FIDXS)
+    tidx_pair = _parse_tidx_pair(args.tidxs, defaults=DEFAULT_TIDXS)
+    y_limits_t = _parse_ylim_pair(args.ylim_t)
+    y_limits_f = _parse_ylim_pair(args.ylim_f)
+    if y_limits_t is not None and y_limits_t[0] <= 0:
+        raise ValueError("Invalid --ylim-t '{}': lower bound must be > 0 for log-scale plots.".format(args.ylim_t))
+    if y_limits_f is not None and y_limits_f[0] <= 0:
+        raise ValueError("Invalid --ylim-f '{}': lower bound must be > 0 for log-scale plots.".format(args.ylim_f))
+
+    if args.idbfile:
+        idb_path = args.idbfile.strip()
+        if not os.path.exists(idb_path):
+            raise IOError("IDB dataset path not found: {}".format(idb_path))
+        if not os.path.isdir(idb_path):
+            raise IOError("IDB dataset path is not a directory: {}".format(idb_path))
+
+        scan_name = os.path.basename(idb_path.rstrip("/"))
+        ts = _parse_idb_timestamp(scan_name)
+        if ts is not None:
+            date_tag = ts.strftime("%Y%m%d")
+        elif args.date is not None:
+            date_tag = _normalize_date_tag(args.date)
+        else:
+            date_tag = _utc_yyyymmdd()
+
+        written = _save_scan_figures(
+            idb_path=idb_path,
+            date_tag=date_tag,
+            outdir=args.outdir,
+            fidxs=fidxs,
+            tidxs=tidx_pair,
+            ant_text=args.ants,
+            y_limits_t=y_limits_t,
+            y_limits_f=y_limits_f,
+        )
+        for p in written:
+            print("Wrote {}".format(p))
+        return 0
 
     if args.gui or args.idb_path:
         if not TK_AVAILABLE:
@@ -982,12 +1260,16 @@ def main():
         app.run()
         return 0
 
-    fidxs = _parse_idx_list(args.fidxs)
-    if len(fidxs) == 0:
-        fidxs = list(DEFAULT_FIDXS)
-    tidx_pair = _parse_tidx_pair(args.tidxs, defaults=DEFAULT_TIDXS)
-
-    written = run_batch(date_text=args.date, outdir=args.outdir, fidxs=fidxs, tidxs=tidx_pair, idb_root=args.idb_root)
+    written = run_batch(
+        date_text=args.date,
+        outdir=args.outdir,
+        fidxs=fidxs,
+        tidxs=tidx_pair,
+        idb_root=args.idb_root,
+        ant_text=args.ants,
+        y_limits_t=y_limits_t,
+        y_limits_f=y_limits_f,
+    )
     for p in written:
         print("Wrote {}".format(p))
     return 0

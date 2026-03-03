@@ -42,10 +42,10 @@
 40 18,21 * * * touch /data1/TPCAL/LOG/TPC$(date +\%Y\%m\%d).log; /bin/bash /home/user/test_svn/shell_scripts/tpcal.sh >> /data1/TPCAL/LOG/TPC$(date +\%Y\%m\%d).log 2>&1
 
 # cronjob to create the Flare Monitor plots for the web page in /common/webplots/flaremon (every 10 min from 13:00-02:00 UT)
-2,12,22,32,42,52 0,1,2,13,14,15,16,17,18,19,20,21,22,23 * * * touch /data1/TPCAL/LOG/FLM$(date +\%Y\%m\%d).log; /bin/bash /home/user/test_svn/shell_scripts/flare_monitor.sh >> /data1/TPCAL/LOG/FLM$(date +\%Y\%m\%d).log 2>&1
+2,12,22,32,42,52 0,1,2,13,14,15,16,17,18,19,20,21,22,23 * * * touch /data1/TPCAL/LOG/FLM$(date +\%Y\%m\%d).log; /bin/bash /home/user/test_svn/shell_scripts/flare_monitor.sh --xdata >> /data1/TPCAL/LOG/FLM$(date +\%Y\%m\%d).log 2>&1
 
 # cronjob to do the final Flare Monitor plot for the day (03:00 UT)
-# 0 3 * * * touch /data1/TPCAL/LOG/FLM$(date +\%Y\%m\%d).log; /bin/bash /home/user/test_svn/shell_scripts/flare_monitor.sh >> /data1/TPCAL/LOG/FLM$(date +\%Y\%m\%d).log 2>&1
+# 0 3 * * * touch /data1/TPCAL/LOG/FLM$(date +\%Y\%m\%d).log; /bin/bash /home/user/test_svn/shell_scripts/flare_monitor.sh --xdata >> /data1/TPCAL/LOG/FLM$(date +\%Y\%m\%d).log 2>&1
 
 # cronjob to append RT median data to daily file (every 1 min from 13:00-02:00 UT)
 * 0,1,2,13,14,15,16,17,18,19,20,21,22,23 * * * touch /data1/RT/RT.log; /bin/bash /home/user/test_svn/shell_scripts/RT_monitor.sh >> /data1/RT/RT.log 2>&1

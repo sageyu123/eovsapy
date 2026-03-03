@@ -90,9 +90,11 @@ def plot_spectrogram(fghz, ut, tsys, ax=None, cbar=True, logsample=False, **kwar
                            norm=mcolors.LogNorm(vmin=vmin, vmax=vmax))
 
     if cbar:
-        cbar_label = 'Flux Density [sfu]'
-        if xdata:
-            cbar_label = 'Amplitude [arb. units]'
+        cbar_label = kwargs.get('cbar_label')
+        if cbar_label is None:
+            cbar_label = 'Flux Density [sfu]'
+            if xdata:
+                cbar_label = 'Amplitude [arb. units]'
         cbar_pad = kwargs.get('cbar_pad', 0.015)
         cbar_fraction = kwargs.get('cbar_fraction', 0.05)
         ax.figure.colorbar(im, ax=ax, label=cbar_label, pad=cbar_pad, fraction=cbar_fraction)
