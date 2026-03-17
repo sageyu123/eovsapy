@@ -44,6 +44,7 @@ DEFAULT_OUTDIR = "/common/webplots/solpntcal"
 DEFAULT_FIDXS = (120, 320)
 DEFAULT_TIDXS = (405, 415)
 TARGET_SOLPNT_HHMMS = ("1830", "2130")
+DEFAULT_ANT_COUNT = 15
 
 
 def _utc_yyyymmdd():
@@ -299,7 +300,7 @@ def _resolve_ant_indices(p, axes, ant_count=15, ant_indices=None):
         idx = sorted(set(int(i) for i in ant_indices if 0 <= int(i) < nant))
         return idx[:max_axes]
     if ant_count is None:
-        ant_count = nant
+        ant_count = DEFAULT_ANT_COUNT
     nants = min(int(ant_count), nant, max_axes)
     return list(range(nants))
 
@@ -826,7 +827,7 @@ def _save_scan_figures(idb_path, date_tag, outdir, fidxs, tidxs, ant_count=None,
 
     ant_idx = _parse_ant_selection(ant_text, max_ant=p.shape[0])
     ant_tag = _format_ant_selection_tag(ant_idx)
-    nsel = len(ant_idx) if ant_idx else p.shape[0]
+    nsel = len(ant_idx) if ant_idx else min(int(DEFAULT_ANT_COUNT), p.shape[0])
     if ant_idx:
         ncols = 2
     else:

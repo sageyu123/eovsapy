@@ -108,6 +108,99 @@ import functools
 import numpy as np
 from eovsapy.util import Time, get_idbdir, nearest_val_idx, bl2ord
 
+DEFAULT_XP_UVRANGE_M = (45.0, 300.0)
+DEFAULT_XP_MINBL = 5
+
+
+def _prepare_xsp_for_display(spec, units, dmaxperc=94, dminperc=5, bgperc=40, freqmaskperc=90):
+    '''Prepare XP spectrogram data and robust display limits.
+
+    For calibrated XP data in SFU, this preserves the absolute spectrogram and
+    only uses a per-frequency background estimate to ignore persistently bright
+    frequency channels when computing the color scale. For uncalibrated XP
+    data, it returns the historical per-frequency-normalized enhancement view.
+
+    :param spec: Spectrogram values with shape ``(nf, nt)``.
+    :type spec: numpy.ndarray
+    :param units: Spectrogram units label, typically ``'sfu'`` or ``'arb'``.
+    :type units: str
+    :param dmaxperc: Upper percentile for display scaling.
+    :type dmaxperc: float
+    :param dminperc: Lower percentile for display scaling.
+    :type dminperc: float
+    :param bgperc: Percentile used to estimate per-frequency background.
+    :type bgperc: float
+    :param freqmaskperc: Upper percentile of background level kept when
+        computing absolute-SFU display limits.
+    :type freqmaskperc: float
+    :returns: Display spectrogram, lower limit, upper limit, xdata flag, and
+        colorbar label.
+    :rtype: tuple
+    '''
+    spec = np.asarray(spec, dtype=float)
+    finite = spec[np.isfinite(spec)]
+    positive = finite[np.where(finite > 0.0)]
+
+    if spec.ndim != 2:
+        if units == 'sfu':
+            if positive.size == 0:
+                return spec, 0.1, None, False, 'Flux Density [sfu]'
+            dmin = max(0.1, np.nanpercentile(positive, dminperc))
+            dmax = np.nanpercentile(positive, dmaxperc)
+            return spec, float(dmin), float(dmax), False, 'Flux Density [sfu]'
+        if finite.size == 0:
+            return spec, 0.8, 1.2, True, 'Relative to per-frequency background'
+        return spec, float(np.nanpercentile(finite, dminperc)), float(np.nanpercentile(finite, dmaxperc)), True, 'Relative to per-frequency background'
+
+    baseline = np.nanpercentile(spec, bgperc, axis=1)
+    good = np.isfinite(baseline) & (baseline > 0.0)
+
+    if units == 'sfu':
+        if not np.any(good):
+            if positive.size == 0:
+                return spec, 0.1, None, False, 'Flux Density [sfu]'
+            dmin = max(0.1, np.nanpercentile(positive, dminperc))
+            dmax = np.nanpercentile(positive, dmaxperc)
+            return spec, float(dmin), float(dmax), False, 'Flux Density [sfu]'
+
+        bgcut = np.nanpercentile(baseline[good], freqmaskperc)
+        keep = good & (baseline <= bgcut)
+        if not np.any(keep):
+            keep = good
+        finite = spec[keep]
+        finite = finite[np.isfinite(finite)]
+        positive = finite[np.where(finite > 0.0)]
+        if positive.size == 0:
+            return spec, 0.1, None, False, 'Flux Density [sfu]'
+        dmin = max(0.1, np.nanpercentile(positive, dminperc))
+        dmax = np.nanpercentile(positive, dmaxperc)
+        dmax = max(1.5, dmax)
+        return spec, float(dmin), float(dmax), False, 'Flux Density [sfu]'
+
+    if not np.any(good):
+        if finite.size == 0:
+            return spec, 0.8, 1.2, True, 'Relative to per-frequency background'
+        return spec, float(np.nanpercentile(finite, dminperc)), float(np.nanpercentile(finite, dmaxperc)), True, 'Relative to per-frequency background'
+
+    fill_value = np.nanmedian(baseline[good])
+    baseline = np.where(good, baseline, fill_value)[:, np.newaxis]
+    disp = spec / baseline
+    finite = disp[np.isfinite(disp)]
+    if finite.size == 0:
+        return disp, 0.8, 1.2, True, 'Relative to per-frequency background'
+
+    dmin = np.nanpercentile(finite, dminperc)
+    dmax = np.nanpercentile(finite, dmaxperc)
+    if not np.isfinite(dmin):
+        dmin = 0.8
+    if not np.isfinite(dmax):
+        dmax = 1.2
+    dmin = min(dmin, 0.98)
+    dmax = max(dmax, 1.05)
+    if dmax <= dmin:
+        dmin, dmax = 0.8, 1.2
+    return disp, float(dmin), float(dmax), True, 'Relative to per-frequency background'
+
 
 def RT_flare_monitor():
     ''' Read "real-time" data file once and obtain the median over antenna
@@ -350,7 +443,9 @@ def read_idb_calibrated(files, t):
                     skipped.append(src)
                     print('Skipping invalid/incomplete IDB dataset: {0}'.format(src))
                     continue
-                calfile = pc.udb_corr([src], calibrate=True, outpath=outpath, attncal=False)
+                # Keep calibration behavior consistent with flare_spec.calIDB():
+                # apply TP calibration and correlator desaturation.
+                calfile = pc.udb_corr([src], calibrate=True, outpath=outpath, desat=True)
                 if isinstance(calfile, str) and calfile != '':
                     calfiles.append(calfile)
                 else:
@@ -393,13 +488,84 @@ def read_idb_calibrated(files, t):
         return {}, False
 
 
-def _build_monitor_spectrogram(out, data_key='p'):
+def _legacy_xp_baseline_indices(nbl):
+    """Return historical XP baseline subset used by pipeline_cal.allday_process()."""
+    baseidx = np.array([29, 30, 31, 32, 33, 34, 42, 43, 44, 45, 46,
+                        54, 55, 56, 57, 65, 66, 67, 75, 76, 84], dtype=int)
+    return baseidx[baseidx < int(nbl)]
+
+
+def _xp_baseline_indices_from_uvrange(out, nsolant, uvrange_m=DEFAULT_XP_UVRANGE_M, minbl=DEFAULT_XP_MINBL):
+    """Return XP baseline indices selected by uvrange and available antennas."""
+    data = out.get('x')
+    if data is None:
+        return np.array([], dtype=int)
+    nbl = data.shape[0]
+    if uvrange_m is None:
+        return _legacy_xp_baseline_indices(nbl)
+
+    try:
+        ulo = float(uvrange_m[0])
+        uhi = float(uvrange_m[1])
+    except Exception:
+        print('Warning: invalid uvrange specification. Falling back to legacy XP baseline list.')
+        return _legacy_xp_baseline_indices(nbl)
+
+    if not np.isfinite(ulo) or not np.isfinite(uhi) or uhi <= ulo:
+        print('Warning: invalid uvrange bounds ({0}). Falling back to legacy XP baseline list.'.format(uvrange_m))
+        return _legacy_xp_baseline_indices(nbl)
+
+    uvw = out.get('uvw')
+    tarr = out.get('time')
+    if uvw is None or tarr is None:
+        print('Warning: uvw/time unavailable. Falling back to legacy XP baseline list.')
+        return _legacy_xp_baseline_indices(nbl)
+
+    uvw = np.asarray(uvw)
+    tarr = np.asarray(tarr)
+    if uvw.ndim < 3 or uvw.shape[0] < nbl or tarr.size == 0:
+        print('Warning: malformed uvw/time arrays. Falling back to legacy XP baseline list.')
+        return _legacy_xp_baseline_indices(nbl)
+
+    mid = int(tarr.size // 2)
+    try:
+        blen = np.sqrt(uvw[:, mid, 0] ** 2 + uvw[:, mid, 1] ** 2)
+    except Exception:
+        print('Warning: could not compute baseline lengths. Falling back to legacy XP baseline list.')
+        return _legacy_xp_baseline_indices(nbl)
+
+    # flare_spec.inspect() interprets uvrange in meters, while uvw is in ns.
+    c_mps = 2.998e8
+    ulo_ns = ulo / c_mps * 1e9
+    uhi_ns = uhi / c_mps * 1e9
+
+    idx = []
+    for i in range(int(nsolant)):
+        for j in range(i + 1, int(nsolant)):
+            k = int(bl2ord[i, j])
+            if k < nbl:
+                idx.append(k)
+    if len(idx) == 0:
+        return _legacy_xp_baseline_indices(nbl)
+
+    idx = np.asarray(sorted(set(idx)), dtype=int)
+    good, = np.where(np.logical_and(blen[idx] > ulo_ns, blen[idx] < uhi_ns))
+    keep = idx[good]
+    if len(keep) <= int(minbl):
+        print('Warning: only {0} baselines in uvrange [{1}, {2}] m (minbl>{3}). '
+              'Falling back to legacy XP baseline list.'.format(len(keep), ulo, uhi, int(minbl)))
+        return _legacy_xp_baseline_indices(nbl)
+
+    return keep
+
+
+def _build_monitor_spectrogram(out, data_key='p', xp_uvrange_m=DEFAULT_XP_UVRANGE_M):
     '''Build TP or XP monitor spectrogram (nf x nt) from read_idb output.
 
     For data_key == 'p', uses TP antenna-selection strategy from
     pipeline_cal.allday_process().
 
-    For data_key == 'x', returns the mean cross-correlation dynamic
+    For data_key == 'x', returns the median cross-correlation dynamic
     spectrum from selected short baselines/polarizations.
     '''
     if data_key not in ('p', 'x'):
@@ -423,11 +589,10 @@ def _build_monitor_spectrogram(out, data_key='p'):
         data = out.get('x')
         if data is None:
             return None
-        # Match pipeline_cal.allday_process() XP definition for consistency.
-        baseidx = np.array([29, 30, 31, 32, 33, 34, 42, 43, 44, 45, 46,
-                            54, 55, 56, 57, 65, 66, 67, 75, 76, 84], dtype=int)
         nbl = data.shape[0]
-        keep = baseidx[baseidx < nbl]
+        keep = _xp_baseline_indices_from_uvrange(
+            out, nsolant, uvrange_m=xp_uvrange_m, minbl=DEFAULT_XP_MINBL
+        )
         if len(keep) == 0:
             return None
         xdat = np.array(data[keep], copy=True)
@@ -440,7 +605,9 @@ def _build_monitor_spectrogram(out, data_key='p'):
                     if k in bmap:
                         good = np.logical_and(tracking[i, tidx], tracking[j, tidx])
                         xdat[bmap[k], :, :, np.logical_not(good)] = np.nan
-        return np.abs(np.nansum(np.nansum(xdat, 0), 0))
+        xabs = np.abs(xdat)
+        # Use robust median statistic for monitor XP product.
+        return np.nanmedian(np.nanmedian(xabs, 0), 0)
     
 
     pdat = np.array(out['p'], copy=True)
@@ -482,8 +649,40 @@ def _get_tracking_mask(out, nsolant):
     return tidx, tracking[:nsolant]
 
 
-def _get_xsp_cache_file(t, files, cache_mode='auto'):
-    '''Return per-day cache file path for XSP spectrogram products.'''
+def _parse_uvrange_arg(text, default=DEFAULT_XP_UVRANGE_M):
+    """Parse uvrange text 'lo,hi' (meters) into a float tuple."""
+    if text is None:
+        return tuple(default)
+    s = str(text).strip()
+    if not s:
+        return tuple(default)
+    parts = s.replace(',', ' ').split()
+    if len(parts) != 2:
+        raise ValueError("Invalid --uvrange '{}'. Use 'lo,hi' in meters.".format(text))
+    try:
+        lo = float(parts[0])
+        hi = float(parts[1])
+    except Exception:
+        raise ValueError("Invalid --uvrange '{}'. Bounds must be numeric.".format(text))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        raise ValueError("Invalid --uvrange '{}'. Require finite bounds and hi > lo.".format(text))
+    return lo, hi
+
+
+def _uvrange_cache_tag(uvrange_m):
+    '''Return short cache-safe tag for XP uvrange setting.'''
+    if uvrange_m is None:
+        return 'legacy'
+    try:
+        lo = float(uvrange_m[0])
+        hi = float(uvrange_m[1])
+    except Exception:
+        return 'legacy'
+    return '{0:g}to{1:g}m'.format(lo, hi).replace('.', 'p')
+
+
+def _get_xsp_cache_file(t, files, cache_mode='auto', uvrange_m=None, scanid=None):
+    '''Return cache file path for XSP spectrogram products.'''
     import os
 
     datstr = t.iso[:10].replace('-', '')
@@ -496,7 +695,9 @@ def _get_xsp_cache_file(t, files, cache_mode='auto'):
     cache_dir = '/tmp/flaremon_cache'
     if not os.path.isdir(cache_dir):
         os.makedirs(cache_dir)
-    return os.path.join(cache_dir, 'XSP_cache_' + datstr + '_' + str(cache_mode) + '.npz')
+    uvtag = _uvrange_cache_tag(uvrange_m)
+    scantag = str(scanid) if scanid is not None else 'noscan'
+    return os.path.join(cache_dir, 'XSP_cache_' + datstr + '_' + scantag + '_' + str(cache_mode) + '_' + uvtag + '.npz')
 
 
 def _load_xsp_cache(cache_file):
@@ -555,13 +756,13 @@ def _save_xsp_cache(cache_file, scanid, mode, files, fghz, times_jd, spec, units
     )
 
 
-def _spectrogram_from_out(out, cal_ok, scanid, preferred_mode='auto'):
+def _spectrogram_from_out(out, cal_ok, scanid, preferred_mode='auto', xp_uvrange_m=DEFAULT_XP_UVRANGE_M):
     '''Convert read_idb output to a plottable spectrogram payload.'''
     mode = None
     spec = None
     units = 'sfu' if cal_ok else 'arb'
     if preferred_mode == 'xp':
-        spec = _build_monitor_spectrogram(out, data_key='x')
+        spec = _build_monitor_spectrogram(out, data_key='x', xp_uvrange_m=xp_uvrange_m)
         if spec is None:
             return None, None, None, None, None
         mode = 'xp'
@@ -572,7 +773,7 @@ def _spectrogram_from_out(out, cal_ok, scanid, preferred_mode='auto'):
             if cal_ok:
                 print('Successfully created TP spectrogram for scan ID {0}'.format(scanid))
         if mode is None:
-            spec = _build_monitor_spectrogram(out, data_key='x')
+            spec = _build_monitor_spectrogram(out, data_key='x', xp_uvrange_m=xp_uvrange_m)
             if spec is None:
                 return None, None, None, None, None
             mode = 'xp'
@@ -606,7 +807,13 @@ def timestamp_decor(func):
 
 
 @timestamp_decor
-def xdata_display(t, ax=None, preferred_mode='auto'):
+def xdata_display(
+        t,
+        ax=None,
+        preferred_mode='auto',
+        xp_uvrange_m=DEFAULT_XP_UVRANGE_M,
+        use_cache=True,
+        manual_mode=False):
     ''' Given the time as a Time object, search the FDB file for files
         associated with the scan for that time and create a dynamic spectrogram
         on the axis specified by ax, or on a new plot if no ax. If the requested
@@ -622,6 +829,9 @@ def xdata_display(t, ax=None, preferred_mode='auto'):
     import astropy.units as u
 
     print('xdata_display requested mode:', preferred_mode)
+    print('xdata_display XP uvrange [m]:', xp_uvrange_m)
+    print('xdata_display cache enabled:', bool(use_cache))
+    print('xdata_display manual mode:', bool(manual_mode))
 
     utc2pst = -8 * u.hour  # The difference between UTC and pst time. The diff between pst and pdt does not matter here.
     t_pst = t + utc2pst
@@ -646,12 +856,17 @@ def xdata_display(t, ax=None, preferred_mode='auto'):
         print('No NormalObserving scans found.')
         return None, None, None, None
 
-    # Find scanID that starts earlier than, but closest to, the current time
+    # Scan selection: latest scan start <= t (same behavior as cron path).
+    iout = None
     for i, scan in enumerate(scans):
         print(scan)
-        dt = t - Time(time.strftime('%Y-%m-%d %H:%M:%S', time.strptime(scan, '%y%m%d%H%M%S')))
-        if dt.sec > 0.:
+        tscan = Time(time.strftime('%Y-%m-%d %H:%M:%S', time.strptime(scan, '%y%m%d%H%M%S')))
+        dt = t - tscan
+        if dt.sec >= 0.:
             iout = i
+    if iout is None:
+        print('Requested time precedes first NormalObserving scan start; no plot created.')
+        return None, None, None, None
     scan = scans[iout]
 
     # Find files for this scan
@@ -662,15 +877,20 @@ def xdata_display(t, ax=None, preferred_mode='auto'):
         files = fdb['FILE'][fidx]
         files_st = Time(fdb['ST_TS'][fidx].astype(float), format='lv')
         files_subdir = [st.to_datetime().strftime('%Y%m%d') for st in files_st]
-        # Find out how old last file of this scan is, and proceed only if less than 20 minutes
-        # earlier than the time given in t.
-        try:
-            dt = t - Time(time.strftime('%Y-%m-%d %H:%M:%S', time.strptime(files[-1], 'IDB%Y%m%d%H%M%S')))
-        except:
-            dt = 10000.  # Forces skip of plot creation
-            print('Unexpected FDB file format.')
-            scan = None
-        if dt.sec < 1200.:
+        file_subdir_map = dict(zip([str(f) for f in files], files_subdir))
+        # In cron/default mode, only process if scan is currently active
+        # (last file no older than 20 min). In manual mode, skip this age check.
+        if manual_mode:
+            proceed = True
+        else:
+            try:
+                dt = t - Time(time.strftime('%Y-%m-%d %H:%M:%S', time.strptime(files[-1], 'IDB%Y%m%d%H%M%S')))
+            except Exception:
+                dt = 10000.  # Forces skip of plot creation
+                print('Unexpected FDB file format.')
+                scan = None
+            proceed = (dt.sec < 1200.)
+        if proceed:
             # This is a currently active scan, so create the figure
             path = '/data1/IDB/'
             filelist = files
@@ -680,8 +900,9 @@ def xdata_display(t, ax=None, preferred_mode='auto'):
                 path = get_idbdir(t)
                 files = []
                 found = 0
-                for i, file in enumerate(filelist):
-                    files.append(os.path.join(path, files_subdir[i], file))
+                for file in filelist:
+                    subdir = file_subdir_map.get(str(file), t.iso[:10].replace('-', ''))
+                    files.append(os.path.join(path, subdir, file))
                     if os.path.isdir(files[-1]):
                         found += 1
                 if found == 0:
@@ -692,15 +913,20 @@ def xdata_display(t, ax=None, preferred_mode='auto'):
                     return scan, tlevel, bflag, times
             else:
                 files = [os.path.join(path, file) for file in filelist]
-            cache_file = _get_xsp_cache_file(t, files, cache_mode=preferred_mode)
-            cache = _load_xsp_cache(cache_file)
+            cache_file = _get_xsp_cache_file(
+                t, files, cache_mode=preferred_mode, uvrange_m=xp_uvrange_m, scanid=scan
+            )
+            cache = _load_xsp_cache(cache_file) if use_cache else None
             mode = None
             fghz = None
             times_jd = None
             spec = None
             units = None
 
-            if cache is not None and cache['scanid'] == str(scan):
+            if not use_cache:
+                print('Skipping XSP cache read/write by request (--no-cache).')
+
+            if cache is not None:
                 cached_files = cache['files']
                 new_files = [f for f in files if f not in cached_files]
                 if len(new_files) == 0:
@@ -723,7 +949,7 @@ def xdata_display(t, ax=None, preferred_mode='auto'):
                     out_new, cal_ok_new = read_idb_calibrated(new_files, t)
                     if out_new:
                         mode_new, fghz_new, times_jd_new, spec_new, units_new = _spectrogram_from_out(
-                            out_new, cal_ok_new, scan, preferred_mode=preferred_mode
+                            out_new, cal_ok_new, scan, preferred_mode=preferred_mode, xp_uvrange_m=xp_uvrange_m
                         )
                         if mode_new is not None:
                             same_mode = (mode_new == cache['mode'])
@@ -737,8 +963,9 @@ def xdata_display(t, ax=None, preferred_mode='auto'):
                                 )
                                 mode = mode_new
                                 units = units_new
-                                _save_xsp_cache(cache_file, scan, mode, files, fghz, times_jd, spec, units)
-                                print('Updated XSP cache with new files.')
+                                if use_cache:
+                                    _save_xsp_cache(cache_file, scan, mode, files, fghz, times_jd, spec, units)
+                                    print('Updated XSP cache with new files.')
                             else:
                                 print('Cache payload incompatible with new data. Rebuilding from full file list.')
                         else:
@@ -755,11 +982,6 @@ def xdata_display(t, ax=None, preferred_mode='auto'):
                         times_jd = cache['times_jd']
                         spec = cache['spec']
                         units = cache.get('units', 'arb')
-            elif cache is not None:
-                print('Cache exists but scan mismatch. Cache scan: {0}, requested scan: {1}. Rebuilding from files.'.format(
-                    cache['scanid'], scan
-                ))
-
             if mode is None:
                 # data, uvw, fghz, times = gd.get_X_data(files)
                 out, cal_ok = read_idb_calibrated(files, t)
@@ -771,15 +993,16 @@ def xdata_display(t, ax=None, preferred_mode='auto'):
                 print('Files read at', Time.now())
                 print(files)
                 mode, fghz, times_jd, spec, units = _spectrogram_from_out(
-                    out, cal_ok, scan, preferred_mode=preferred_mode
+                    out, cal_ok, scan, preferred_mode=preferred_mode, xp_uvrange_m=xp_uvrange_m
                 )
                 if mode is None:
                     print('No spectrogram payload returned for scan ID {0}'.format(scan))
                     scan = None
                     times = None
                     return scan, tlevel, bflag, times
-                _save_xsp_cache(cache_file, scan, mode, files, fghz, times_jd, spec, units)
-                print('Wrote XSP cache to {0}'.format(cache_file))
+                if use_cache:
+                    _save_xsp_cache(cache_file, scan, mode, files, fghz, times_jd, spec, units)
+                    print('Wrote XSP cache to {0}'.format(cache_file))
 
             times = Time(times_jd, format='jd')
             print('Flare monitor resolved mode: {0} ({1})'.format(mode, units))
@@ -811,19 +1034,17 @@ def xdata_display(t, ax=None, preferred_mode='auto'):
                         bbox={'facecolor': 'black', 'alpha': 0.35, 'edgecolor': 'none', 'pad': 2.0}
                     )
             else:
+                spec_disp, dmin, dmax, xdata_plot, cbar_label = _prepare_xsp_for_display(spec, units)
                 if ax is not None:
                     if units == 'sfu':
-                        ax.set_title('EOVSA Mean Cross-Correlation Flux for ' + datstr)
+                        ax.set_title('EOVSA Median Cross-Correlation Flux for ' + datstr)
                     else:
-                        ax.set_title('EOVSA Mean Cross-Correlation Amplitude for ' + datstr)
-                finite = spec[np.isfinite(spec)]
-                dmax = None
-                if len(finite) > 0:
-                    dmax = np.nanpercentile(finite, 95)
-                cbar_label = 'Flux Density [sfu]' if units == 'sfu' else 'Amplitude [arb. units]'
-                sp.plot_spectrogram(fghz, times, spec,
-                                    ax=ax, logsample=None, xdata=True, cbar=True, dmax=dmax,
-                                    cbar_label=cbar_label)
+                        ax.set_title('EOVSA Median Cross-Correlation Amplitude Enhancement for ' + datstr)
+                sp.plot_spectrogram(
+                    fghz, times, spec_disp,
+                    ax=ax, logsample=None, xdata=xdata_plot, cbar=True, dmin=dmin, dmax=dmax,
+                    cbar_label=cbar_label
+                )
             # tlevel, bflag = flaremeter(data)
         else:
             print('Time', dt.sec, 'is > 1200 s after last file of last NormalObserving scan.  No plot created.')
@@ -958,6 +1179,8 @@ if __name__ == "__main__":
           python /common/python/eovsapy-src/eovsapy/flare_monitor.py --timestamp "2026-02-19 20:10:00"
           python /common/python/eovsapy-src/eovsapy/flare_monitor.py --timestamp "2026-02-19T20:10:00" --skip-xsp
           python /common/python/eovsapy-src/eovsapy/flare_monitor.py --xdata
+          python /common/python/eovsapy-src/eovsapy/flare_monitor.py --xdata --uvrange 45,300
+          python /common/python/eovsapy-src/eovsapy/flare_monitor.py --xdata --timestamp "2026-03-02 23:55:00" --manual --no-cache
           python /common/python/eovsapy-src/eovsapy/flare_monitor.py --rt
     '''
     import argparse
@@ -976,6 +1199,8 @@ if __name__ == "__main__":
             '  python flare_monitor.py --timestamp "2026-02-19 20:10:00"\n'
             '  python flare_monitor.py --timestamp "2026-02-19T20:10:00" --skip-xsp\n'
             '  python flare_monitor.py --xdata\n'
+            '  python flare_monitor.py --xdata --uvrange 45,300\n'
+            '  python flare_monitor.py --xdata --timestamp "2026-03-02 23:55:00" --manual --no-cache\n'
             '  python flare_monitor.py --rt'
         )
     )
@@ -990,6 +1215,18 @@ if __name__ == "__main__":
     parser.add_argument(
         '--xdata', action='store_true',
         help='Force mean cross-power (XP) mode; uses shared calibration state (SFU if available, otherwise arb. units).'
+    )
+    parser.add_argument(
+        '--uvrange', default='45,300',
+        help='XP baseline-length range in meters, format "lo,hi". Default: 45,300 (same as flare_spec.inspect()).'
+    )
+    parser.add_argument(
+        '--no-cache', action='store_true',
+        help='Do not read/write XSP cache files; force recalculation from current IDB files.'
+    )
+    parser.add_argument(
+        '--manual', action='store_true',
+        help='Manual mode: skip the 1200 s active-scan age check so older scans can be regenerated.'
     )
     parser.add_argument(
         '--rt', action='store_true',
@@ -1010,7 +1247,14 @@ if __name__ == "__main__":
         t = Time.now()
     skip = args.skip_xsp
     preferred_mode = 'xp' if args.xdata else 'auto'
+    try:
+        xp_uvrange_m = _parse_uvrange_arg(args.uvrange, default=DEFAULT_XP_UVRANGE_M)
+    except Exception as err:
+        parser.error(str(err))
     print('Flare monitor mode request:', preferred_mode)
+    print('Flare monitor XP uvrange [m]:', xp_uvrange_m)
+    print('Flare monitor cache enabled:', not args.no_cache)
+    print('Flare monitor manual mode:', args.manual)
     print(t.iso[:19], ': ', )
     # if (t.mjd % 1) < 3./24:
     # # Special case of being run at or before 3 AM (UT), so change to late "yesterday" to finish out
@@ -1022,7 +1266,14 @@ if __name__ == "__main__":
         # Check if cross-correlation plot already exists
         f, ax = plt.subplots(1, 1)
         f.set_size_inches(12.5, 5)
-        scanid, tlevel, bflag, times = xdata_display(t, ax, preferred_mode=preferred_mode)
+        scanid, tlevel, bflag, times = xdata_display(
+            t,
+            ax,
+            preferred_mode=preferred_mode,
+            xp_uvrange_m=xp_uvrange_m,
+            use_cache=(not args.no_cache),
+            manual_mode=args.manual,
+        )
         if times is None:
             plt.close(f)
         else:

@@ -38,6 +38,60 @@ def lin_sample(fghz, ut, tsys):
     return fghzl, out
 
 
+def _set_smart_time_axis(ax):
+    '''Configure a width-aware time axis for spectrogram plots.
+
+    :param ax: Matplotlib axis to configure.
+    :type ax: matplotlib.axes.Axes
+    '''
+    import matplotlib.dates as mdates
+
+    fig = ax.figure
+    fig_width_px = float(fig.get_size_inches()[0] * fig.dpi)
+    ax_width_px = fig_width_px * float(ax.get_position().width)
+    max_ticks = int(np.clip(np.floor(ax_width_px / 95.0), 4, 9))
+    xlim = ax.get_xlim()
+    span_minutes = max(0.0, (float(xlim[1]) - float(xlim[0])) * 24.0 * 60.0)
+    target_minutes = span_minutes / float(max_ticks) if max_ticks > 0 else span_minutes
+
+    major_interval = None
+    for interval in (1, 2, 5, 10, 15, 20, 30, 60, 120, 180, 360):
+        if interval >= target_minutes:
+            major_interval = interval
+            break
+    if major_interval is None:
+        major_interval = 360
+
+    if major_interval < 60:
+        locator = mdates.MinuteLocator(interval=major_interval)
+        if major_interval <= 5:
+            minor_interval = 1
+        elif major_interval <= 15:
+            minor_interval = 5
+        elif major_interval <= 30:
+            minor_interval = 10
+        else:
+            minor_interval = 15
+        minor_locator = mdates.MinuteLocator(interval=minor_interval)
+        formatter = mdates.DateFormatter('%H:%M')
+    else:
+        hour_interval = int(major_interval // 60)
+        locator = mdates.HourLocator(interval=hour_interval)
+        if hour_interval <= 1:
+            minor_locator = mdates.MinuteLocator(interval=15)
+        elif hour_interval <= 2:
+            minor_locator = mdates.MinuteLocator(interval=30)
+        else:
+            minor_locator = None
+        formatter = mdates.DateFormatter('%H:%M')
+
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(formatter)
+    if minor_locator is not None:
+        ax.xaxis.set_minor_locator(minor_locator)
+    ax.tick_params(axis='x', labelrotation=0)
+
+
 def plot_spectrogram(fghz, ut, tsys, ax=None, cbar=True, logsample=False, **kwargs):
     '''Create a standard EOVSA spectrogram plot.
 
@@ -59,8 +113,10 @@ def plot_spectrogram(fghz, ut, tsys, ax=None, cbar=True, logsample=False, **kwar
         if kwargs.get('xdata', False):
             ax.set_title('EOVSA Summed Cross-Correlation Amplitude for ' + datstr)
 
-    ax.xaxis.set_tick_params(width=1.5, size=10, which='both')
-    ax.yaxis.set_tick_params(width=1.5, size=10, which='both')
+    ax.xaxis.set_tick_params(width=1.5, size=10, which='major')
+    ax.xaxis.set_tick_params(width=1.0, size=5, which='minor')
+    ax.yaxis.set_tick_params(width=1.5, size=10, which='major')
+    ax.yaxis.set_tick_params(width=1.0, size=5, which='minor')
     if logsample:
         fghzl, tsysl = log_sample(fghz, utd, tsys)
         ax.set_yscale('log')
@@ -99,28 +155,7 @@ def plot_spectrogram(fghz, ut, tsys, ax=None, cbar=True, logsample=False, **kwar
         cbar_fraction = kwargs.get('cbar_fraction', 0.05)
         ax.figure.colorbar(im, ax=ax, label=cbar_label, pad=cbar_pad, fraction=cbar_fraction)
     ax.xaxis_date()
-    span_minutes = 0.0
-    if len(utd) > 1:
-        span_minutes = (float(utd[-1]) - float(utd[0])) * 24.0 * 60.0
-    if span_minutes <= 20.0:
-        locator = matplotlib.dates.MinuteLocator(interval=1)
-        formatter = matplotlib.dates.DateFormatter('%H:%M:%S')
-    elif span_minutes <= 120.0:
-        locator = matplotlib.dates.MinuteLocator(interval=5)
-        formatter = matplotlib.dates.DateFormatter('%H:%M')
-    elif span_minutes <= 360.0:
-        locator = matplotlib.dates.MinuteLocator(interval=15)
-        formatter = matplotlib.dates.DateFormatter('%H:%M')
-    else:
-        locator = matplotlib.dates.AutoDateLocator(minticks=4, maxticks=8, interval_multiples=True)
-        try:
-            formatter = matplotlib.dates.ConciseDateFormatter(locator, show_offset=False)
-        except TypeError:
-            formatter = matplotlib.dates.ConciseDateFormatter(locator)
-        except AttributeError:
-            formatter = matplotlib.dates.AutoDateFormatter(locator)
-    ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(formatter)
+    _set_smart_time_axis(ax)
 
     if 'xlabel' in kwargs:
         if kwargs['xlabel'] == 'auto':
