@@ -14,8 +14,9 @@
 #
 #   Wrapper script: /home/user/test_svn/shell_scripts/flare_monitor.sh
 #   #! /bin/bash
-#   export PYTHONPATH=/home/user/test_svn/python:/common/python/current:/common/python:/common/python/packages/pipeline
-#   /common/anaconda2/bin/python /common/python/current/flare_monitor.py
+#   source /home/user/.setenv_py38
+#   /home/user/miniforge3/envs/py38/bin/python \
+#       /common/python/eovsapy-src/eovsapy/flare_monitor.py "$@"
 #
 # History:
 #   2014-Dec-20  DG

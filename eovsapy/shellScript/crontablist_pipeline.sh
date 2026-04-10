@@ -46,8 +46,8 @@
 # (about 20 minutes later, at 18:50 and 21:50 UT)
 50 18,21 * * * /usr/bin/flock -n /tmp/cron_fig_sys_gain.lock -c "bash /common/python/eovsapy-src/eovsapy/shellScript/sys_gain_inspect_plot.sh" >> /tmp/sys_gain_inspect_plot.log 2>&1
 
-# Run the image pipeline that creates the full-disk images every day
-0 4 * * * cd /data1/workdir; /bin/bash /common/python/eovsapy-src/eovsapy/shellScript/pipeline_fdimg.sh > /tmp/pipeline_fdimg.log 2>&1
+# Poll hourly for observer-written calibration readiness, then run the full-disk image pipeline once the day is ready
+5 * * * * EOVSA_PIPELINE_CRON=1 /usr/bin/flock -n /tmp/pipeline_fdimg.lock -c "cd /data1/workdir; /bin/bash /common/python/eovsapy-src/eovsapy/shellScript/pipeline_fdimg.sh" > /tmp/pipeline_fdimg.log 2>&1
 
 # Run OVSA spectrogram script every day
 0 */6 * * * /bin/bash -c "cd /data1/workdir; source /home/user/.setenv_pyenv38; /home/user/.pyenv/shims/python /common/python/suncasa-src/suncasa/utils/ovsa_spectrogram.py" > /tmp/ovsa_spectrogram.log 2>&1
@@ -98,3 +98,7 @@
 @reboot /common/python/current/start_flare_detect.sh
 # health check every 5 minutes: restart if missing or likely hung
 */5 * * * * /bin/bash /common/python/eovsapy-src/eovsapy/shellScript/flare_detect_watchdog.sh
+
+## Influx streamer watchdog retired on 2026-03-23.
+# The supported Influx ingestion path is acc_exporter -> Telegraf -> InfluxDB.
+#* * * * * export EOVSA_PYTHON_ENV_FILE=/home/user/.eovsa_exporter_env; /bin/bash /common/python/eovsapy-src/eovsapy/shellScript/influx_stream_watchdog.sh

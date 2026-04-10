@@ -1,0 +1,16 @@
+[Unit]
+Description=EOVSA ACC telemetry exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data1/workdir
+ExecStart=/bin/bash /common/python/eovsapy-src/eovsapy/shellScript/acc_exporter.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:/tmp/acc_exporter.log
+StandardError=append:/tmp/acc_exporter.log
+
+[Install]
+WantedBy=multi-user.target

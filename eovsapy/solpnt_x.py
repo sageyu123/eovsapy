@@ -50,13 +50,13 @@
 #     Added a parameter send=False to offsets2ants(), to suppress sending the
 #     commands to the antennas, although they are still written to the terminal screen.
 #
+from . import cal_header as ch
 from . import dbutil, stateframe, read_idb, eovsa_array
-import .cal_header as ch
 from .disk_conv import disk_conv
 from .util import Time, common_val_idx, ant_str2list
 from .eovsa_tracktable import make_trajtables
 from .coord_conv import radec2azel
-import .gaincal2 as gc
+from . import gaincal2 as gc
 import numpy as np
 from time import time
 import warnings
@@ -106,7 +106,7 @@ def solpnt_meta(tsolpnt):
         date-dependent.
     '''
     t1 = time()
-    cursor = dbutil.get_cursor()
+    cnxn, cursor = dbutil.get_cursor()
     ver = dbutil.find_table_version(cursor, int(tsolpnt.lv))
     if tsolpnt < Time('2025-05-22'):
         tbldim = 15
@@ -127,6 +127,7 @@ def solpnt_meta(tsolpnt):
     trk = outdict['TrackFlag'][:,antlist]
     meta = {'Timestamp':times[0],'tstamps':times,'antlist':antlist,'ra':ra,'dec':dec,'rao':rao,
            'deco':deco, 'azo':azo, 'elo':elo, 'trk':trk, 'bgmask':bgmask, 'setup':setup}
+    cnxn.close()
     print('solpnt_meta took',time()-t1,'s')
     return meta
 
@@ -928,7 +929,7 @@ def solpnt_calfac(inparams, do_plot=False, prompt=True):
                   'tpcalfac':tpcalfac,'accalfac':accalfac,'tpoffsun':tpoffsun,'acoffsun':acoffsun}
     tsql = Time(int(t.mjd) + 20/24.,format='mjd')
     if prompt:
-        ok = raw_input('Okay to write result to SQL database? [Y/N]: ')
+        ok = input('Okay to write result to SQL database? [Y/N]: ')
     else:
         ok = 'Y'
     if ok.upper() == 'Y':

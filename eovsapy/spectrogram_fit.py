@@ -49,40 +49,46 @@ def _set_smart_time_axis(ax):
     fig = ax.figure
     fig_width_px = float(fig.get_size_inches()[0] * fig.dpi)
     ax_width_px = fig_width_px * float(ax.get_position().width)
-    max_ticks = int(np.clip(np.floor(ax_width_px / 95.0), 4, 9))
+    max_labels = int(np.clip(np.floor(ax_width_px / 110.0), 4, 8))
     xlim = ax.get_xlim()
     span_minutes = max(0.0, (float(xlim[1]) - float(xlim[0])) * 24.0 * 60.0)
-    target_minutes = span_minutes / float(max_ticks) if max_ticks > 0 else span_minutes
+    choices = (
+        (1, 1),
+        (2, 1),
+        (5, 1),
+        (10, 2),
+        (15, 5),
+        (20, 5),
+        (30, 10),
+        (60, 15),
+        (120, 30),
+        (180, 60),
+        (360, 60),
+    )
 
-    major_interval = None
-    for interval in (1, 2, 5, 10, 15, 20, 30, 60, 120, 180, 360):
-        if interval >= target_minutes:
-            major_interval = interval
+    major_interval = choices[-1][0]
+    minor_interval = choices[-1][1]
+    for cand_major, cand_minor in choices:
+        ntick = int(np.ceil(span_minutes / float(cand_major))) + 1
+        if ntick <= max_labels:
+            major_interval = cand_major
+            minor_interval = cand_minor
             break
-    if major_interval is None:
-        major_interval = 360
 
     if major_interval < 60:
-        locator = mdates.MinuteLocator(interval=major_interval)
-        if major_interval <= 5:
-            minor_interval = 1
-        elif major_interval <= 15:
-            minor_interval = 5
-        elif major_interval <= 30:
-            minor_interval = 10
-        else:
-            minor_interval = 15
-        minor_locator = mdates.MinuteLocator(interval=minor_interval)
+        locator = mdates.MinuteLocator(byminute=range(0, 60, major_interval))
+        minor_locator = mdates.MinuteLocator(byminute=range(0, 60, minor_interval))
         formatter = mdates.DateFormatter('%H:%M')
     else:
         hour_interval = int(major_interval // 60)
-        locator = mdates.HourLocator(interval=hour_interval)
-        if hour_interval <= 1:
-            minor_locator = mdates.MinuteLocator(interval=15)
-        elif hour_interval <= 2:
-            minor_locator = mdates.MinuteLocator(interval=30)
+        locator = mdates.HourLocator(byhour=range(0, 24, hour_interval))
+        if minor_interval < 60:
+            minor_locator = mdates.MinuteLocator(byminute=range(0, 60, minor_interval))
+        elif minor_interval == 60:
+            minor_locator = mdates.HourLocator()
         else:
-            minor_locator = None
+            minor_hour = int(max(1, minor_interval // 60))
+            minor_locator = mdates.HourLocator(byhour=range(0, 24, minor_hour))
         formatter = mdates.DateFormatter('%H:%M')
 
     ax.xaxis.set_major_locator(locator)

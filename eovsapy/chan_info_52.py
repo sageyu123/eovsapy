@@ -110,7 +110,7 @@ class Chan_Info():
         # Sum number of science channels for all bands up to but
         # not including this one.
         nsci = 0
-        if band is 0:
+        if band == 0:
             pass
         else:
             for n in nscichan[0:band]:

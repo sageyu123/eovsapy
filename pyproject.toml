@@ -3,7 +3,7 @@ name = "eovsapy"
 version = "0.1.0.1"
 description = "Python code and files for Expanded Owens Valley Solar Array"
 readme = "README.md"
-requires-python = ">=3.6"
+requires-python = ">=3.8,<3.11"
 authors = [
     { name = "The EOVSA team", email = "sijie.yu@njit.edu" },
 ]
@@ -16,8 +16,9 @@ classifiers = [
     "Natural Language :: English",
     "Operating System :: OS Independent",
     "Programming Language :: Python",
-    "Programming Language :: Python :: 3.6",
     "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
     "Topic :: Scientific/Engineering :: Physics",
 ]
 dependencies = [
@@ -53,6 +54,13 @@ dev = [
     "PyQt5-Qt5",
     "PyQt5-sip",
 ]
+influx = [
+    "influxdb-client",
+]
+web = [
+    "fastapi",
+    "uvicorn",
+]
 
 [project.urls]
 Homepage = "https://github.com/ovro-eovsa/eovsapy"
@@ -60,6 +68,12 @@ Repository = "https://github.com/ovro-eovsa/eovsapy"
 
 [tool.setuptools]
 include-package-data = true
+
+[tool.setuptools.package-data]
+eovsapy = [
+    "calwidget_html/calwidget_v2_frontend/*",
+    "calwidget_html/calwidget_v2_frontend/vendor/*",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

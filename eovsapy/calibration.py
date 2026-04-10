@@ -1323,7 +1323,7 @@ if __name__ == "__main__":
             print('Calibration file not written--too many bad values.')
     else:
         # Date is after 2023 Oct 10, so use new VERY different calibration scheme
-        import .solpnt_x as sx
+        from . import solpnt_x as sx
         tsolpnt = t
         solout = sx.solpnt_xanal(tsolpnt)
         qual = sx.sp_check_qual(solout)

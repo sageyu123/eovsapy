@@ -1,0 +1,25 @@
+[Unit]
+Description=RETIRED: EOVSA live stateframe InfluxDB streamer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User for the target host.
+User=user
+WorkingDirectory=/data1/workdir
+Environment=EOVSA_ACC_INI=/common/python/runtime-cache/acc.ini
+Environment=EOVSA_STATEFRAME_XML=/common/python/runtime-cache/stateframe.xml
+Environment=EOVSA_POLL_INTERVAL=1.0
+Environment=EOVSA_CONDA_ROOT=/common/python/miniforge3
+Environment=EOVSA_CONDA_ENV_NAME=eovsapy3p10
+Environment=EOVSA_INFLUX_ORG=eovsa
+Environment=EOVSA_INFLUX_BUCKET=stateframe
+EnvironmentFile=-/etc/default/eovsa-influx-stream
+# Retired in favor of acc_exporter.service + Telegraf.
+ExecStart=/bin/bash /common/python/eovsapy-src/eovsapy/shellScript/influx_stream.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

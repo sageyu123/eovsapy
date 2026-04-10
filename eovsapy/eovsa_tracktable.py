@@ -199,3 +199,58 @@ def make_geosattable(sat,aa,mjd1=None,mjd2=None,dt=1/24.):
         mjd = mjd + dt
 
     return tbl
+
+
+def make_trajtables(srcname, aa, fname, mjd=None):
+    '''Make azel and radec trajectory tables for a SOLPNT scan pattern.'''
+
+    from .stateframe import par_angle
+
+    try:
+        src = aa.cat[srcname]
+    except Exception:
+        return 'Source ', srcname, ' not found in catalog!  Trajtables not generated.'
+
+    if mjd is None:
+        mjd = util.Time.now().mjd
+    aa.date = mjd - 15019.5
+    src = aa.cat[srcname]
+    src.compute(aa)
+    alt = src.alt
+    az = src.az
+    chi = par_angle(alt, az)
+    dec = src.dec
+    v = numpy.array(
+        [-100000, -50000, -20000, -10000, -5000, -2000, -1000, 0, 1000, 2000, 5000, 10000, 20000, 50000]
+    )
+    toff = numpy.array([30, 20, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 20])
+    xoff = v * numpy.cos(pi / 4)
+    xdecoff1 = xoff * numpy.cos(chi) + xoff * numpy.sin(chi)
+    decoff1 = -xoff * numpy.sin(chi) + xoff * numpy.cos(chi)
+    xdecoff2 = -xoff * numpy.cos(chi) + xoff * numpy.sin(chi)
+    decoff2 = xoff * numpy.sin(chi) + xoff * numpy.cos(chi)
+    try:
+        with open('/tmp/' + fname + '.azel', 'w') as f:
+            for i in range(len(xoff)):
+                if mjd < util.Time('2024-05-22 21:20').mjd:
+                    f.write(str(int(xoff[i] / numpy.cos(alt))) + ' ' + str(int(-xoff[i])) + ' ' + str(toff[i]) + '\n')
+                else:
+                    f.write(str(int(xoff[i])) + ' ' + str(int(-xoff[i])) + ' ' + str(toff[i]) + '\n')
+            for i in range(len(xoff)):
+                if mjd < util.Time('2024-05-22 21:20').mjd:
+                    f.write(str(int(-xoff[i] / numpy.cos(alt))) + ' ' + str(int(-xoff[i])) + ' ' + str(toff[i]) + '\n')
+                else:
+                    f.write(str(int(-xoff[i])) + ' ' + str(int(-xoff[i])) + ' ' + str(toff[i]) + '\n')
+        with open('/tmp/' + fname + '.radec', 'w') as f:
+            for i in range(len(xoff)):
+                f.write(str(int(-xdecoff1[i] / numpy.cos(dec))) + ' ' + str(int(-decoff1[i])) + ' ' + str(toff[i]) + '\n')
+            for i in range(len(xoff)):
+                f.write(str(int(-xdecoff2[i] / numpy.cos(dec))) + ' ' + str(int(-decoff2[i])) + ' ' + str(toff[i]) + '\n')
+        with open('/tmp/' + fname + '12.radec', 'w') as f:
+            for i in range(len(xoff)):
+                f.write(str(int(-xdecoff1[i] / numpy.cos(dec))) + ' ' + str(int(-decoff1[i])) + ' ' + str(toff[i]) + '\n')
+            for i in range(len(xoff)):
+                f.write(str(int(-xdecoff2[i] / numpy.cos(dec))) + ' ' + str(int(-decoff2[i])) + ' ' + str(toff[i]) + '\n')
+        return 'Success'
+    except Exception:
+        return 'Error: Writing of /tmp/solpnt.azel and /tmp/solpnt.radec failed!'

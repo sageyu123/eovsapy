@@ -1,4 +1,4 @@
-from util import Time
+from .util import Time
 import glob
 import numpy as np
 from copy import copy
