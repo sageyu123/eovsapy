@@ -394,7 +394,7 @@ button:disabled {
 
 .heatmap-box {
   flex: 1 1 0;
-  min-height: 18rem;
+  min-height: 22rem;
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -660,6 +660,12 @@ button:disabled {
   gap: 0.55rem;
 }
 
+.time-history-toolbar-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
 .scope-pills {
   display: flex;
   gap: 0.45rem;
@@ -717,6 +723,17 @@ button:disabled {
   border-color: rgba(255, 149, 0, 0.42);
 }
 
+.interval-chip.pending {
+  background: rgba(255, 69, 58, 0.09);
+  border-color: rgba(255, 69, 58, 0.28);
+  color: #7a2a24;
+}
+
+.interval-chip.pending.hovered {
+  background: rgba(255, 69, 58, 0.16);
+  border-color: rgba(255, 69, 58, 0.42);
+}
+
 .interval-chip button {
   border: 0;
   background: transparent;
@@ -730,6 +747,15 @@ button:disabled {
 .interval-chip-empty {
   color: #6a828e;
   font-size: 0.8rem;
+}
+
+.interval-chip-apply {
+  flex: 0 0 auto;
+  align-self: center;
+}
+
+.time-history-apply-inline {
+  flex: 0 0 auto;
 }
 
 .panel-grid-row {
@@ -900,6 +926,28 @@ button:disabled {
   stroke-width: 1.3;
 }
 
+.interval-delete {
+  cursor: pointer;
+}
+
+.interval-delete-bg {
+  fill: rgba(255, 255, 255, 0.96);
+  stroke: rgba(255, 69, 58, 0.92);
+  stroke-width: 1.1;
+}
+
+.interval-delete.hovered .interval-delete-bg {
+  fill: rgba(255, 226, 224, 0.96);
+}
+
+.interval-delete-label {
+  fill: rgba(255, 69, 58, 0.96);
+  font-size: 11px;
+  font-weight: 700;
+  pointer-events: none;
+  user-select: none;
+}
+
 .interval-start {
   stroke-dasharray: 4 3;
 }
@@ -1011,7 +1059,7 @@ button:disabled {
 
 .compact-th-box {
   flex: 1 1 0;
-  min-height: 18rem;
+  min-height: 23rem;
   overflow: hidden;
   display: flex;
   flex-direction: column;

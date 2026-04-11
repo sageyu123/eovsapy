@@ -141,9 +141,20 @@
 
   async function jsonFetch(url, options) {
     const response = await fetch(url, options || {});
-    const data = await response.json();
+    const text = await response.text();
+    let data = {};
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch (_err) {
+        if (!response.ok) {
+          throw new Error(text || response.statusText || "Request failed");
+        }
+        throw new Error("Invalid JSON response.");
+      }
+    }
     if (!response.ok) {
-      throw new Error(data.detail || "Request failed");
+      throw new Error((data && data.detail) || text || response.statusText || "Request failed");
     }
     return data;
   }
@@ -278,6 +289,66 @@
 
   function targetMaskKey(rowIdx, panelIdx) {
     return [rowIdx, panelIdx].join(":");
+  }
+
+  function normalizeJdInterval(startJd, endJd) {
+    return {
+      start_jd: Math.min(Number(startJd), Number(endJd)),
+      end_jd: Math.max(Number(startJd), Number(endJd)),
+    };
+  }
+
+  function timeFlagScopeLabel(scope) {
+    const match = TIME_FLAG_SCOPES.find(function (item) {
+      return item.id === scope;
+    });
+    return match ? match.label : String(scope || "");
+  }
+
+  function mergeTimeFlagIntervals(intervals, nextInterval) {
+    const normalized = normalizeJdInterval(nextInterval.start_jd, nextInterval.end_jd);
+    const mergedSeed = Object.assign({}, nextInterval, normalized);
+    const tol = 1.0e-9;
+    const kept = [];
+    let merged = mergedSeed;
+    (intervals || []).forEach(function (item) {
+      const sameTarget =
+        Number(item.antenna) === Number(merged.antenna)
+        && Number(item.band) === Number(merged.band)
+        && String(item.scope) === String(merged.scope);
+      const overlaps = !(
+        Number(item.end_jd) < Number(merged.start_jd) - tol
+        || Number(merged.end_jd) < Number(item.start_jd) - tol
+      );
+      if (sameTarget && overlaps) {
+        merged = Object.assign({}, merged, {
+          temp_id: String(item.temp_id || merged.temp_id),
+          start_jd: Math.min(Number(merged.start_jd), Number(item.start_jd)),
+          end_jd: Math.max(Number(merged.end_jd), Number(item.end_jd)),
+        });
+      } else {
+        kept.push(item);
+      }
+    });
+    kept.push(merged);
+    kept.sort(function (a, b) {
+      return Number(a.start_jd) - Number(b.start_jd) || Number(a.end_jd) - Number(b.end_jd);
+    });
+    return kept;
+  }
+
+  function intersectKeptRanges(rangesA, rangesB, bandEdges) {
+    if (!bandEdges || !bandEdges.length) {
+      return [];
+    }
+    const maskA = bandMaskFromRanges(rangesA, bandEdges);
+    const maskB = bandMaskFromRanges(rangesB, bandEdges);
+    return keptRangesFromMask(
+      maskA.map(function (value, idx) {
+        return Boolean(value) && Boolean(maskB[idx]);
+      }),
+      bandEdges
+    );
   }
 
   function defaultKeptRanges(bandEdges) {
@@ -588,7 +659,7 @@
       return html`<div className="plot-placeholder">${data.message}</div>`;
     }
     const width = 380;
-    const height = 320;
+    const height = 388;
     const margin = { left: 54, right: 84, top: 18, bottom: 44 };
     const plotWidth = width - margin.left - margin.right;
     const plotHeight = height - margin.top - margin.bottom;
@@ -1501,7 +1572,7 @@
       return html`<div className="plot-placeholder">${data.message}</div>`;
     }
     const width = 940;
-    const height = 470;
+    const height = 560;
     const outer = { left: 64, right: 28, top: 58, bottom: 46 };
     const gap = 52;
     const panelWidth = (width - outer.left - outer.right - gap) / 2;
@@ -1518,6 +1589,8 @@
     const phaseMin = (data.phase_ylim && data.phase_ylim[0]) || -4.0;
     const phaseMax = (data.phase_ylim && data.phase_ylim[1]) || 4.0;
     const intervalGroups = data.interval_groups || [];
+    const pendingIntervals = props.pendingIntervals || [];
+    const allIntervalGroups = intervalGroups.concat(pendingIntervals);
 
     function focusShell() {
       if (wrapperRef.current && typeof wrapperRef.current.focus === "function") {
@@ -1548,7 +1621,7 @@
       return xMin + ((clampedX - panelStart) / denom) * (xMax - xMin || 1.0);
     }
     function intervalGroupAtOffset(offset) {
-      const active = intervalGroups.filter(function (group) {
+      const active = allIntervalGroups.filter(function (group) {
         const left = Math.min(group.start_offset_min, group.end_offset_min);
         const right = Math.max(group.start_offset_min, group.end_offset_min);
         return offset >= left && offset <= right;
@@ -1665,7 +1738,7 @@
       });
     }
     function intervalBands(panelStart) {
-      return intervalGroups.map(function (group) {
+      return allIntervalGroups.map(function (group) {
         const leftOffset = Math.min(group.start_offset_min, group.end_offset_min);
         const rightOffset = Math.max(group.start_offset_min, group.end_offset_min);
         const left = xMap(leftOffset, panelStart);
@@ -1676,6 +1749,51 @@
             <rect x=${left} y=${y0} width=${Math.max(right - left, 1.5)} height=${panelHeight} className="interval-band" />
             <line x1=${left} x2=${left} y1=${y0} y2=${y0 + panelHeight} className="interval-boundary interval-start" />
             <line x1=${right} x2=${right} y1=${y0} y2=${y0 + panelHeight} className="interval-boundary interval-end" />
+          </g>
+        `;
+      });
+    }
+    function deleteIntervalGroup(groupId) {
+      if (String(groupId).indexOf("staged:") === 0) {
+        props.onDeletePendingInterval(groupId);
+      } else {
+        props.onDeleteInterval(groupId);
+      }
+    }
+    function intervalDeleteButtons(panelStart) {
+      const buttonSize = 15;
+      return allIntervalGroups.map(function (group) {
+        const leftOffset = Math.min(group.start_offset_min, group.end_offset_min);
+        const rightOffset = Math.max(group.start_offset_min, group.end_offset_min);
+        const left = xMap(leftOffset, panelStart);
+        const right = xMap(rightOffset, panelStart);
+        const x = clamp(right - buttonSize - 2, left + 1, panelStart + panelWidth - buttonSize - 1);
+        const y = y0 + 2;
+        const hovered = hoveredGroupId === group.group_id;
+        return html`
+          <g
+            key=${panelStart + "-interval-delete-" + group.group_id}
+            className=${hovered ? "interval-delete hovered" : "interval-delete"}
+            onMouseEnter=${function () {
+              setHoveredGroupId(group.group_id);
+            }}
+            onMouseLeave=${function () {
+              setHoveredGroupId(function (current) {
+                return current === group.group_id ? null : current;
+              });
+            }}
+            onPointerDown=${function (event) {
+              event.stopPropagation();
+            }}
+            onClick=${function (event) {
+              event.stopPropagation();
+              deleteIntervalGroup(group.group_id);
+            }}
+          >
+            <rect x=${x} y=${y} width=${buttonSize} height=${buttonSize} rx="3" ry="3" className="interval-delete-bg" />
+            <text x=${x + buttonSize / 2} y=${y + buttonSize / 2 + 0.5} textAnchor="middle" dominantBaseline="middle" className="interval-delete-label">
+              ×
+            </text>
           </g>
         `;
       });
@@ -1723,7 +1841,7 @@
         event.currentTarget.setPointerCapture(event.pointerId);
       }
       if (props.onStatus) {
-        props.onStatus("Drag to set a time-flag interval.");
+        props.onStatus("Drag to stage flagged range. Click Apply Mask to apply.");
       }
     }
     function pointerMove(event, panelStart) {
@@ -1763,7 +1881,7 @@
         }
         return;
       }
-      props.onAddInterval(start, end);
+      props.onStageInterval(start, end);
     }
     function pointerLeave() {
       if (!dragState) {
@@ -1775,11 +1893,11 @@
     function deleteHoveredInterval() {
       if (!hoveredGroupId) {
         if (props.onStatus) {
-          props.onStatus("X ignored. Hover an interval or interval chip first.");
+          props.onStatus("X ignored. Hover an interval first.");
         }
         return;
       }
-      props.onDeleteInterval(hoveredGroupId);
+      deleteIntervalGroup(hoveredGroupId);
     }
     function handleKeyDown(event) {
       const target = event.target;
@@ -1807,7 +1925,7 @@
           }
           return;
         }
-        props.onAddInterval(pendingAnchorJd, hoverJd);
+        props.onStageInterval(pendingAnchorJd, hoverJd);
         setPendingAnchorJd(null);
       } else if (key === "X") {
         event.preventDefault();
@@ -1843,6 +1961,22 @@
               `;
             })}
           </div>
+          ${pendingIntervals.length
+            ? html`
+                <div className="time-history-toolbar-actions">
+                  <button
+                    type="button"
+                    className="btn-outline-blue time-history-apply-inline"
+                    disabled=${props.busy}
+                    onClick=${function () {
+                      props.onApplyPending();
+                    }}
+                  >
+                    Apply Mask
+                  </button>
+                </div>
+              `
+            : null}
           <div className="time-history-readout">
             <span>${hoverReadout}</span>
             ${Number.isFinite(pendingAnchorJd)
@@ -1854,40 +1988,6 @@
           ${(data.series || []).map(function (series) {
             return legendItem(series.label, series.color, "points");
           })}
-        </div>
-        <div className="interval-chip-list">
-          ${intervalGroups.length
-            ? intervalGroups.map(function (group) {
-                const hovered = hoveredGroupId === group.group_id;
-                return html`
-                  <div
-                    key=${"chip-" + group.group_id}
-                    className=${"interval-chip" + (hovered ? " hovered" : "")}
-                    onMouseEnter=${function () {
-                      setHoveredGroupId(group.group_id);
-                    }}
-                    onMouseLeave=${function () {
-                      setHoveredGroupId(function (current) {
-                        return current === group.group_id ? null : current;
-                      });
-                    }}
-                  >
-                    <span>${group.scope_label + " " + group.start_label + " - " + group.end_label}</span>
-                    <button
-                      type="button"
-                      disabled=${props.busy}
-                      aria-label=${"Delete interval " + group.start_label + " to " + group.end_label}
-                      onClick=${function (event) {
-                        event.stopPropagation();
-                        props.onDeleteInterval(group.group_id);
-                      }}
-                    >
-                      ×
-                    </button>
-                  </div>
-                `;
-              })
-            : null}
         </div>
         <svg
           ref=${svgRef}
@@ -1971,6 +2071,7 @@
             }}
             onPointerLeave=${pointerLeave}
           />
+          ${intervalDeleteButtons(ampX0)}
         </svg>
       </div>
     `;
@@ -2006,8 +2107,8 @@
     }
 
     const width = 480;
-    const ampHeight = 132;
-    const phaseHeight = 154;
+    const ampHeight = 164;
+    const phaseHeight = 192;
     const ampOuter = { left: 50, right: 18, top: 12, bottom: 10 };
     const phaseOuter = { left: 50, right: 18, top: 8, bottom: 28 };
     const plotWidth = width - ampOuter.left - ampOuter.right;
@@ -2022,6 +2123,8 @@
     const phaseMin = (data.phase_ylim && data.phase_ylim[0]) || -4.0;
     const phaseMax = (data.phase_ylim && data.phase_ylim[1]) || 4.0;
     const intervalGroups = data.interval_groups || [];
+    const pendingIntervals = props.pendingIntervals || [];
+    const allIntervalGroups = intervalGroups.concat(pendingIntervals);
 
     function focusShell() {
       if (wrapperRef.current && typeof wrapperRef.current.focus === "function") {
@@ -2052,7 +2155,7 @@
       return xMin + ((clampedX - ampOuter.left) / denom) * (xMax - xMin || 1.0);
     }
     function intervalGroupAtOffset(offset) {
-      const active = intervalGroups.filter(function (group) {
+      const active = allIntervalGroups.filter(function (group) {
         const left = Math.min(group.start_offset_min, group.end_offset_min);
         const right = Math.max(group.start_offset_min, group.end_offset_min);
         return offset >= left && offset <= right;
@@ -2165,7 +2268,7 @@
       });
     }
     function intervalBands(top, plotHeight) {
-      return intervalGroups.map(function (group) {
+      return allIntervalGroups.map(function (group) {
         const leftOffset = Math.min(group.start_offset_min, group.end_offset_min);
         const rightOffset = Math.max(group.start_offset_min, group.end_offset_min);
         const left = xMap(leftOffset);
@@ -2176,6 +2279,51 @@
             <rect x=${left} y=${top} width=${Math.max(right - left, 1.5)} height=${plotHeight} className="interval-band" />
             <line x1=${left} x2=${left} y1=${top} y2=${top + plotHeight} className="interval-boundary interval-start" />
             <line x1=${right} x2=${right} y1=${top} y2=${top + plotHeight} className="interval-boundary interval-end" />
+          </g>
+        `;
+      });
+    }
+    function deleteIntervalGroup(groupId) {
+      if (String(groupId).indexOf("staged:") === 0) {
+        props.onDeletePendingInterval(groupId);
+      } else {
+        props.onDeleteInterval(groupId);
+      }
+    }
+    function intervalDeleteButtons(top) {
+      const buttonSize = 15;
+      return allIntervalGroups.map(function (group) {
+        const leftOffset = Math.min(group.start_offset_min, group.end_offset_min);
+        const rightOffset = Math.max(group.start_offset_min, group.end_offset_min);
+        const left = xMap(leftOffset);
+        const right = xMap(rightOffset);
+        const x = clamp(right - buttonSize - 2, left + 1, ampOuter.left + plotWidth - buttonSize - 1);
+        const y = top + 2;
+        const hovered = hoveredGroupId === group.group_id;
+        return html`
+          <g
+            key=${top + "-interval-delete-" + group.group_id}
+            className=${hovered ? "interval-delete hovered" : "interval-delete"}
+            onMouseEnter=${function () {
+              setHoveredGroupId(group.group_id);
+            }}
+            onMouseLeave=${function () {
+              setHoveredGroupId(function (current) {
+                return current === group.group_id ? null : current;
+              });
+            }}
+            onPointerDown=${function (event) {
+              event.stopPropagation();
+            }}
+            onClick=${function (event) {
+              event.stopPropagation();
+              deleteIntervalGroup(group.group_id);
+            }}
+          >
+            <rect x=${x} y=${y} width=${buttonSize} height=${buttonSize} rx="3" ry="3" className="interval-delete-bg" />
+            <text x=${x + buttonSize / 2} y=${y + buttonSize / 2 + 0.5} textAnchor="middle" dominantBaseline="middle" className="interval-delete-label">
+              ×
+            </text>
           </g>
         `;
       });
@@ -2223,7 +2371,7 @@
         event.currentTarget.setPointerCapture(event.pointerId);
       }
       if (props.onStatus) {
-        props.onStatus("Drag to set a time-flag interval.");
+        props.onStatus("Drag to stage flagged range. Click Apply Mask to apply.");
       }
     }
     function pointerMove(event, svgRef, svgWidth) {
@@ -2263,7 +2411,7 @@
         }
         return;
       }
-      props.onAddInterval(start, end);
+      props.onStageInterval(start, end);
     }
     function pointerLeave() {
       if (!dragState) {
@@ -2275,11 +2423,11 @@
     function deleteHoveredInterval() {
       if (!hoveredGroupId) {
         if (props.onStatus) {
-          props.onStatus("X ignored. Hover an interval or interval chip first.");
+          props.onStatus("X ignored. Hover an interval first.");
         }
         return;
       }
-      props.onDeleteInterval(hoveredGroupId);
+      deleteIntervalGroup(hoveredGroupId);
     }
     function handleKeyDown(event) {
       const target = event.target;
@@ -2307,7 +2455,7 @@
           }
           return;
         }
-        props.onAddInterval(pendingAnchorJd, hoverJd);
+        props.onStageInterval(pendingAnchorJd, hoverJd);
         setPendingAnchorJd(null);
       } else if (key === "X") {
         event.preventDefault();
@@ -2341,6 +2489,22 @@
               `;
             })}
           </div>
+          ${pendingIntervals.length
+            ? html`
+                <div className="time-history-toolbar-actions">
+                  <button
+                    type="button"
+                    className="btn-outline-blue time-history-apply-inline"
+                    disabled=${props.busy}
+                    onClick=${function () {
+                      props.onApplyPending();
+                    }}
+                  >
+                    Apply Mask
+                  </button>
+                </div>
+              `
+            : null}
         </div>
         <svg
           ref=${ampSvgRef}
@@ -2386,6 +2550,7 @@
             }}
             onPointerLeave=${pointerLeave}
           />
+          ${intervalDeleteButtons(ampOuter.top)}
         </svg>
         <svg
           ref=${phaseSvgRef}
@@ -2434,40 +2599,6 @@
             onPointerLeave=${pointerLeave}
           />
         </svg>
-        <div className="interval-chip-list">
-          ${intervalGroups.length
-            ? intervalGroups.map(function (group) {
-                const hovered = hoveredGroupId === group.group_id;
-                return html`
-                  <div
-                    key=${"compact-chip-" + group.group_id}
-                    className=${"interval-chip" + (hovered ? " hovered" : "")}
-                    onMouseEnter=${function () {
-                      setHoveredGroupId(group.group_id);
-                    }}
-                    onMouseLeave=${function () {
-                      setHoveredGroupId(function (current) {
-                        return current === group.group_id ? null : current;
-                      });
-                    }}
-                  >
-                    <span>${group.scope_label + " " + group.start_label + " - " + group.end_label}</span>
-                    <button
-                      type="button"
-                      disabled=${props.busy}
-                      aria-label=${"Delete interval " + group.start_label + " to " + group.end_label}
-                      onClick=${function (event) {
-                        event.stopPropagation();
-                        props.onDeleteInterval(group.group_id);
-                      }}
-                    >
-                      ×
-                    </button>
-                  </div>
-                `;
-              })
-            : null}
-        </div>
       </div>
     `;
   }
@@ -2491,6 +2622,7 @@
     const [timeHistoryData, setTimeHistoryData] = useState(null);
     const [heatmapData, setHeatmapData] = useState(null);
     const [overviewData, setOverviewData] = useState(null);
+    const [stagedTimeIntervals, setStagedTimeIntervals] = useState([]);
     const [stagedInbandPanels, setStagedInbandPanels] = useState({});
     const [stagedInbandMasks, setStagedInbandMasks] = useState({});
     const [heatmapLoadedRevision, setHeatmapLoadedRevision] = useState(-1);
@@ -2551,10 +2683,18 @@
     useEffect(
       function () {
         setInbandResidualInspector(null);
+        setStagedTimeIntervals([]);
         setStagedInbandPanels({});
         setStagedInbandMasks({});
       },
       [dataRevision]
+    );
+
+    useEffect(
+      function () {
+        setStagedTimeIntervals([]);
+      },
+      [selectionRevision]
     );
 
     function syncDraft(nextState) {
@@ -2924,15 +3064,56 @@
       });
     }
 
-    function addTimeFlag(startJd, endJd) {
+    function stageTimeFlag(startJd, endJd) {
+      if (!state) {
+        return;
+      }
+      const normalized = normalizeJdInterval(startJd, endJd);
+      if (Math.abs(normalized.end_jd - normalized.start_jd) <= 1.0e-9) {
+        setInteractionMessage("Ignored click without drag.");
+        return;
+      }
+      const pending = {
+        temp_id: "staged:" + Date.now().toString(36) + ":" + Math.random().toString(36).slice(2, 8),
+        antenna: Number(state.selected_ant),
+        band: Number(state.selected_band),
+        scope: String(timeFlagScope),
+        start_jd: Number(normalized.start_jd),
+        end_jd: Number(normalized.end_jd),
+      };
+      setStagedTimeIntervals(function (current) {
+        return mergeTimeFlagIntervals(current, pending);
+      });
+      setInteractionMessage("Time flag staged. Click Apply Mask to apply.");
+    }
+
+    function removeStagedTimeFlag(groupId) {
+      setStagedTimeIntervals(function (current) {
+        return current.filter(function (item) {
+          return String(item.temp_id) !== String(groupId);
+        });
+      });
+      setInteractionMessage("Removed staged time flag.");
+    }
+
+    function applyStagedTimeFlags() {
+      if (busy || !sessionId || !stagedTimeIntervals.length) {
+        return;
+      }
       setInteractionMessage("");
       runAction(
         function () {
-          return postJson("/api/time-flags/add", {
+          return postJson("/api/time-flags/add-batch", {
             session_id: sessionId,
-            start_jd: startJd,
-            end_jd: endJd,
-            scope: timeFlagScope,
+            intervals: stagedTimeIntervals.map(function (item) {
+              return {
+                antenna: Number(item.antenna),
+                band: Number(item.band),
+                start_jd: Number(item.start_jd),
+                end_jd: Number(item.end_jd),
+                scope: String(item.scope),
+              };
+            }),
           });
         },
         { progressKind: "time_flag", successMessage: "Time flag applied" }
@@ -2953,7 +3134,11 @@
     }
 
     function targetInbandRows(sourcePol) {
-      const pol = clamp(Number(sourcePol), 0, 1);
+      const sourceRow = Number(sourcePol);
+      if (sourceRow === 2) {
+        return [0, 1];
+      }
+      const pol = clamp(sourceRow, 0, 1);
       return inbandPolScope === "all" ? [0, 1] : [pol];
     }
 
@@ -3023,24 +3208,28 @@
       const sectionIds = ["inband_fit", "inband_relative_phase"];
       const nextOverrides = {};
       const nextMasks = {};
-      sectionIds.forEach(function (sectionId) {
-        const section = overviewData[sectionId];
-        const bandEdges = section && section.band_edges ? section.band_edges : [];
-        const row = section && section.panels && section.panels[rowIdx] ? section.panels[rowIdx] : [];
-        const originalPanel = row[panelIdx];
-        if (!originalPanel || !bandEdges.length) {
-          return;
-        }
-        const nextRanges = defaultKeptRanges(bandEdges);
-        const key = panelSelectionKey(sectionId, rowIdx, panelIdx);
-        nextOverrides[key] = optimisticPanelUpdate(originalPanel, nextRanges, bandEdges);
+      targetInbandRows(rowIdx).forEach(function (maskRowIdx) {
+        sectionIds.forEach(function (sectionId) {
+          const section = overviewData[sectionId];
+          const bandEdges = section && section.band_edges ? section.band_edges : [];
+          const row = section && section.panels && section.panels[maskRowIdx] ? section.panels[maskRowIdx] : [];
+          const originalPanel = row[panelIdx];
+          if (!originalPanel || !bandEdges.length) {
+            return;
+          }
+          const nextRanges = defaultKeptRanges(bandEdges);
+          const key = panelSelectionKey(sectionId, maskRowIdx, panelIdx);
+          nextOverrides[key] = optimisticPanelUpdate(originalPanel, nextRanges, bandEdges);
+        });
       });
       const resetRanges = sectionIds.length ? defaultKeptRanges((overviewData.inband_fit && overviewData.inband_fit.band_edges) || []) : [];
-      nextMasks[targetMaskKey(rowIdx, panelIdx)] = {
-        antenna: panelIdx,
-        polarization: rowIdx,
-        kept_ranges: resetRanges,
-      };
+      targetInbandRows(rowIdx).forEach(function (maskRowIdx) {
+        nextMasks[targetMaskKey(maskRowIdx, panelIdx)] = {
+          antenna: panelIdx,
+          polarization: maskRowIdx,
+          kept_ranges: resetRanges,
+        };
+      });
       if (Object.keys(nextOverrides).length) {
         setStagedInbandPanels(function (current) {
           return Object.assign({}, current, nextOverrides);
@@ -3060,6 +3249,25 @@
     }
 
     function panelWithStagedInbandSelection(sectionId, rowIdx, panelIdx, panel) {
+      if (sectionId === "inband_relative_phase" && rowIdx === 2) {
+        const section = overviewData && overviewData[sectionId] ? overviewData[sectionId] : null;
+        const bandEdges = section && section.band_edges ? section.band_edges : [];
+        const xKey = panelSelectionKey(sectionId, 0, panelIdx);
+        const yKey = panelSelectionKey(sectionId, 1, panelIdx);
+        const xRow = section && section.panels && section.panels[0] ? section.panels[0] : [];
+        const yRow = section && section.panels && section.panels[1] ? section.panels[1] : [];
+        const xPanel = stagedInbandPanels[xKey]
+          ? Object.assign({}, xRow[panelIdx] || {}, stagedInbandPanels[xKey])
+          : xRow[panelIdx];
+        const yPanel = stagedInbandPanels[yKey]
+          ? Object.assign({}, yRow[panelIdx] || {}, stagedInbandPanels[yKey])
+          : yRow[panelIdx];
+        if (xPanel && yPanel && bandEdges.length) {
+          return Object.assign({}, panel, {
+            kept_ranges: intersectKeptRanges(xPanel.kept_ranges, yPanel.kept_ranges, bandEdges),
+          });
+        }
+      }
       const override = stagedInbandPanels[panelSelectionKey(sectionId, rowIdx, panelIdx)];
       return override ? Object.assign({}, panel, override) : panel;
     }
@@ -3258,6 +3466,31 @@
         : "—";
     const scanCount = state && state.scans ? state.scans.length : 0;
     const scanlistMaxHeightPx = Math.min(320, Math.max(80, 28 + scanCount * 29));
+    const selectedPendingTimeIntervals =
+      state && timeHistoryData && !timeHistoryData.message
+        ? stagedTimeIntervals
+            .filter(function (item) {
+              return Number(item.antenna) === Number(state.selected_ant) && Number(item.band) === Number(state.selected_band);
+            })
+            .sort(function (a, b) {
+              return Number(a.start_jd) - Number(b.start_jd) || Number(a.end_jd) - Number(b.end_jd);
+            })
+            .map(function (item) {
+              return {
+                group_id: String(item.temp_id),
+                scope: String(item.scope),
+                scope_label: timeFlagScopeLabel(item.scope),
+                source: "staged",
+                pending: true,
+                start_jd: Number(item.start_jd),
+                end_jd: Number(item.end_jd),
+                start_offset_min: (Number(item.start_jd) - Number(timeHistoryData.start_jd || 0)) * 24.0 * 60.0,
+                end_offset_min: (Number(item.end_jd) - Number(timeHistoryData.start_jd || 0)) * 24.0 * 60.0,
+                start_label: formatUtcTime(Number(item.start_jd)),
+                end_label: formatUtcTime(Number(item.end_jd)),
+              };
+            })
+        : [];
 
     return html`
       <div className="app-shell">
@@ -3494,8 +3727,11 @@
               <${CompactTimeHistoryPlot}
                 data=${timeHistoryData}
                 scope=${timeFlagScope}
+                pendingIntervals=${selectedPendingTimeIntervals}
                 onScopeChange=${setTimeFlagScope}
-                onAddInterval=${addTimeFlag}
+                onStageInterval=${stageTimeFlag}
+                onApplyPending=${applyStagedTimeFlags}
+                onDeletePendingInterval=${removeStagedTimeFlag}
                 onDeleteInterval=${deleteTimeFlag}
                 onStatus=${setInteractionMessage}
                 busy=${busy}

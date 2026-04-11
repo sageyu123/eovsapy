@@ -1133,21 +1133,44 @@ def ensure_time_flag_groups(scan: ScanAnalysis) -> List[TimeFlagGroup]:
 
 
 def add_time_flag_group(scan: ScanAnalysis, ant: int, band: int, start_jd: float, end_jd: float, scope: str) -> TimeFlagGroup:
-    """Append one browser-native interval group to the selected scan."""
+    """Append or merge one browser-native interval group on the selected scan."""
 
     ensure_time_flag_groups(scan)
     start_norm, end_norm = _normalize_interval(start_jd, end_jd)
     if np.isclose(start_norm, end_norm, rtol=0.0, atol=1.0e-9):
         raise CalWidgetV2Error("Time-flag interval width is zero.")
-    group = TimeFlagGroup(
-        group_id=uuid4().hex,
-        scope=str(scope),
-        start_jd=start_norm,
-        end_jd=end_norm,
-        targets=_targets_for_scope(scan.layout, ant, band, str(scope)),
-        source="browser",
-    )
-    scan.time_flag_groups.append(group)
+    scope_str = str(scope)
+    targets = sorted(_targets_for_scope(scan.layout, ant, band, scope_str))
+    tol = 1.0e-9
+    overlapping: List[TimeFlagGroup] = []
+    kept_groups: List[TimeFlagGroup] = []
+    for group in scan.time_flag_groups:
+        same_scope = str(group.scope) == scope_str
+        same_targets = sorted(group.targets) == targets
+        overlaps = not (float(group.end_jd) < start_norm - tol or end_norm < float(group.start_jd) - tol)
+        if same_scope and same_targets and overlaps:
+            overlapping.append(group)
+            continue
+        kept_groups.append(group)
+    if overlapping:
+        group = TimeFlagGroup(
+            group_id=str(overlapping[0].group_id),
+            scope=scope_str,
+            start_jd=min([start_norm] + [float(item.start_jd) for item in overlapping]),
+            end_jd=max([end_norm] + [float(item.end_jd) for item in overlapping]),
+            targets=targets,
+            source="browser",
+        )
+    else:
+        group = TimeFlagGroup(
+            group_id=uuid4().hex,
+            scope=scope_str,
+            start_jd=start_norm,
+            end_jd=end_norm,
+            targets=targets,
+            source="browser",
+        )
+    scan.time_flag_groups = kept_groups + [group]
     scan.time_flag_groups.sort(key=lambda item: (item.start_jd, item.end_jd, item.group_id))
     return group
 
@@ -1554,6 +1577,7 @@ def _band_average_selected_antennas(
     used_band_ids = np.zeros(layout.maxnbd, dtype=np.int32)
     if not ants:
         return band_vis, fghz_band, used_band_ids, ants
+    selected_vis = channel_vis[ants, :, :, :]
     for band_value in np.unique(band_id[band_id > 0]):
         idx = np.where(band_id == band_value)[0]
         if idx.size == 0:
@@ -1561,7 +1585,7 @@ def _band_average_selected_antennas(
         full_index = int(band_value) - 1
         fghz_band[full_index] = np.nanmean(freq_ghz[idx])
         used_band_ids[full_index] = int(band_value)
-        band_vis[:, :, full_index, :] = _safe_nanmean(channel_vis[ants, :, idx, :], axis=2)
+        band_vis[:, :, full_index, :] = _safe_nanmean(selected_vis[:, :, idx, :], axis=2)
     if layout.maxnbd > 1 and fghz_band[1] < 1.0:
         fghz_band[1] = 1.9290
     return band_vis, fghz_band, used_band_ids, ants

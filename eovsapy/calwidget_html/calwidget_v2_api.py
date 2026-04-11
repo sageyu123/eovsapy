@@ -189,6 +189,22 @@ class TimeFlagAddRequest(SessionRequest):
     scope: str
 
 
+class TimeFlagInterval(BaseModel):
+    """One staged browser-native time-flag interval."""
+
+    antenna: int
+    band: int
+    start_jd: float
+    end_jd: float
+    scope: str
+
+
+class TimeFlagBatchRequest(SessionRequest):
+    """Apply multiple staged browser-native time-flag intervals."""
+
+    intervals: List[TimeFlagInterval]
+
+
 class TimeFlagDeleteRequest(SessionRequest):
     """Delete one browser-native time-flag interval group."""
 
@@ -433,6 +449,38 @@ class WidgetSession:
 
         scan = self._selected_editable_scan()
         group = add_time_flag_group(scan, self.selected_ant, self.selected_band, start_jd, end_jd, scope)
+        self._refresh_time_flag_scan(scan)
+        self.status_message = "Added {0} time flag {1}-{2} for {3}.".format(
+            group.scope,
+            Time(group.start_jd, format="jd").iso[11:19],
+            Time(group.end_jd, format="jd").iso[11:19],
+            scan.scan_kind,
+        )
+
+    def add_time_flags(self, intervals: List[TimeFlagInterval]) -> None:
+        """Add multiple browser-native time-flag interval groups and refresh once."""
+
+        if not intervals:
+            return
+        scan = self._selected_editable_scan()
+        groups = []
+        for interval in intervals:
+            groups.append(
+                add_time_flag_group(
+                    scan,
+                    int(interval.antenna),
+                    int(interval.band),
+                    float(interval.start_jd),
+                    float(interval.end_jd),
+                    str(interval.scope),
+                )
+            )
+        self._refresh_time_flag_scan(scan)
+        self.status_message = "Applied {0:d} staged time-flag interval(s) for {1}.".format(len(groups), scan.scan_kind)
+
+    def _refresh_time_flag_scan(self, scan: ScanAnalysis) -> None:
+        """Recompute products after browser-native time-flag edits."""
+
         if scan.scan_kind == "refcal":
             refresh_refcal_solution(scan)
             scan.saved_to_sql = False
@@ -446,12 +494,6 @@ class WidgetSession:
             scan.saved_to_sql = False
         else:
             raise CalWidgetV2Error("Time-flag editing is only available for analyzed refcal or phacal scans.")
-        self.status_message = "Added {0} time flag {1}-{2} for {3}.".format(
-            group.scope,
-            Time(group.start_jd, format="jd").iso[11:19],
-            Time(group.end_jd, format="jd").iso[11:19],
-            scan.scan_kind,
-        )
 
     def delete_time_flag(self, group_id: str) -> None:
         """Delete one browser-native time-flag interval group and live-recompute."""
@@ -460,19 +502,7 @@ class WidgetSession:
         removed = delete_time_flag_group(scan, group_id)
         if not removed:
             raise CalWidgetV2Error("Requested time-flag interval was not found.")
-        if scan.scan_kind == "refcal":
-            refresh_refcal_solution(scan)
-            scan.saved_to_sql = False
-            self._invalidate_dependent_phacals(scan.scan_id)
-        elif scan.scan_kind == "phacal":
-            ref_id = scan.applied_ref_id if scan.applied_ref_id is not None else self.ref_scan_id
-            if ref_id is None:
-                raise CalWidgetV2Error("Active refcal is required to recompute time-flagged phacal data.")
-            refcal = self._ensure_refcal_analysis(int(ref_id))
-            refresh_phacal_solution(scan, refcal)
-            scan.saved_to_sql = False
-        else:
-            raise CalWidgetV2Error("Time-flag editing is only available for analyzed refcal or phacal scans.")
+        self._refresh_time_flag_scan(scan)
         self.status_message = "Deleted one time-flag interval from {0}.".format(scan.scan_kind)
 
     def _editable_inband_refcal(self) -> tuple[int, ScanAnalysis]:
@@ -1049,6 +1079,17 @@ def build_app() -> FastAPI:
         session = _get_session(payload.session_id)
         try:
             session.add_time_flag(payload.start_jd, payload.end_jd, payload.scope)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return session.state()
+
+    @app.post("/api/time-flags/add-batch")
+    def add_time_flags(payload: TimeFlagBatchRequest) -> Dict:
+        """Add multiple browser-native time-flag interval groups."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.add_time_flags(payload.intervals)
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         return session.state()
