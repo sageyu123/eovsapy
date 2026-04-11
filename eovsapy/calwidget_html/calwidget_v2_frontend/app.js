@@ -388,15 +388,33 @@
   }
 
   function mergeSectionAntennaPanels(currentSection, updateSection, antennaIndex) {
-    if (!updateSection || !updateSection.panels || !Number.isFinite(antennaIndex) || antennaIndex < 0) {
+    if (!updateSection || !updateSection.panels) {
+      return updateSection || currentSection;
+    }
+    const sparseAntennas = Array.isArray(updateSection.sparse_antennas)
+      ? updateSection.sparse_antennas
+          .map(function (value) {
+            return Number(value);
+          })
+          .filter(function (value) {
+            return Number.isFinite(value) && value >= 0;
+          })
+      : null;
+    const antennaSet =
+      sparseAntennas && sparseAntennas.length
+        ? new Set(sparseAntennas)
+        : Number.isFinite(antennaIndex) && antennaIndex >= 0
+        ? new Set([antennaIndex])
+        : null;
+    if (!antennaSet) {
       return updateSection || currentSection;
     }
     const currentPanels = currentSection && currentSection.panels ? currentSection.panels : [];
     const mergedPanels = (updateSection.panels || []).map(function (row, rowIdx) {
       const currentRow = currentPanels[rowIdx] || [];
       return row.map(function (panel, panelIdx) {
-        if (panelIdx === antennaIndex) {
-          return panel;
+        if (antennaSet.has(panelIdx)) {
+          return panel || currentRow[panelIdx] || panel;
         }
         return currentRow[panelIdx] || panel;
       });
@@ -2846,8 +2864,7 @@
       syncDraft(nextState);
       if (next && next.overview_updates) {
         const responseAntenna = next.updated_antenna;
-        const patchAntenna =
-          responseAntenna === 0 || responseAntenna === null || responseAntenna === undefined ? null : antennaIndex;
+        const patchAntenna = Number.isFinite(responseAntenna) ? responseAntenna : antennaIndex;
         setOverviewData(function (current) {
           return mergeOverviewAntennaUpdates(current, next.overview_updates, patchAntenna);
         });
@@ -3076,7 +3093,7 @@
             syncDraft(nextState);
             if (next && next.overview_updates) {
               setOverviewData(function (current) {
-                return Object.assign({}, current || {}, next.overview_updates);
+                return mergeOverviewAntennaUpdates(current, next.overview_updates, null);
               });
             }
             clearStagedInbandSelection();

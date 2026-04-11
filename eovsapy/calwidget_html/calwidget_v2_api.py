@@ -505,7 +505,7 @@ class WidgetSession:
             refcal.delay_solution.active_ns[ant, 0] = float(x_delay_ns)
         if y_delay_ns is not None:
             refcal.delay_solution.active_ns[ant, 1] = float(y_delay_ns)
-        refresh_refcal_solution(refcal)
+        refresh_refcal_solution(refcal, antenna_indices=[ant], invalidate_legacy_summary=False)
         try:
             refcal.sidecar_path = write_sidecar(refcal)
         except Exception:
@@ -626,6 +626,7 @@ class WidgetSession:
             return
         ref_id, refcal = self._editable_inband_refcal()
         last_ant = self.selected_ant
+        changed_ants = set()
         last_start = 0
         last_end = 0
         last_mode = "replace"
@@ -654,13 +655,18 @@ class WidgetSession:
             else:
                 raise CalWidgetV2Error("Unknown in-band polarization scope {0}.".format(polarization_scope))
             refcal.delay_solution.update_kept_band_mask(ant_indices, pol_indices, start_band, end_band, mode=str(operation.mode))
+            changed_ants.update(int(ant) for ant in ant_indices)
             last_ant = ant0
             last_start = min(start_band, end_band)
             last_end = max(start_band, end_band)
             last_mode = str(operation.mode)
             last_polarization_scope = polarization_scope
             last_ant_count = len(ant_indices)
-        refresh_refcal_solution(refcal)
+        refresh_refcal_solution(
+            refcal,
+            antenna_indices=None if len(changed_ants) >= refcal.layout.nsolant else sorted(changed_ants),
+            invalidate_legacy_summary=False,
+        )
         refcal.saved_to_sql = False
         self._invalidate_dependent_phacals(ref_id)
         self.selected_ant = last_ant
@@ -687,13 +693,19 @@ class WidgetSession:
             return
         ref_id, refcal = self._editable_inband_refcal()
         last_ant = self.selected_ant
+        changed_ants = set()
         for target in targets:
             ant = int(max(0, min(int(target.antenna), refcal.layout.nsolant - 1)))
             pol = int(max(0, min(int(target.polarization), 1)))
             ranges = [(int(item.start_band), int(item.end_band)) for item in target.kept_ranges]
             refcal.delay_solution.set_kept_band_ranges(ant, pol, ranges)
+            changed_ants.add(ant)
             last_ant = ant
-        refresh_refcal_solution(refcal)
+        refresh_refcal_solution(
+            refcal,
+            antenna_indices=None if len(changed_ants) >= refcal.layout.nsolant else sorted(changed_ants),
+            invalidate_legacy_summary=False,
+        )
         refcal.saved_to_sql = False
         self._invalidate_dependent_phacals(ref_id)
         self.selected_ant = last_ant
@@ -706,11 +718,13 @@ class WidgetSession:
         if antenna is None:
             refcal.delay_solution.reset_all()
             message = "Reset all active in-band delays."
+            refresh_antennas = None
         else:
             ant = int(max(0, min(antenna, refcal.layout.nsolant - 1)))
             refcal.delay_solution.reset_ant(ant)
             message = "Reset antenna {0:d} in-band delays.".format(ant + 1)
-        refresh_refcal_solution(refcal)
+            refresh_antennas = [ant]
+        refresh_refcal_solution(refcal, antenna_indices=refresh_antennas, invalidate_legacy_summary=False)
         try:
             refcal.sidecar_path = write_sidecar(refcal)
         except Exception:
@@ -1062,7 +1076,11 @@ def build_app() -> FastAPI:
         scan, _refcal = _overview_context(session)
         return {
             "state": session.state(),
-            "overview_updates": inband_delay_update_payloads(scan, use_lobe=session.use_lobe),
+            "overview_updates": inband_delay_update_payloads(
+                scan,
+                use_lobe=session.use_lobe,
+                antenna=payload.antenna,
+            ),
             "updated_antenna": int(max(0, payload.antenna)),
         }
 
@@ -1078,7 +1096,7 @@ def build_app() -> FastAPI:
         scan, _refcal = _overview_context(session)
         return {
             "state": session.state(),
-            "overview_updates": relative_delay_update_payloads(scan),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna),
             "updated_antenna": int(max(0, payload.antenna)),
         }
 
@@ -1094,7 +1112,7 @@ def build_app() -> FastAPI:
         scan, _refcal = _overview_context(session)
         return {
             "state": session.state(),
-            "overview_updates": relative_delay_update_payloads(scan),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna),
             "updated_antenna": int(max(0, payload.antenna)),
         }
 
@@ -1110,7 +1128,7 @@ def build_app() -> FastAPI:
         scan, _refcal = _overview_context(session)
         return {
             "state": session.state(),
-            "overview_updates": relative_delay_update_payloads(scan),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna),
             "updated_antenna": int(max(0, payload.antenna)),
         }
 
@@ -1164,7 +1182,10 @@ def build_app() -> FastAPI:
         scan, _refcal = _overview_context(session)
         return {
             "state": session.state(),
-            "overview_updates": inband_window_update_payloads(scan),
+            "overview_updates": inband_window_update_payloads(
+                scan,
+                antenna_indices=[int(target.antenna) for target in payload.targets],
+            ),
         }
 
     @app.post("/api/inband/reset")
@@ -1179,7 +1200,11 @@ def build_app() -> FastAPI:
         scan, _refcal = _overview_context(session)
         return {
             "state": session.state(),
-            "overview_updates": inband_delay_update_payloads(scan, use_lobe=session.use_lobe),
+            "overview_updates": inband_delay_update_payloads(
+                scan,
+                use_lobe=session.use_lobe,
+                antenna=payload.antenna,
+            ),
             "updated_antenna": None if payload.antenna is None else int(max(0, payload.antenna)),
         }
 
@@ -1195,7 +1220,7 @@ def build_app() -> FastAPI:
         scan, _refcal = _overview_context(session)
         return {
             "state": session.state(),
-            "overview_updates": relative_delay_update_payloads(scan),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna),
             "updated_antenna": None if payload.antenna is None else int(max(0, payload.antenna)),
         }
 

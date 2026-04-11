@@ -1403,11 +1403,21 @@ def _apply_uniform_delay(
     band_id: np.ndarray,
     delay_ns: np.ndarray,
     layout: LayoutInfo,
+    antenna_indices: Optional[Sequence[int]] = None,
+    corrected_vis: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Apply one X/Y delay per antenna before band averaging."""
 
-    corrected = deepcopy(channel_vis)
-    for ant in range(layout.nsolant):
+    ants = (
+        sorted({int(max(0, min(int(ant), layout.nsolant - 1))) for ant in antenna_indices})
+        if antenna_indices is not None
+        else list(range(layout.nsolant))
+    )
+    corrected = deepcopy(channel_vis) if corrected_vis is None else corrected_vis
+    if corrected_vis is not None:
+        for ant in ants:
+            corrected[ant, :, :, :] = channel_vis[ant, :, :, :]
+    for ant in ants:
         for pol in range(2):
             tau_ns = delay_ns[ant, pol]
             if not np.isfinite(tau_ns):
@@ -1513,6 +1523,50 @@ def _band_average_channel_vis(
     return band_vis, fghz_band, used_band_ids
 
 
+def _band_average_selected_antennas(
+    channel_vis: np.ndarray,
+    freq_ghz: np.ndarray,
+    band_id: np.ndarray,
+    layout: LayoutInfo,
+    antenna_indices: Sequence[int],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, list[int]]:
+    """Collapse corrected channel visibilities for selected antennas only.
+
+    :param channel_vis: Corrected channel visibilities.
+    :type channel_vis: np.ndarray
+    :param freq_ghz: Channel frequencies in GHz.
+    :type freq_ghz: np.ndarray
+    :param band_id: Band number per fine channel.
+    :type band_id: np.ndarray
+    :param layout: Observation layout metadata.
+    :type layout: LayoutInfo
+    :param antenna_indices: Zero-based antenna indices to summarize.
+    :type antenna_indices: Sequence[int]
+    :returns: Band-averaged selected rows, band-center frequencies, used band ids,
+        and the normalized selected antenna list.
+    :rtype: tuple[np.ndarray, np.ndarray, np.ndarray, list[int]]
+    """
+
+    ants = sorted({int(max(0, min(int(ant), layout.nsolant - 1))) for ant in antenna_indices})
+    ntime = channel_vis.shape[-1]
+    band_vis = np.full((len(ants), 4, layout.maxnbd, ntime), np.nan + 1j * np.nan, dtype=np.complex128)
+    fghz_band = np.zeros(layout.maxnbd, dtype=np.float64)
+    used_band_ids = np.zeros(layout.maxnbd, dtype=np.int32)
+    if not ants:
+        return band_vis, fghz_band, used_band_ids, ants
+    for band_value in np.unique(band_id[band_id > 0]):
+        idx = np.where(band_id == band_value)[0]
+        if idx.size == 0:
+            continue
+        full_index = int(band_value) - 1
+        fghz_band[full_index] = np.nanmean(freq_ghz[idx])
+        used_band_ids[full_index] = int(band_value)
+        band_vis[:, :, full_index, :] = _safe_nanmean(channel_vis[ants, :, idx, :], axis=2)
+    if layout.maxnbd > 1 and fghz_band[1] < 1.0:
+        fghz_band[1] = 1.9290
+    return band_vis, fghz_band, used_band_ids, ants
+
+
 def _summarize_band_vis(
     band_vis: np.ndarray,
     layout: LayoutInfo,
@@ -1556,6 +1610,54 @@ def _summarize_band_vis(
     flags = (snr < 1).astype(np.int32)
     flags[np.where(np.isnan(snr))] = 1
     return vis_median, sigma, flags, tflags
+
+
+def _summarize_selected_band_vis(
+    band_vis: np.ndarray,
+    antenna_indices: Sequence[int],
+    layout: LayoutInfo,
+    times_jd: Optional[np.ndarray] = None,
+    time_flag_groups: Optional[Sequence[TimeFlagGroup]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute time-averaged products and flags for selected antennas only.
+
+    :param band_vis: Selected-antenna band visibilities.
+    :type band_vis: np.ndarray
+    :param antenna_indices: Zero-based antenna indices represented in ``band_vis``.
+    :type antenna_indices: Sequence[int]
+    :param layout: Observation layout metadata.
+    :type layout: LayoutInfo
+    :param times_jd: Optional time axis in Julian Date.
+    :type times_jd: np.ndarray | None
+    :param time_flag_groups: Optional browser-native time-flag groups.
+    :type time_flag_groups: Sequence[TimeFlagGroup] | None
+    :returns: Selected-antenna median visibilities, sigma, and flags.
+    :rtype: tuple[np.ndarray, np.ndarray, np.ndarray]
+    """
+
+    vis = deepcopy(band_vis)
+    ants = [int(max(0, min(int(ant), layout.nsolant - 1))) for ant in antenna_indices]
+    ant_lookup = {ant: idx for idx, ant in enumerate(ants)}
+    if times_jd is not None and time_flag_groups:
+        times = np.asarray(times_jd, dtype=np.float64)
+        for group in time_flag_groups:
+            start_jd, end_jd = _normalize_interval(group.start_jd, group.end_jd)
+            bad, = np.where(np.logical_and(times >= start_jd, times <= end_jd))
+            if bad.size == 0:
+                continue
+            for ant, band_idx in group.targets:
+                local_idx = ant_lookup.get(int(ant))
+                if local_idx is None or band_idx < 0 or band_idx >= layout.maxnbd:
+                    continue
+                vis[local_idx, :, band_idx, bad] = np.nan
+    sigma = _safe_nanstd(vis, axis=3)
+    amp = np.abs(vis)
+    vis_median = np.nanmedian(vis, axis=3)
+    amp_median = np.nanmedian(amp, axis=3)
+    snr = np.divide(amp_median, sigma, out=np.full_like(amp_median, np.nan), where=sigma != 0)
+    flags = (snr < 1).astype(np.int32)
+    flags[np.where(np.isnan(snr))] = 1
+    return vis_median, sigma, flags
 
 
 def _band_index_map(used_band_ids: np.ndarray) -> Dict[int, int]:
@@ -1633,41 +1735,98 @@ def analyze_refcal_input(
     )
 
 
-def refresh_refcal_solution(scan: ScanAnalysis) -> None:
-    """Reapply the active in-band delays after a manual edit."""
+def refresh_refcal_solution(
+    scan: ScanAnalysis,
+    antenna_indices: Optional[Sequence[int]] = None,
+    invalidate_legacy_summary: bool = True,
+) -> None:
+    """Reapply the active in-band delays after a manual edit.
+
+    :param scan: Reference-calibration scan to refresh.
+    :type scan: ScanAnalysis
+    :param antenna_indices: Optional zero-based antenna subset to refresh.
+    :type antenna_indices: Sequence[int] | None
+    :param invalidate_legacy_summary: Whether to clear the cached legacy
+        heatmap/display summary.
+    :type invalidate_legacy_summary: bool
+    """
 
     if scan.delay_solution is None:
         raise CalWidgetV2Error("No in-band delay solution is attached to this refcal.")
     groups = ensure_time_flag_groups(scan)
     prepared = scan.raw
-    corrected_channel_vis = _apply_uniform_delay(
-        prepared["channel_vis"],
-        prepared["channel_freq_ghz"],
-        prepared["channel_band"],
-        scan.delay_solution.active_ns,
-        scan.layout,
+    ants = (
+        sorted({int(max(0, min(int(ant), scan.layout.nsolant - 1))) for ant in antenna_indices})
+        if antenna_indices is not None
+        else list(range(scan.layout.nsolant))
     )
-    band_vis, fghz_band, used_band_ids = _band_average_channel_vis(
-        corrected_channel_vis,
-        prepared["channel_freq_ghz"],
-        prepared["channel_band"],
-        scan.layout,
+    full_refresh = (
+        antenna_indices is None
+        or len(ants) == scan.layout.nsolant
+        or scan.corrected_channel_vis.shape != prepared["channel_vis"].shape
+        or scan.corrected_band_vis.shape[:2] != (scan.layout.nant, 4)
+        or scan.sigma.shape[:2] != (scan.layout.nant, 4)
+        or scan.flags.shape[:2] != (scan.layout.nant, 4)
     )
-    vis_median, sigma, flags, tflags = _summarize_band_vis(
-        band_vis,
-        scan.layout,
-        tflags=None,
-        times_jd=np.asarray(prepared["raw"]["time"], dtype=np.float64),
-        time_flag_groups=groups,
-    )
-    scan.corrected_channel_vis = corrected_channel_vis
-    scan.corrected_band_vis = vis_median
-    scan.sigma = sigma
-    scan.flags = flags
-    scan.fghz_band = fghz_band
-    scan.bands_band = used_band_ids
-    scan.band_to_full_index = _band_index_map(used_band_ids)
-    scan.tflags = tflags
+    if full_refresh:
+        corrected_channel_vis = _apply_uniform_delay(
+            prepared["channel_vis"],
+            prepared["channel_freq_ghz"],
+            prepared["channel_band"],
+            scan.delay_solution.active_ns,
+            scan.layout,
+        )
+        band_vis, fghz_band, used_band_ids = _band_average_channel_vis(
+            corrected_channel_vis,
+            prepared["channel_freq_ghz"],
+            prepared["channel_band"],
+            scan.layout,
+        )
+        vis_median, sigma, flags, tflags = _summarize_band_vis(
+            band_vis,
+            scan.layout,
+            tflags=None,
+            times_jd=np.asarray(prepared["raw"]["time"], dtype=np.float64),
+            time_flag_groups=groups,
+        )
+        scan.corrected_channel_vis = corrected_channel_vis
+        scan.corrected_band_vis = vis_median
+        scan.sigma = sigma
+        scan.flags = flags
+        scan.fghz_band = fghz_band
+        scan.bands_band = used_band_ids
+        scan.band_to_full_index = _band_index_map(used_band_ids)
+        scan.tflags = tflags
+    else:
+        _apply_uniform_delay(
+            prepared["channel_vis"],
+            prepared["channel_freq_ghz"],
+            prepared["channel_band"],
+            scan.delay_solution.active_ns,
+            scan.layout,
+            antenna_indices=ants,
+            corrected_vis=scan.corrected_channel_vis,
+        )
+        band_vis_rows, fghz_band, used_band_ids, ants = _band_average_selected_antennas(
+            scan.corrected_channel_vis,
+            prepared["channel_freq_ghz"],
+            prepared["channel_band"],
+            scan.layout,
+            ants,
+        )
+        vis_median_rows, sigma_rows, flags_rows = _summarize_selected_band_vis(
+            band_vis_rows,
+            ants,
+            scan.layout,
+            times_jd=np.asarray(prepared["raw"]["time"], dtype=np.float64),
+            time_flag_groups=groups,
+        )
+        scan.corrected_band_vis[ants, :, :] = vis_median_rows
+        scan.sigma[ants, :, :] = sigma_rows
+        scan.flags[ants, :, :] = flags_rows
+        scan.fghz_band = fghz_band
+        scan.bands_band = used_band_ids
+        scan.band_to_full_index = _band_index_map(used_band_ids)
     windows_are_full = all(
         scan.delay_solution.uses_full_window(ant, pol)
         for ant in range(scan.layout.nsolant)
@@ -1682,7 +1841,8 @@ def refresh_refcal_solution(scan: ScanAnalysis) -> None:
         or not windows_are_full
     )
     if scan.raw:
-        scan.raw.pop("legacy_refcal_summary", None)
+        if invalidate_legacy_summary:
+            scan.raw.pop("legacy_refcal_summary", None)
         scan.raw.pop("overview_payload_cache", None)
         scan.raw.pop("residual_diagnostics_cache", None)
         scan.raw.pop("combined_channel_vis_cache", None)
