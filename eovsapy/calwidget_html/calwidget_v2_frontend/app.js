@@ -4291,7 +4291,7 @@
                 <button
                   type="button"
                   className="btn-outline-blue"
-                  disabled=${!sessionId || busy || !checkedScanIds.length}
+                  disabled=${!sessionId || busy}
                   onClick=${function () {
                     runAction(
                       function () {
