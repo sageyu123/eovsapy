@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,13 +14,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+import numpy as np
 import uvicorn
 
 from eovsapy.util import Time
 
 from .calwidget_v2_analysis import (
     CalWidgetV2Error,
+    SIDECAR_DIR,
     ScanAnalysis,
+    YX_RESIDUAL_THRESHOLD_RAD,
     add_time_flag_group,
     analyze_phacal_input,
     analyze_refcal_input,
@@ -33,25 +37,30 @@ from .calwidget_v2_analysis import (
     load_sidecar,
     refresh_phacal_solution,
     refresh_refcal_solution,
+    scan_feed_kind,
     sidecar_path_for_scan,
     sql2phacalX,
     sql2refcalX,
     sql_phacal_to_scan,
     sql_refcal_to_scan,
     write_sidecar,
+    yx_residual_threshold,
 )
 from .calwidget_v2_plots import (
     TAB_NAMES,
+    export_model_bundle_entry,
     heatmap_payload,
     heatmap_plot_meta,
     inband_delay_update_payloads,
     relative_delay_update_payloads,
     inband_window_update_payloads,
     overview_payloads,
+    refresh_model_flag_state,
     relative_delay_editor_meta,
     render_heatmap,
     render_tab,
     tab_payload,
+    time_flag_update_payloads,
 )
 
 
@@ -181,6 +190,25 @@ class SaveSqlRequest(SessionRequest):
     timestamp_iso: Optional[str] = None
 
 
+class SaveNpzRequest(SessionRequest):
+    """Save one daily v2/model NPZ bundle."""
+
+    scan_ids: Optional[List[int]] = None
+
+
+class ManualAntennaFlagRequest(SessionRequest):
+    """Update one antenna's manual keep/flag override."""
+
+    antenna: int
+    flagged: bool
+
+
+class YXResidualThresholdRequest(SessionRequest):
+    """Update the active refcal Y-X residual RMS auto-keep threshold."""
+
+    value: float
+
+
 class TimeFlagAddRequest(SessionRequest):
     """Add one browser-native time-flag interval group."""
 
@@ -297,6 +325,10 @@ class WidgetSession:
             "source": entry["source"],
             "duration_min": entry["duration_min"],
             "file": entry["file"],
+            "project": entry.get("project"),
+            "fseqfile": entry.get("fseqfile"),
+            "feed_kind": entry.get("feed_kind", "unknown"),
+            "metadata_warning": entry.get("metadata_warning", ""),
             "status": status,
             "sql_time": entry["sql_time"],
             "color": entry["color"],
@@ -317,12 +349,28 @@ class WidgetSession:
             return None
         if sql_meta["kind"] == "refcal":
             result = sql_refcal_to_scan(sql_meta, scan_id=scan_id)
+            result.scan_meta.update(
+                {
+                    "project": entry.get("project", ""),
+                    "fseqfile": entry.get("fseqfile", ""),
+                    "feed_kind": entry.get("feed_kind", "unknown"),
+                    "metadata_warning": entry.get("metadata_warning", ""),
+                }
+            )
             sidecar_file = find_sidecar_by_timestamp(sql_meta["timestamp"])
             if sidecar_file:
                 attach_sidecar_delay(result, load_sidecar(sidecar_file))
                 result.sidecar_path = sidecar_file
             return result
         result = sql_phacal_to_scan(sql_meta, scan_id=scan_id)
+        result.scan_meta.update(
+            {
+                "project": entry.get("project", ""),
+                "fseqfile": entry.get("fseqfile", ""),
+                "feed_kind": entry.get("feed_kind", "unknown"),
+                "metadata_warning": entry.get("metadata_warning", ""),
+            }
+        )
         return result
 
     def _ensure_refcal_analysis(self, scan_id: int) -> ScanAnalysis:
@@ -332,6 +380,15 @@ class WidgetSession:
             return self.analyses[scan_id]
         entry = self._entry(scan_id)
         result = analyze_refcal_input(entry["file"], scan_id=scan_id, fix_drift=self.fix_drift)
+        result.scan_meta.update(
+            {
+                "project": entry.get("project", ""),
+                "fseqfile": entry.get("fseqfile", ""),
+                "feed_kind": entry.get("feed_kind", "unknown"),
+                "metadata_warning": entry.get("metadata_warning", ""),
+            }
+        )
+        refresh_model_flag_state(result)
         try:
             result.sidecar_path = write_sidecar(result)
         except Exception:
@@ -370,8 +427,8 @@ class WidgetSession:
     def set_use_lobe(self, use_lobe: bool) -> None:
         """Update lobe wrapping for Sum Pha display."""
 
-        self.use_lobe = bool(use_lobe)
-        self.status_message = "Sum Pha lobe set to {0}.".format(self.use_lobe)
+        self.use_lobe = True
+        self.status_message = "Sum Pha lobe remains enabled."
 
     def analyze_refcal(self, scan_id: int) -> None:
         """Analyze the requested scan as a refcal."""
@@ -415,6 +472,14 @@ class WidgetSession:
         refcal = self._ensure_refcal_analysis(self.ref_scan_id)
         entry = self._entry(scan_id)
         result = analyze_phacal_input(entry["file"], refcal, scan_id=scan_id, fix_drift=self.fix_drift)
+        result.scan_meta.update(
+            {
+                "project": entry.get("project", ""),
+                "fseqfile": entry.get("fseqfile", ""),
+                "feed_kind": entry.get("feed_kind", "unknown"),
+                "metadata_warning": entry.get("metadata_warning", ""),
+            }
+        )
         result.saved_to_sql = False
         self.analyses[scan_id] = result
         entry["status"] = "phacal"
@@ -444,45 +509,49 @@ class WidgetSession:
         ensure_time_flag_groups(scan)
         return scan
 
-    def add_time_flag(self, start_jd: float, end_jd: float, scope: str) -> None:
+    def add_time_flag(self, start_jd: float, end_jd: float, scope: str) -> List[int]:
         """Add one browser-native time-flag interval group and live-recompute."""
 
         scan = self._selected_editable_scan()
         group = add_time_flag_group(scan, self.selected_ant, self.selected_band, start_jd, end_jd, scope)
-        self._refresh_time_flag_scan(scan)
+        touched_ants = sorted({int(target[0]) for target in group.targets})
+        self._refresh_time_flag_scan(scan, antenna_indices=touched_ants)
         self.status_message = "Added {0} time flag {1}-{2} for {3}.".format(
             group.scope,
             Time(group.start_jd, format="jd").iso[11:19],
             Time(group.end_jd, format="jd").iso[11:19],
             scan.scan_kind,
         )
+        return [int(ant) for ant in touched_ants]
 
-    def add_time_flags(self, intervals: List[TimeFlagInterval]) -> None:
+    def add_time_flags(self, intervals: List[TimeFlagInterval]) -> List[int]:
         """Add multiple browser-native time-flag interval groups and refresh once."""
 
         if not intervals:
-            return
+            return []
         scan = self._selected_editable_scan()
         groups = []
+        touched_ants = set()
         for interval in intervals:
-            groups.append(
-                add_time_flag_group(
-                    scan,
-                    int(interval.antenna),
-                    int(interval.band),
-                    float(interval.start_jd),
-                    float(interval.end_jd),
-                    str(interval.scope),
-                )
+            group = add_time_flag_group(
+                scan,
+                int(interval.antenna),
+                int(interval.band),
+                float(interval.start_jd),
+                float(interval.end_jd),
+                str(interval.scope),
             )
-        self._refresh_time_flag_scan(scan)
+            groups.append(group)
+            touched_ants.update(int(target[0]) for target in group.targets)
+        self._refresh_time_flag_scan(scan, antenna_indices=sorted(touched_ants))
         self.status_message = "Applied {0:d} staged time-flag interval(s) for {1}.".format(len(groups), scan.scan_kind)
+        return sorted(int(ant) for ant in touched_ants)
 
-    def _refresh_time_flag_scan(self, scan: ScanAnalysis) -> None:
+    def _refresh_time_flag_scan(self, scan: ScanAnalysis, antenna_indices: Optional[List[int]] = None) -> None:
         """Recompute products after browser-native time-flag edits."""
 
         if scan.scan_kind == "refcal":
-            refresh_refcal_solution(scan)
+            refresh_refcal_solution(scan, antenna_indices=antenna_indices, invalidate_legacy_summary=False)
             scan.saved_to_sql = False
             self._invalidate_dependent_phacals(scan.scan_id)
         elif scan.scan_kind == "phacal":
@@ -495,15 +564,72 @@ class WidgetSession:
         else:
             raise CalWidgetV2Error("Time-flag editing is only available for analyzed refcal or phacal scans.")
 
-    def delete_time_flag(self, group_id: str) -> None:
+    def set_manual_antenna_flag(self, antenna: int, flagged: bool) -> None:
+        """Update one antenna's manual tuned v2/model keep/flag override.
+
+        :param antenna: Zero-based antenna index.
+        :type antenna: int
+        :param flagged: Whether the whole antenna should be manually flagged.
+        :type flagged: bool
+        """
+
+        ref_id, refcal = self._editable_inband_refcal()
+        ant = int(max(0, min(antenna, refcal.layout.nsolant - 1)))
+        refcal.delay_solution.manual_ant_flag_override[ant] = bool(flagged)
+        yx_rms = np.asarray(refcal.raw.get("yx_residual_rms", np.full(refcal.layout.nsolant, np.nan)), dtype=float)
+        auto_flagged = bool(
+            ant < yx_rms.size and np.isfinite(yx_rms[ant]) and float(yx_rms[ant]) > yx_residual_threshold(refcal)
+        )
+        refcal.delay_solution.manual_ant_keep_override[ant] = bool((not flagged) and auto_flagged)
+        refresh_model_flag_state(refcal, antenna_indices=[ant])
+        if refcal.raw:
+            refcal.raw.pop("overview_payload_cache", None)
+        try:
+            refcal.sidecar_path = write_sidecar(refcal)
+        except Exception:
+            pass
+        refcal.saved_to_sql = False
+        self._invalidate_dependent_phacals(ref_id)
+        self.selected_ant = ant
+        if flagged:
+            self.status_message = "Excluded antenna {0:d} from the tuned v2/model solution.".format(ant + 1)
+        elif auto_flagged:
+            self.status_message = "Forced antenna {0:d} back into the tuned v2/model solution.".format(ant + 1)
+        else:
+            self.status_message = "Cleared the manual tuned v2/model flag for antenna {0:d}.".format(ant + 1)
+
+    def update_yx_residual_threshold(self, value: float) -> None:
+        """Update the active refcal Y-X residual RMS auto-keep threshold.
+
+        :param value: Threshold in radians.
+        :type value: float
+        """
+
+        _ref_id, refcal = self._editable_inband_refcal()
+        threshold = max(float(value), 0.0)
+        refcal.scan_meta["yx_residual_threshold_rad"] = threshold
+        refresh_model_flag_state(refcal)
+        if refcal.raw:
+            refcal.raw.pop("overview_payload_cache", None)
+            refcal.raw.pop("residual_diagnostics_cache", None)
+        try:
+            refcal.sidecar_path = write_sidecar(refcal)
+        except Exception:
+            pass
+        refcal.saved_to_sql = False
+        self.status_message = "Set the Y-X residual RMS threshold to {0:.2f} rad.".format(threshold)
+
+    def delete_time_flag(self, group_id: str) -> List[int]:
         """Delete one browser-native time-flag interval group and live-recompute."""
 
         scan = self._selected_editable_scan()
         removed = delete_time_flag_group(scan, group_id)
         if not removed:
             raise CalWidgetV2Error("Requested time-flag interval was not found.")
-        self._refresh_time_flag_scan(scan)
+        touched_ants = sorted({int(target[0]) for target in removed.targets}) if hasattr(removed, "targets") else None
+        self._refresh_time_flag_scan(scan, antenna_indices=touched_ants)
         self.status_message = "Deleted one time-flag interval from {0}.".format(scan.scan_kind)
+        return touched_ants or []
 
     def _editable_inband_refcal(self) -> tuple[int, ScanAnalysis]:
         """Return the refcal analysis that should receive in-band edits.
@@ -566,6 +692,7 @@ class WidgetSession:
         if refcal.raw:
             refcal.raw.pop("overview_payload_cache", None)
             refcal.raw.pop("residual_diagnostics_cache", None)
+        refresh_model_flag_state(refcal, antenna_indices=[ant])
         try:
             refcal.sidecar_path = write_sidecar(refcal)
         except Exception:
@@ -591,12 +718,37 @@ class WidgetSession:
         if refcal.raw:
             refcal.raw.pop("overview_payload_cache", None)
             refcal.raw.pop("residual_diagnostics_cache", None)
+        refresh_model_flag_state(refcal, antenna_indices=[ant])
         try:
             refcal.sidecar_path = write_sidecar(refcal)
         except Exception:
             pass
         self.selected_ant = ant
         self.status_message = "Applied residual-guided relative-phase suggestion for antenna {0:d}.".format(ant + 1)
+
+    def apply_residual_inband_fit(self, antenna: int) -> None:
+        """Apply one antenna's residual in-band delay suggestion.
+
+        :param antenna: Zero-based antenna index.
+        :type antenna: int
+        """
+
+        ref_id, refcal = self._editable_inband_refcal()
+        ant = int(max(0, min(antenna, refcal.layout.nsolant - 1)))
+        meta = relative_delay_editor_meta(refcal, ant)
+        x_suggest = float(meta.get("x_suggested_residual_inband_delay_ns", 0.0) or 0.0)
+        y_suggest = float(meta.get("y_suggested_residual_inband_delay_ns", 0.0) or 0.0)
+        refcal.delay_solution.active_ns[ant, 0] = float(refcal.delay_solution.active_ns[ant, 0] + x_suggest)
+        refcal.delay_solution.active_ns[ant, 1] = float(refcal.delay_solution.active_ns[ant, 1] + y_suggest)
+        refresh_refcal_solution(refcal, antenna_indices=[ant], invalidate_legacy_summary=False)
+        try:
+            refcal.sidecar_path = write_sidecar(refcal)
+        except Exception:
+            pass
+        refcal.saved_to_sql = False
+        self._invalidate_dependent_phacals(ref_id)
+        self.selected_ant = ant
+        self.status_message = "Applied residual in-band delay correction for antenna {0:d}.".format(ant + 1)
 
     def undo_relative_delay(self, antenna: int) -> None:
         """Undo the last applied relative-delay edit for one antenna.
@@ -612,6 +764,7 @@ class WidgetSession:
         if refcal.raw:
             refcal.raw.pop("overview_payload_cache", None)
             refcal.raw.pop("residual_diagnostics_cache", None)
+        refresh_model_flag_state(refcal, antenna_indices=[ant])
         try:
             refcal.sidecar_path = write_sidecar(refcal)
         except Exception:
@@ -785,6 +938,7 @@ class WidgetSession:
         if refcal.raw:
             refcal.raw.pop("overview_payload_cache", None)
             refcal.raw.pop("residual_diagnostics_cache", None)
+        refresh_model_flag_state(refcal, antenna_indices=None if antenna is None else [ant])
         try:
             refcal.sidecar_path = write_sidecar(refcal)
         except Exception:
@@ -815,6 +969,132 @@ class WidgetSession:
         result.saved_to_sql = True
         self.status_message = "Saved scan {0} to SQL.".format(target_id)
 
+    def save_npz_bundle(self, scan_ids: Optional[List[int]] = None) -> str:
+        """Save one daily v2/model bundle under ``/common/webplots/phasecal``.
+
+        :param scan_ids: Optional explicit scan ids to include.
+        :type scan_ids: list[int] | None
+        :returns: Absolute output path.
+        :rtype: str
+        """
+
+        if self.day is None:
+            raise CalWidgetV2Error("Load a day before saving an NPZ bundle.")
+        chosen_ids = [int(scan_id) for scan_id in (scan_ids or [])]
+        if not chosen_ids:
+            chosen_ids = sorted(int(scan_id) for scan_id in self.analyses.keys())
+        if self.ref_scan_id is not None and int(self.ref_scan_id) not in chosen_ids:
+            chosen_ids = [int(self.ref_scan_id)] + chosen_ids
+        chosen_ids = sorted(set(chosen_ids))
+        prior_selected_scan = self.selected_scan_id
+        prior_status = self.status_message
+        for scan_id in chosen_ids:
+            if scan_id in self.analyses:
+                continue
+            try:
+                entry = self._entry(scan_id)
+            except CalWidgetV2Error:
+                continue
+            sql_meta = entry.get("sql_meta") or {}
+            try:
+                if sql_meta.get("kind") == "refcal":
+                    self._ensure_refcal_analysis(scan_id)
+                elif sql_meta.get("kind") == "phacal" and self.ref_scan_id is not None:
+                    self.analyze_phacal(scan_id)
+            except CalWidgetV2Error:
+                continue
+        self.selected_scan_id = prior_selected_scan
+        self.status_message = prior_status
+
+        products: Dict[str, Dict] = {}
+        phacal_ids: List[int] = []
+        for scan_id in chosen_ids:
+            if scan_id not in self.analyses:
+                continue
+            analysis = self.analyses[scan_id]
+            if analysis.scan_kind == "phacal":
+                phacal_ids.append(int(scan_id))
+            products[str(scan_id)] = export_model_bundle_entry(analysis)
+        if not products:
+            raise CalWidgetV2Error("Analyze at least one scan before saving the NPZ bundle.")
+
+        canonical_ref = self.ref_scan_id if self.ref_scan_id is not None else None
+        high_ref_candidates = [
+            int(scan_id)
+            for scan_id in chosen_ids
+            if scan_id in self.analyses
+            and self.analyses[scan_id].scan_kind == "refcal"
+            and scan_feed_kind(self.analyses[scan_id]) == "hi"
+        ]
+        secondary_ref = None
+        if canonical_ref in high_ref_candidates:
+            secondary_candidates = [scan_id for scan_id in high_ref_candidates if scan_id != int(canonical_ref)]
+            secondary_ref = secondary_candidates[0] if secondary_candidates else None
+        bundle_threshold = float(YX_RESIDUAL_THRESHOLD_RAD)
+        if canonical_ref is not None and int(canonical_ref) in self.analyses:
+            bundle_threshold = float(yx_residual_threshold(self.analyses[int(canonical_ref)]))
+
+        saved_at_iso = Time.now().iso[:19]
+        outpath = SIDECAR_DIR / "{0}_calwidget_v2_daily.npz".format(self.day["date"].replace("-", ""))
+        outpath.parent.mkdir(parents=True, exist_ok=True)
+        archive: Dict[str, np.ndarray] = {
+            "bundle_schema_version": np.asarray(2, dtype=np.int32),
+            "date": np.asarray(self.day["date"]),
+            "saved_at_iso": np.asarray(saved_at_iso),
+            "canonical_anchor_scan_id": np.asarray(-1 if canonical_ref is None else int(canonical_ref), dtype=np.int32),
+            "secondary_anchor_scan_id": np.asarray(-1 if secondary_ref is None else int(secondary_ref), dtype=np.int32),
+            "single_anchor_mode": np.asarray(bool(secondary_ref is None), dtype=np.uint8),
+            "selected_phacal_ids": np.asarray(phacal_ids, dtype=np.int32),
+            "yx_residual_threshold_rad": np.asarray(bundle_threshold, dtype=np.float64),
+            "product_scan_ids": np.asarray(sorted(int(scan_id) for scan_id in products.keys()), dtype=np.int32),
+            "product_manifest_json": np.asarray(
+                json.dumps(
+                    {
+                        "canonical_anchor_scan_id": None if canonical_ref is None else int(canonical_ref),
+                        "secondary_anchor_scan_id": None if secondary_ref is None else int(secondary_ref),
+                        "single_anchor_mode": bool(secondary_ref is None),
+                        "selected_phacal_ids": phacal_ids,
+                    },
+                    separators=(",", ":"),
+                )
+            ),
+        }
+        for scan_id, product in products.items():
+            prefix = "scan_{0}".format(scan_id)
+            archive[prefix + "__scan_id"] = np.asarray(int(scan_id), dtype=np.int32)
+            archive[prefix + "__scan_kind"] = np.asarray(product.get("scan_kind", ""))
+            archive[prefix + "__timestamp_iso"] = np.asarray(product.get("timestamp_iso", ""))
+            archive[prefix + "__source"] = np.asarray(product.get("source", ""))
+            archive[prefix + "__feed_kind"] = np.asarray(product.get("feed_kind", "unknown"))
+            archive[prefix + "__metadata_warning"] = np.asarray(product.get("metadata_warning", ""))
+            archive[prefix + "__fine_frequency_ghz"] = np.asarray(product.get("fine_frequency_ghz", []), dtype=np.float64)
+            archive[prefix + "__band_frequency_ghz"] = np.asarray(product.get("band_frequency_ghz", []), dtype=np.float64)
+            archive[prefix + "__band_values"] = np.asarray(product.get("band_values", []), dtype=np.int32)
+            archive[prefix + "__model_phase_fine"] = np.asarray(product.get("model_phase_fine", []), dtype=np.float64)
+            archive[prefix + "__model_phase_band"] = np.asarray(product.get("model_phase_band", []), dtype=np.float64)
+            archive[prefix + "__legacy_flag"] = np.asarray(product.get("legacy_flag", []), dtype=np.int32)
+            archive[prefix + "__v2_flag"] = np.asarray(product.get("v2_flag", []), dtype=np.int32)
+            archive[prefix + "__model_flag"] = np.asarray(product.get("model_flag", []), dtype=np.int32)
+            archive[prefix + "__manual_ant_flag_override"] = np.asarray(
+                product.get("manual_ant_flag_override", []),
+                dtype=np.uint8,
+            )
+            archive[prefix + "__manual_ant_keep_override"] = np.asarray(
+                product.get("manual_ant_keep_override", []),
+                dtype=np.uint8,
+            )
+            archive[prefix + "__yx_residual_rms"] = np.asarray(product.get("yx_residual_rms", []), dtype=np.float64)
+            archive[prefix + "__yx_residual_threshold_rad"] = np.asarray(
+                product.get("yx_residual_threshold_rad", bundle_threshold),
+                dtype=np.float64,
+            )
+            archive[prefix + "__scan_meta_json"] = np.asarray(
+                json.dumps(product.get("scan_meta", {}) or {}, separators=(",", ":"))
+            )
+        np.savez_compressed(str(outpath), **archive)
+        self.status_message = "Saved daily v2/model NPZ bundle to {0}.".format(outpath)
+        return str(outpath)
+
     def state(self) -> Dict:
         """Serialize session state for the frontend."""
 
@@ -839,6 +1119,7 @@ class WidgetSession:
                 "timestamp_iso": current.timestamp.iso[:19],
                 "scan_time": current_entry["scan_time"] if current_entry else current.t_bg.iso[11:19],
                 "source": current.source,
+                "feed_kind": scan_feed_kind(current),
                 "saved_to_sql": current.saved_to_sql,
                 "sidecar_path": current.sidecar_path,
             }
@@ -889,6 +1170,13 @@ class WidgetSession:
             "heatmap_meta": heatmap_plot_meta(current),
             "current_scan": current_meta,
             "active_refcal": ref_meta,
+            "scan_metadata_warnings": sorted(
+                {
+                    str(entry.get("metadata_warning", "")).strip()
+                    for entry in self.entries
+                    if str(entry.get("metadata_warning", "")).strip()
+                }
+            ),
             "scans": [self._serialize_entry(entry) for entry in self.entries],
         }
 
@@ -1078,10 +1366,21 @@ def build_app() -> FastAPI:
 
         session = _get_session(payload.session_id)
         try:
-            session.add_time_flag(payload.start_jd, payload.end_jd, payload.scope)
+            touched_ants = session.add_time_flag(payload.start_jd, payload.end_jd, payload.scope)
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        return session.state()
+        scan = session._current_result()
+        return {
+            "state": session.state(),
+            "overview_updates": time_flag_update_payloads(scan, use_lobe=session.use_lobe, antenna_indices=touched_ants),
+            "heatmap": heatmap_payload(
+                scan,
+                session.selected_ant,
+                session.selected_band,
+                scan_label=_current_scan_label(session),
+            ),
+            "time_history": legacy_time_history_payload(scan, session.selected_ant, session.selected_band),
+        }
 
     @app.post("/api/time-flags/add-batch")
     def add_time_flags(payload: TimeFlagBatchRequest) -> Dict:
@@ -1089,10 +1388,21 @@ def build_app() -> FastAPI:
 
         session = _get_session(payload.session_id)
         try:
-            session.add_time_flags(payload.intervals)
+            touched_ants = session.add_time_flags(payload.intervals)
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        return session.state()
+        scan = session._current_result()
+        return {
+            "state": session.state(),
+            "overview_updates": time_flag_update_payloads(scan, use_lobe=session.use_lobe, antenna_indices=touched_ants),
+            "heatmap": heatmap_payload(
+                scan,
+                session.selected_ant,
+                session.selected_band,
+                scan_label=_current_scan_label(session),
+            ),
+            "time_history": legacy_time_history_payload(scan, session.selected_ant, session.selected_band),
+        }
 
     @app.post("/api/time-flags/delete")
     def delete_time_flag(payload: TimeFlagDeleteRequest) -> Dict:
@@ -1100,10 +1410,21 @@ def build_app() -> FastAPI:
 
         session = _get_session(payload.session_id)
         try:
-            session.delete_time_flag(payload.group_id)
+            touched_ants = session.delete_time_flag(payload.group_id)
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        return session.state()
+        scan = session._current_result()
+        return {
+            "state": session.state(),
+            "overview_updates": time_flag_update_payloads(scan, use_lobe=session.use_lobe, antenna_indices=touched_ants),
+            "heatmap": heatmap_payload(
+                scan,
+                session.selected_ant,
+                session.selected_band,
+                scan_label=_current_scan_label(session),
+            ),
+            "time_history": legacy_time_history_payload(scan, session.selected_ant, session.selected_band),
+        }
 
     @app.post("/api/inband/update")
     def update_inband(payload: UpdateInbandRequest) -> Dict:
@@ -1157,6 +1478,26 @@ def build_app() -> FastAPI:
             "updated_antenna": int(max(0, payload.antenna)),
         }
 
+    @app.post("/api/inband/apply-residual-fit")
+    def apply_residual_inband_fit(payload: RelativeDelayAntennaRequest) -> Dict:
+        """Apply one antenna's residual in-band correction from residual fits."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.apply_residual_inband_fit(payload.antenna)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        scan, _refcal = _overview_context(session)
+        return {
+            "state": session.state(),
+            "overview_updates": inband_delay_update_payloads(
+                scan,
+                use_lobe=session.use_lobe,
+                antenna=payload.antenna,
+            ),
+            "updated_antenna": int(max(0, payload.antenna)),
+        }
+
     @app.post("/api/relative-delay/undo")
     def undo_relative_delay(payload: RelativeDelayAntennaRequest) -> Dict:
         """Undo the last relative-delay edit for one antenna."""
@@ -1171,6 +1512,49 @@ def build_app() -> FastAPI:
             "state": session.state(),
             "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna),
             "updated_antenna": int(max(0, payload.antenna)),
+        }
+
+    @app.post("/api/relative-phase/antenna-flag")
+    def set_manual_antenna_flag(payload: ManualAntennaFlagRequest) -> Dict:
+        """Update one antenna's manual tuned-solution keep/flag state."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.set_manual_antenna_flag(payload.antenna, payload.flagged)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        scan, _refcal = _overview_context(session)
+        return {
+            "state": session.state(),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna),
+            "heatmap": heatmap_payload(
+                session._current_result(),
+                session.selected_ant,
+                session.selected_band,
+                scan_label=_current_scan_label(session),
+            ),
+            "updated_antenna": int(max(0, payload.antenna)),
+        }
+
+    @app.post("/api/relative-phase/yx-threshold")
+    def set_yx_residual_threshold(payload: YXResidualThresholdRequest) -> Dict:
+        """Update the active refcal Y-X residual RMS threshold."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.update_yx_residual_threshold(payload.value)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        scan, refcal = _overview_context(session)
+        return {
+            "state": session.state(),
+            "overview": overview_payloads(scan, refcal=refcal, use_lobe=session.use_lobe),
+            "heatmap": heatmap_payload(
+                session._current_result(),
+                session.selected_ant,
+                session.selected_band,
+                scan_label=_current_scan_label(session),
+            ),
         }
 
     @app.post("/api/inband/window")
@@ -1275,6 +1659,17 @@ def build_app() -> FastAPI:
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         return session.state()
+
+    @app.post("/api/save/npz")
+    def save_npz(payload: SaveNpzRequest) -> Dict:
+        """Write the current day's tuned v2/model bundle to NPZ."""
+
+        session = _get_session(payload.session_id)
+        try:
+            outpath = session.save_npz_bundle(payload.scan_ids)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"state": session.state(), "path": outpath}
 
     @app.get("/api/plot/heatmap.png")
     def heatmap_png(session_id: str) -> Response:

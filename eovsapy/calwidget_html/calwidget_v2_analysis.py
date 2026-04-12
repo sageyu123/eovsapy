@@ -23,6 +23,7 @@ from eovsapy.util import Time, extract, lin_phase_fit, lobe, nearest_val_idx
 
 
 SIDECAR_DIR = Path("/common/webplots/phasecal")
+YX_RESIDUAL_THRESHOLD_RAD = 1.5
 TIME_FLAG_SCOPE_LABELS = {
     "selected": "Selected",
     "this_ant": "This Ant",
@@ -70,6 +71,8 @@ class DelaySolution:
     band_values: np.ndarray
     band_centers_ghz: np.ndarray
     kept_band_mask: np.ndarray
+    manual_ant_flag_override: np.ndarray
+    manual_ant_keep_override: np.ndarray
 
     def reset_all(self) -> None:
         """Reset all active delays to the fitted solution."""
@@ -306,7 +309,12 @@ class DelaySolution:
         """
 
         relative = np.round(self.relative_ns.astype(np.float64), 6).ravel().tolist()
-        return json.dumps({"relative": relative}, separators=(",", ":"))
+        manual = np.asarray(self.manual_ant_flag_override, dtype=np.int8).ravel().tolist()
+        manual_keep = np.asarray(self.manual_ant_keep_override, dtype=np.int8).ravel().tolist()
+        return json.dumps(
+            {"relative": relative, "manual_ant_flag": manual, "manual_ant_keep": manual_keep},
+            separators=(",", ":"),
+        )
 
 
 @dataclass
@@ -356,6 +364,7 @@ class ScanAnalysis:
     fghz_band: np.ndarray
     bands_band: np.ndarray
     band_to_full_index: Dict[int, int]
+    base_flags: Optional[np.ndarray] = None
     delay_solution: Optional[DelaySolution] = None
     tflags: Optional[np.ndarray] = None
     mbd: Optional[np.ndarray] = None
@@ -368,7 +377,7 @@ class ScanAnalysis:
     dirty_inband: bool = False
     time_flag_groups: List[TimeFlagGroup] = field(default_factory=list)
     time_flag_groups_initialized: bool = False
-
+    scan_meta: Dict[str, Any] = field(default_factory=dict)
     def to_refcal_sql(self, timestamp: Optional[Time] = None) -> Dict[str, Any]:
         """Build a legacy-compatible refcal SQL payload."""
 
@@ -411,6 +420,105 @@ def _as_path(value: Any) -> Path:
     """Normalize a user-supplied path-like value."""
 
     return Path(str(value)).expanduser().resolve()
+
+
+def _clean_text(value: Any) -> str:
+    """Return one database/header text field as a stripped Python string.
+
+    :param value: Raw scalar value from SQL/header metadata.
+    :type value: Any
+    :returns: Cleaned text with embedded NULs removed.
+    :rtype: str
+    """
+
+    if value is None:
+        return ""
+    return str(value).replace("\x00", "").strip()
+
+
+def _classify_feed_kind(project: str, fseqfile: str, duration_min: Optional[float] = None) -> str:
+    """Classify a PHASECAL scan as LO or HI feed when possible.
+
+    :param project: Scan-header project string.
+    :type project: str
+    :param fseqfile: Matched FSeq filename from front-end metadata.
+    :type fseqfile: str
+    :param duration_min: Optional observed scan duration in minutes, used only as a
+        fallback when explicit metadata is unavailable.
+    :type duration_min: float | None
+    :returns: ``"lo"``, ``"hi"``, or ``"unknown"``.
+    :rtype: str
+    """
+
+    project_lower = _clean_text(project).lower()
+    fseq_lower = _clean_text(fseqfile).lower()
+    if "phasecal_lo" in project_lower or "pcal_lo" in fseq_lower or " lo" in fseq_lower:
+        return "lo"
+    if "pcal_hi" in fseq_lower or "hi-all" in fseq_lower:
+        return "hi"
+    if duration_min is not None and np.isfinite(duration_min):
+        duration = float(duration_min)
+        if 17.0 <= duration <= 25.0:
+            return "lo"
+        if 12.0 <= duration <= 17.0 or 50.0 <= duration <= 70.0:
+            return "hi"
+    return "unknown"
+
+
+def scan_feed_kind(scan: ScanAnalysis) -> str:
+    """Return the feed classification stored on one analyzed scan.
+
+    :param scan: Scan analysis object.
+    :type scan: ScanAnalysis
+    :returns: ``"lo"``, ``"hi"``, or ``"unknown"``.
+    :rtype: str
+    """
+
+    meta = scan.scan_meta or {}
+    return str(
+        meta.get("feed_kind")
+        or _classify_feed_kind(
+            meta.get("project", ""),
+            meta.get("fseqfile", ""),
+            duration_min=meta.get("duration_min"),
+        )
+    )
+
+
+def yx_residual_threshold(scan: Optional[ScanAnalysis] = None) -> float:
+    """Return the active Y-X residual RMS threshold for one scan.
+
+    :param scan: Optional analyzed scan.
+    :type scan: ScanAnalysis | None
+    :returns: Threshold in radians.
+    :rtype: float
+    """
+
+    if scan is None:
+        return float(YX_RESIDUAL_THRESHOLD_RAD)
+    meta = dict(scan.scan_meta or {})
+    value = meta.get("yx_residual_threshold_rad", YX_RESIDUAL_THRESHOLD_RAD)
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError):
+        threshold = float(YX_RESIDUAL_THRESHOLD_RAD)
+    return max(threshold, 0.0)
+
+
+def _apply_effective_refcal_flags(scan: ScanAnalysis, antenna_indices: Optional[Sequence[int]] = None) -> None:
+    """Apply the current v2/model flag logic to one refcal in place.
+
+    :param scan: Refcal scan to update.
+    :type scan: ScanAnalysis
+    :param antenna_indices: Optional antenna subset to refresh.
+    :type antenna_indices: Sequence[int] | None
+    """
+
+    if scan.scan_kind != "refcal" or scan.delay_solution is None:
+        return
+    from .calwidget_v2_plots import refresh_model_flag_state
+
+    refresh_model_flag_state(scan, antenna_indices=antenna_indices)
 
 
 def _layout_for_mjd(mjd: float) -> LayoutInfo:
@@ -468,18 +576,19 @@ def find_phasecal_scans(trange: Time) -> Dict[str, Any]:
     tstart, tend = trange.lv.astype(int).astype(str)
     cnxn, cursor = db.get_cursor()
     verstr = db.find_table_version(cursor, tstart, True)
+    fverstr = db.find_table_version(cursor, tstart, False)
     query = (
         "select Timestamp,Project,SourceID from hV{ver}_vD1 "
         "where left(Project,8) = 'PHASECAL' and Timestamp between {start} and {end} "
         "order by Timestamp"
     ).format(ver=verstr, start=tstart, end=tend)
     projdict, msg = db.do_query(cursor, query)
-    cnxn.close()
     if msg != "Success":
         return {"msg": msg}
     if projdict == {}:
         return {"msg": "No PHASECAL scans for this day"}
     tsint = projdict["Timestamp"].astype(int)
+    projects = np.array([_clean_text(item) for item in projdict.get("Project", [])], dtype=object)
     ufdb = dump_tsys.rd_ufdb(Time(int(tstart), format="lv"))
     mjd0 = int(Time(int(tstart), format="lv").mjd)
     mjdnow = int(Time.now().mjd)
@@ -498,12 +607,61 @@ def find_phasecal_scans(trange: Time) -> Dict[str, Any]:
     for i in idx:
         dur.append(((ufdb["EN_TS"].astype(float) - ufdb["ST_TS"].astype(float))[i]) / 60.0)
         filelist.append(fpath + ufdb["FILE"][i])
-    srclist = np.array([str(item.replace("\x00", "")) for item in projdict["SourceID"]])
+    srclist = np.array([_clean_text(item) for item in projdict["SourceID"]], dtype=object)
+    fseq_lookup: Dict[int, str] = {}
+    fseq_warning = ""
+    try:
+        if fverstr is None:
+            fseq_warning = "Front-end FSeq metadata unavailable."
+        else:
+            fquery = (
+                "select Timestamp,LODM_LO1A_FSeqFile from fV{ver}_vD1 "
+                "where Timestamp between {start} and {end} order by Timestamp"
+            ).format(ver=fverstr, start=tstart, end=tend)
+            fdict, fmsg = db.do_query(cursor, fquery)
+            if fmsg == "Success" and fdict and "Timestamp" in fdict and len(fdict["Timestamp"]) > 0:
+                fts = np.asarray(fdict["Timestamp"], dtype=float).astype(int)
+                ffseq = np.array([_clean_text(item) for item in fdict["LODM_LO1A_FSeqFile"]], dtype=object)
+                fidx = nearest_val_idx(tsint, fts)
+                for row_idx, ts_value in enumerate(tsint):
+                    match_idx = int(fidx[row_idx])
+                    if match_idx < 0 or match_idx >= len(ffseq):
+                        continue
+                    if abs(int(fts[match_idx]) - int(ts_value)) > 300:
+                        continue
+                    fseq_lookup[int(ts_value)] = str(ffseq[match_idx])
+            else:
+                fseq_warning = "Front-end FSeq metadata unavailable."
+    except Exception:
+        fseq_warning = "Front-end FSeq metadata unavailable."
+    cnxn.close()
     return {
         "Timestamp": tsint,
+        "Project": projects,
         "SourceID": srclist,
         "duration": np.array(dur),
         "filelist": np.array(filelist),
+        "fseqfile": np.array([str(fseq_lookup.get(int(ts_value), "")) for ts_value in tsint], dtype=object),
+        "feed_kind": np.array(
+            [
+                _classify_feed_kind(projects[row_idx], fseq_lookup.get(int(ts_value), ""), duration_min=dur[row_idx])
+                for row_idx, ts_value in enumerate(tsint)
+            ],
+            dtype=object,
+        ),
+        "metadata_warning": np.array(
+            [
+                ""
+                if fseq_lookup.get(int(ts_value), "")
+                else (
+                    (fseq_warning.rstrip(".") + "; using duration fallback.")
+                    if fseq_warning
+                    else "Using duration fallback because FSeq metadata was not found."
+                )
+                for ts_value in tsint
+            ],
+            dtype=object,
+        ),
         "msg": msg,
     }
 
@@ -617,6 +775,10 @@ def describe_day(date_text: str) -> Dict[str, Any]:
                 "scan_id": idx,
                 "scan_time": start.iso[11:19],
                 "source": str(scan_dict["SourceID"][idx]),
+                "project": str(scan_dict.get("Project", [""] * len(scan_dict["Timestamp"]))[idx]),
+                "fseqfile": str(scan_dict.get("fseqfile", [""] * len(scan_dict["Timestamp"]))[idx]),
+                "feed_kind": str(scan_dict.get("feed_kind", ["unknown"] * len(scan_dict["Timestamp"]))[idx]),
+                "metadata_warning": str(scan_dict.get("metadata_warning", [""] * len(scan_dict["Timestamp"]))[idx]),
                 "duration_min": duration,
                 "file": str(scan_dict["filelist"][idx]),
                 "timestamp_lv": int(ts),
@@ -1175,13 +1337,27 @@ def add_time_flag_group(scan: ScanAnalysis, ant: int, band: int, start_jd: float
     return group
 
 
-def delete_time_flag_group(scan: ScanAnalysis, group_id: str) -> bool:
-    """Delete one browser-native interval group by id."""
+def delete_time_flag_group(scan: ScanAnalysis, group_id: str) -> Optional[TimeFlagGroup]:
+    """Delete one browser-native interval group by id.
+
+    :param scan: Scan whose interval list will be updated.
+    :type scan: ScanAnalysis
+    :param group_id: Interval-group identifier.
+    :type group_id: str
+    :returns: Removed group, or ``None`` when not found.
+    :rtype: TimeFlagGroup | None
+    """
 
     ensure_time_flag_groups(scan)
-    before = len(scan.time_flag_groups)
-    scan.time_flag_groups = [group for group in scan.time_flag_groups if group.group_id != str(group_id)]
-    return len(scan.time_flag_groups) != before
+    removed = None
+    kept = []
+    for group in scan.time_flag_groups:
+        if group.group_id == str(group_id):
+            removed = group
+            continue
+        kept.append(group)
+    scan.time_flag_groups = kept
+    return removed
 
 
 def serialized_time_flag_groups_for_target(scan: ScanAnalysis, ant: int, band: int, times_jd: np.ndarray) -> List[Dict[str, Any]]:
@@ -1417,6 +1593,8 @@ def _fit_uniform_inband_delay(
         band_values=band_values,
         band_centers_ghz=band_centers_ghz,
         kept_band_mask=kept_band_mask,
+        manual_ant_flag_override=np.zeros(layout.nsolant, dtype=bool),
+        manual_ant_keep_override=np.zeros(layout.nsolant, dtype=bool),
     )
 
 
@@ -1754,6 +1932,7 @@ def analyze_refcal_input(
         fghz_band=fghz_band,
         bands_band=used_band_ids,
         band_to_full_index=_band_index_map(used_band_ids),
+        base_flags=np.asarray(flags, dtype=np.int32).copy(),
         delay_solution=delay_solution,
         tflags=tflags,
     )
@@ -1816,7 +1995,8 @@ def refresh_refcal_solution(
         scan.corrected_channel_vis = corrected_channel_vis
         scan.corrected_band_vis = vis_median
         scan.sigma = sigma
-        scan.flags = flags
+        scan.base_flags = np.asarray(flags, dtype=np.int32).copy()
+        scan.flags = np.asarray(flags, dtype=np.int32).copy()
         scan.fghz_band = fghz_band
         scan.bands_band = used_band_ids
         scan.band_to_full_index = _band_index_map(used_band_ids)
@@ -1847,10 +2027,14 @@ def refresh_refcal_solution(
         )
         scan.corrected_band_vis[ants, :, :] = vis_median_rows
         scan.sigma[ants, :, :] = sigma_rows
+        if scan.base_flags is None or scan.base_flags.shape != scan.flags.shape:
+            scan.base_flags = np.asarray(scan.flags, dtype=np.int32).copy()
+        scan.base_flags[ants, :, :] = flags_rows
         scan.flags[ants, :, :] = flags_rows
         scan.fghz_band = fghz_band
         scan.bands_band = used_band_ids
         scan.band_to_full_index = _band_index_map(used_band_ids)
+    _apply_effective_refcal_flags(scan, antenna_indices=None if full_refresh else ants)
     windows_are_full = all(
         scan.delay_solution.uses_full_window(ant, pol)
         for ant in range(scan.layout.nsolant)
@@ -1901,7 +2085,8 @@ def refresh_phacal_solution(scan: ScanAnalysis, refcal: ScanAnalysis) -> None:
     )
     scan.corrected_band_vis = vis_median
     scan.sigma = sigma
-    scan.flags = flags
+    scan.base_flags = np.asarray(flags, dtype=np.int32).copy()
+    scan.flags = np.asarray(flags, dtype=np.int32).copy()
     scan.fghz_band = fghz_band
     scan.bands_band = used_band_ids
     scan.band_to_full_index = _band_index_map(used_band_ids)
@@ -2020,6 +2205,7 @@ def analyze_phacal_input(
         fghz_band=fghz_band,
         bands_band=used_band_ids,
         band_to_full_index=_band_index_map(used_band_ids),
+        base_flags=np.asarray(flags, dtype=np.int32).copy(),
         delay_solution=refcal.delay_solution,
         tflags=tflags,
         applied_ref_id=refcal.scan_id,
@@ -2035,18 +2221,31 @@ def combine_refcals(refcal_a: ScanAnalysis, refcal_b: ScanAnalysis) -> ScanAnaly
         raise CalWidgetV2Error("LO/HI refcals come from incompatible array layouts.")
     result = deepcopy(refcal_b)
     layout = result.layout
-    nflagged_a = int(np.sum(np.asarray(refcal_a.flags[: layout.nsolant, :2]).astype(int)))
-    nflagged_b = int(np.sum(np.asarray(refcal_b.flags[: layout.nsolant, :2]).astype(int)))
     lo = None
     hi = None
-    if nflagged_a > 80 * layout.nsolant:
+    feed_a = scan_feed_kind(refcal_a)
+    feed_b = scan_feed_kind(refcal_b)
+    combine_warning = ""
+    if feed_a == "lo":
         lo = refcal_a
-    else:
+    elif feed_a == "hi":
         hi = refcal_a
-    if nflagged_b > 80 * layout.nsolant:
+    if feed_b == "lo":
         lo = refcal_b
-    else:
+    elif feed_b == "hi":
         hi = refcal_b
+    if lo is None or hi is None:
+        nflagged_a = int(np.sum(np.asarray(refcal_a.flags[: layout.nsolant, :2]).astype(int)))
+        nflagged_b = int(np.sum(np.asarray(refcal_b.flags[: layout.nsolant, :2]).astype(int)))
+        if nflagged_a > 80 * layout.nsolant:
+            lo = refcal_a
+        else:
+            hi = refcal_a
+        if nflagged_b > 80 * layout.nsolant:
+            lo = refcal_b
+        else:
+            hi = refcal_b
+        combine_warning = "Feed metadata unavailable; combined refcals using legacy flag-count fallback."
     if lo is None or hi is None:
         raise CalWidgetV2Error("Selected scans do not form a LO/HI refcal pair.")
     fghz = lo.fghz_band
@@ -2078,6 +2277,16 @@ def combine_refcals(refcal_a: ScanAnalysis, refcal_b: ScanAnalysis) -> ScanAnaly
                     )
     if hi.delay_solution is not None:
         merged.delay_solution = deepcopy(hi.delay_solution)
+    merged.scan_meta = dict(hi.scan_meta or {})
+    merged.scan_meta.update(
+        {
+            "combined_lo_scan_id": int(lo.scan_id),
+            "combined_hi_scan_id": int(hi.scan_id),
+            "combined_mode": "lo_hi_pair",
+            "metadata_warning": combine_warning or str((merged.scan_meta or {}).get("metadata_warning", "")),
+            "feed_kind": "hi",
+        }
+    )
     return merged
 
 
@@ -2120,10 +2329,13 @@ def write_sidecar(scan: ScanAnalysis) -> str:
         "band_values": scan.delay_solution.band_values,
         "band_centers_ghz": scan.delay_solution.band_centers_ghz,
         "kept_band_mask": scan.delay_solution.kept_band_mask.astype(np.uint8),
+        "manual_ant_flag_override": np.asarray(scan.delay_solution.manual_ant_flag_override, dtype=np.uint8),
+        "manual_ant_keep_override": np.asarray(scan.delay_solution.manual_ant_keep_override, dtype=np.uint8),
         "active_band_start": active_band_start,
         "active_band_end": active_band_end,
         "fghz_band": scan.fghz_band,
         "bands_band": scan.bands_band,
+        "scan_meta": dict(scan.scan_meta or {}),
     }
     np.savez_compressed(str(path), payload=payload)
     scan.sidecar_path = str(path)
@@ -2192,9 +2404,18 @@ def attach_sidecar_delay(scan: ScanAnalysis, sidecar: Dict[str, Any]) -> None:
         band_values=band_values,
         band_centers_ghz=np.asarray(sidecar["band_centers_ghz"], dtype=np.float64),
         kept_band_mask=kept_band_mask,
+        manual_ant_flag_override=np.asarray(
+            sidecar.get("manual_ant_flag_override", np.zeros(nsolant, dtype=np.uint8)),
+            dtype=bool,
+        ),
+        manual_ant_keep_override=np.asarray(
+            sidecar.get("manual_ant_keep_override", np.zeros(nsolant, dtype=np.uint8)),
+            dtype=bool,
+        ),
     )
     scan.delay_solution = delay_solution
     scan.sidecar_path = scan.sidecar_path or ""
+    scan.scan_meta.update(dict(sidecar.get("scan_meta", {}) or {}))
 
 
 def sql2refcalX(trange: Time, *args: Any, **kwargs: Any) -> Any:

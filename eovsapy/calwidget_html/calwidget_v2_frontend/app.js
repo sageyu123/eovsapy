@@ -7,33 +7,39 @@
   const OVERVIEW_SECTIONS = [
     {
       id: "sum_amp",
-      label: "Sum Amp",
+      label: "Sum X & Y Amplitude",
       showLegend: false,
+      panelHeight: 116,
     },
     {
       id: "sum_pha",
-      label: "Sum Pha [rad]",
+      label: "Sum X & Y Phase [rad]",
       showLegend: false,
+      panelHeight: 116,
     },
     {
       id: "inband_fit",
       label: "Inband Fit",
       showLegend: true,
+      panelHeight: 138,
     },
     {
       id: "inband_relative_phase",
       label: "Relative Phase + Fit",
       showLegend: true,
+      panelHeight: 138,
     },
     {
       id: "inband_residual_phase_band",
       label: "Per-Band Residual Phase",
       showLegend: false,
+      panelHeight: 138,
     },
     {
       id: "inband_residual_delay_band",
       label: "Residual Delay Per Band",
       showLegend: true,
+      panelHeight: 126,
     },
   ];
   const TIME_FLAG_SCOPES = [
@@ -135,6 +141,30 @@
         "Recomputing fit overlays",
         "Refreshing residual diagnostics",
         "Updating display panels",
+      ],
+    },
+    save_sql: {
+      label: "Saving SQL",
+      success: "Saved scan to SQL",
+      paceMs: 7000,
+      waitForPlots: false,
+      stages: [
+        "Preparing calibrated scan product",
+        "Writing calibration arrays to SQL",
+        "Refreshing saved-state metadata",
+        "Updating browser state",
+      ],
+    },
+    save_npz: {
+      label: "Saving NPZ",
+      success: "Daily NPZ bundle saved",
+      paceMs: 7000,
+      waitForPlots: false,
+      stages: [
+        "Collecting tuned scan products",
+        "Building model-phase export arrays",
+        "Writing daily bundle under /common/webplots/phasecal",
+        "Updating browser state",
       ],
     },
   };
@@ -303,6 +333,93 @@
       return item.id === scope;
     });
     return match ? match.label : String(scope || "");
+  }
+
+  function mergedSectionHeading(rowLabels) {
+    const labels = Array.isArray(rowLabels) ? rowLabels.filter(Boolean) : [];
+    if (!labels.length) {
+      return "";
+    }
+    if (labels.length === 2) {
+      const first = String(labels[0]).replace(/^XX?\s+/i, "").trim();
+      const second = String(labels[1]).replace(/^YY?\s+/i, "").trim();
+      if (first && first === second) {
+        return "X & Y " + first;
+      }
+    }
+    return labels.join(" · ");
+  }
+
+  function useMeasuredWidth(ref, fallbackWidth) {
+    const [width, setWidth] = useState(fallbackWidth);
+
+    useEffect(
+      function () {
+        if (!ref.current || typeof window === "undefined") {
+          return;
+        }
+        function updateWidth() {
+          if (!ref.current) {
+            return;
+          }
+          const nextWidth = Math.max(fallbackWidth, Math.round(ref.current.getBoundingClientRect().width || fallbackWidth));
+          setWidth(nextWidth);
+        }
+        updateWidth();
+        let resizeObserver = null;
+        if (typeof ResizeObserver !== "undefined") {
+          resizeObserver = new ResizeObserver(updateWidth);
+          resizeObserver.observe(ref.current);
+        }
+        window.addEventListener("resize", updateWidth);
+        return function () {
+          window.removeEventListener("resize", updateWidth);
+          if (resizeObserver) {
+            resizeObserver.disconnect();
+          }
+        };
+      },
+      [ref, fallbackWidth]
+    );
+
+    return width;
+  }
+
+  function expandTimeFlagTargets(interval, layout) {
+    if (!interval || !layout) {
+      return [];
+    }
+    const ant = clamp(Number(interval.antenna || 0), 0, Math.max(0, Number(layout.nsolant || 1) - 1));
+    const band = clamp(Number(interval.band || 0), 0, Math.max(0, Number(layout.maxnbd || 1) - 1));
+    const scope = String(interval.scope || "selected");
+    if (scope === "selected") {
+      return [{ antenna: ant, band: band }];
+    }
+    if (scope === "this_ant") {
+      return Array.from({ length: Number(layout.maxnbd || 0) }).map(function (_item, idx) {
+        return { antenna: ant, band: idx };
+      });
+    }
+    if (scope === "this_band") {
+      return Array.from({ length: Number(layout.nsolant || 0) }).map(function (_item, idx) {
+        return { antenna: idx, band: band };
+      });
+    }
+    if (scope === "higher_bands") {
+      return Array.from({ length: Math.max(0, Number(layout.maxnbd || 0) - band) }).map(function (_item, idx) {
+        return { antenna: ant, band: band + idx };
+      });
+    }
+    if (scope === "all") {
+      const out = [];
+      for (let antIdx = 0; antIdx < Number(layout.nsolant || 0); antIdx += 1) {
+        for (let bandIdx = 0; bandIdx < Number(layout.maxnbd || 0); bandIdx += 1) {
+          out.push({ antenna: antIdx, band: bandIdx });
+        }
+      }
+      return out;
+    }
+    return [];
   }
 
   function mergeTimeFlagIntervals(intervals, nextInterval) {
@@ -652,15 +769,17 @@
   function HeatmapPlot(props) {
     const data = props.data;
     const [hoverCell, setHoverCell] = useState(null);
+    const shellRef = useRef(null);
+    const shellWidth = useMeasuredWidth(shellRef, 300);
     if (!data) {
       return html`<div className="plot-placeholder">Loading heatmap...</div>`;
     }
     if (data.message) {
       return html`<div className="plot-placeholder">${data.message}</div>`;
     }
-    const width = 380;
-    const height = 388;
-    const margin = { left: 54, right: 84, top: 18, bottom: 44 };
+    const width = shellWidth > 0 ? shellWidth : 300;
+    const height = Math.round(width * 1.05);
+    const margin = { left: 48, right: 42, top: 22, bottom: 58 };
     const plotWidth = width - margin.left - margin.right;
     const plotHeight = height - margin.top - margin.bottom;
     const cellWidth = plotWidth / data.nsolant;
@@ -671,7 +790,37 @@
       props.selectedBand !== null && props.selectedBand !== undefined ? props.selectedBand : data.selected_band;
     const vmin = Number.isFinite(data.vmin) ? data.vmin : 0.0;
     const vmax = Number.isFinite(data.vmax) ? data.vmax : 2.0;
+    const colorLevels = Array.isArray(data.color_levels) && data.color_levels.length ? data.color_levels : null;
+    const colorBins = Array.isArray(data.color_bins) && data.color_bins.length ? data.color_bins : null;
+    const pendingCellSet = new Set(
+      (props.pendingCells || []).map(function (cell) {
+        return String(cell.antenna) + ":" + String(cell.band);
+      })
+    );
+    const appliedCellSet = new Set(
+      ((data && data.applied_cells) || []).map(function (cell) {
+        return String(cell.antenna) + ":" + String(cell.band);
+      })
+    );
     function colorFor(value) {
+      if (colorBins) {
+        for (let idx = 0; idx < colorBins.length; idx += 1) {
+          const bin = colorBins[idx];
+          const min = Number(bin.min);
+          const max = Number(bin.max);
+          if (value >= min && (value < max || (idx === colorBins.length - 1 && value <= max))) {
+            return bin.color;
+          }
+        }
+      }
+      if (colorLevels) {
+        const match = colorLevels.find(function (item) {
+          return Number(item.value) === Number(value);
+        });
+        if (match) {
+          return match.color;
+        }
+      }
       const norm = (value - vmin) / Math.max(vmax - vmin, 1e-9);
       return viridisColor(norm);
     }
@@ -679,11 +828,17 @@
     for (let value = 0; value <= data.maxnbd; value += 10) {
       yTicks.push(value);
     }
-    const barX = margin.left + plotWidth + 24;
+    const barX = margin.left + plotWidth + 16;
     const barY = margin.top;
-    const barWidth = 24;
+    const barWidth = 8;
     const barHeight = plotHeight;
-    const colorbarTicks = [vmin, (vmin + vmax) / 2.0, vmax];
+    const colorbarTicks = colorBins
+      ? colorBins.map(function (item) {
+          return 0.5 * (Number(item.min) + Number(item.max));
+        })
+      : colorLevels
+      ? colorLevels.map(function (item) { return Number(item.value); })
+      : [vmin, (vmin + vmax) / 2.0, vmax];
     const majorX = [];
     for (let idx = 0; idx <= data.nsolant; idx += 5) {
       majorX.push(idx);
@@ -733,14 +888,25 @@
       });
     }
     return html`
-      <div className="js-plot-shell heatmap-shell">
-        <svg viewBox=${"0 0 " + width + " " + height} className="svg-plot" preserveAspectRatio="none" role="img" aria-label=${data.title}>
+      <div className="js-plot-shell heatmap-shell" ref=${shellRef}>
+        <svg
+          viewBox=${"0 0 " + width + " " + height}
+          className="svg-plot"
+          preserveAspectRatio="xMidYMid meet"
+          style=${{ aspectRatio: width + " / " + height }}
+          role="img"
+          aria-label=${data.title}
+        >
           <defs>
-            <linearGradient id="viridis-heatmap-bar" x1="0%" y1="100%" x2="0%" y2="0%">
-              ${VIRIDIS_STOPS.map(function (stop) {
-                return html`<stop key=${"stop-" + stop.t} offset=${String(stop.t * 100) + "%"} stopColor=${stop.color} />`;
-              })}
-            </linearGradient>
+            ${!colorLevels
+              ? html`
+                  <linearGradient id="viridis-heatmap-bar" x1="0%" y1="100%" x2="0%" y2="0%">
+                    ${VIRIDIS_STOPS.map(function (stop) {
+                      return html`<stop key=${"stop-" + stop.t} offset=${String(stop.t * 100) + "%"} stopColor=${stop.color} />`;
+                    })}
+                  </linearGradient>
+                `
+              : null}
           </defs>
           ${Array.from({ length: data.nsolant }).map(function (_, antIdx) {
             const x = margin.left + antIdx * cellWidth + cellWidth / 2;
@@ -748,9 +914,9 @@
               <text
                 key=${"xtick-" + antIdx}
                 x=${x}
-                y=${margin.top + plotHeight + 28}
+                y=${margin.top + plotHeight + 18}
                 textAnchor="end"
-                transform=${"rotate(-45 " + x + " " + (margin.top + plotHeight + 28) + ")"}
+                transform=${"rotate(-35 " + x + " " + (margin.top + plotHeight + 18) + ")"}
                 className="axis-label"
               >
                 ${String(antIdx + 1)}
@@ -784,6 +950,44 @@
                   className="heatmap-cell"
                 />
               `;
+            });
+          })}
+
+          ${data.values.map(function (row, bandIdx) {
+            return row.map(function (_value, antIdx) {
+              const key = String(antIdx) + ":" + String(bandIdx);
+              if (!appliedCellSet.has(key)) {
+                return null;
+              }
+              return html`<rect
+                key=${"applied-" + key}
+                x=${margin.left + antIdx * cellWidth + 0.9}
+                y=${margin.top + plotHeight - (bandIdx + 1) * cellHeight + 0.9}
+                width=${Math.max(cellWidth - 1.8, 0.8)}
+                height=${Math.max(cellHeight - 1.8, 0.8)}
+                fill="none"
+                stroke="rgba(0, 113, 227, 0.58)"
+                strokeWidth="1.15"
+              />`;
+            });
+          })}
+
+          ${data.values.map(function (row, bandIdx) {
+            return row.map(function (_value, antIdx) {
+              const key = String(antIdx) + ":" + String(bandIdx);
+              if (!pendingCellSet.has(key)) {
+                return null;
+              }
+              return html`<rect
+                key=${"pending-" + key}
+                x=${margin.left + antIdx * cellWidth + 0.5}
+                y=${margin.top + plotHeight - (bandIdx + 1) * cellHeight + 0.5}
+                width=${Math.max(cellWidth - 1.0, 1.0)}
+                height=${Math.max(cellHeight - 1.0, 1.0)}
+                fill="none"
+                stroke="#1f6feb"
+                strokeWidth="2.2"
+              />`;
             });
           })}
 
@@ -829,23 +1033,81 @@
             ${data.y_label}
           </text>
 
-          <rect x=${barX} y=${barY} width=${barWidth} height=${barHeight} fill="url(#viridis-heatmap-bar)" />
-          ${colorbarTicks.map(function (tick) {
-            const y = barY + (1.0 - (tick - vmin) / Math.max(vmax - vmin, 1e-9)) * barHeight;
-            return html`
-              <g key=${"bar-" + tick}>
-                <line x1=${barX + barWidth} x2=${barX + barWidth + 6} y1=${y} y2=${y} className="axis-line" />
-                <text x=${barX + barWidth + 10} y=${y + 4} className="axis-label">${String(tick.toFixed(2))}</text>
-              </g>
-            `;
-          })}
+          ${colorBins
+            ? colorBins.map(function (bin, idx) {
+                const denom = Math.max(vmax - vmin, 1e-9);
+                const yTop = barY + (1.0 - (Number(bin.max) - vmin) / denom) * barHeight;
+                const yBottom = barY + (1.0 - (Number(bin.min) - vmin) / denom) * barHeight;
+                return html`
+                  <rect
+                    key=${"bar-bin-" + idx}
+                    x=${barX}
+                    y=${Math.min(yTop, yBottom)}
+                    width=${barWidth}
+                    height=${Math.max(Math.abs(yBottom - yTop), 1)}
+                    fill=${bin.color}
+                  />
+                `;
+              })
+            : colorLevels
+            ? colorLevels
+                .slice()
+                .sort(function (a, b) {
+                  return Number(a.value) - Number(b.value);
+                })
+                .map(function (level, idx, items) {
+                  const bandHeight = barHeight / Math.max(items.length, 1);
+                  const displayIdx = items.length - 1 - idx;
+                  return html`
+                    <rect
+                      key=${"bar-fill-" + level.value}
+                      x=${barX}
+                      y=${barY + displayIdx * bandHeight}
+                      width=${barWidth}
+                      height=${bandHeight}
+                      fill=${level.color}
+                    />
+                  `;
+                })
+            : html`<rect x=${barX} y=${barY} width=${barWidth} height=${barHeight} fill="url(#viridis-heatmap-bar)" />`}
+          ${colorBins
+            ? colorBins.map(function (bin, idx) {
+                const y = barY + (1.0 - (0.5 * (Number(bin.min) + Number(bin.max)) - vmin) / Math.max(vmax - vmin, 1e-9)) * barHeight;
+                return html`
+                  <g key=${"bar-bin-label-" + idx}>
+                    <line x1=${barX + barWidth} x2=${barX + barWidth + 6} y1=${y} y2=${y} className="axis-line" />
+                    <text x=${barX + barWidth + 10} y=${y + 4} className="axis-label">${String(bin.label)}</text>
+                  </g>
+                `;
+              })
+            : colorLevels
+            ? colorLevels
+                .slice()
+                .sort(function (a, b) {
+                  return Number(a.value) - Number(b.value);
+                })
+                .map(function (level, idx, items) {
+                  const bandHeight = barHeight / Math.max(items.length, 1);
+                  const displayIdx = items.length - 1 - idx;
+                  const y = barY + (displayIdx + 0.5) * bandHeight;
+                  return html`
+                    <g key=${"bar-tick-" + level.value}>
+                      <line x1=${barX + barWidth} x2=${barX + barWidth + 6} y1=${y} y2=${y} className="axis-line" />
+                      <text x=${barX + barWidth + 10} y=${y + 4} className="axis-label">${String(Math.round(Number(level.value)))}</text>
+                    </g>
+                  `;
+                })
+            : colorbarTicks.map(function (tick) {
+                const y = barY + (1.0 - (tick - vmin) / Math.max(vmax - vmin, 1e-9)) * barHeight;
+                return html`
+                  <g key=${"bar-" + tick}>
+                    <line x1=${barX + barWidth} x2=${barX + barWidth + 6} y1=${y} y2=${y} className="axis-line" />
+                    <text x=${barX + barWidth + 10} y=${y + 4} className="axis-label">${String(Math.round(tick))}</text>
+                  </g>
+                `;
+              })}
           <rect x=${barX} y=${barY} width=${barWidth} height=${barHeight} className="plot-frame" />
-          <text
-            x=${barX + barWidth + 34}
-            y=${barY + barHeight / 2}
-            transform=${"rotate(-90 " + (barX + barWidth + 34) + " " + (barY + barHeight / 2) + ")"}
-            className="axis-label"
-          >
+          <text x=${barX + barWidth / 2} y=${barY - 8} textAnchor="middle" className="axis-label">
             ${data.colorbar_label || ""}
           </text>
           <rect
@@ -894,11 +1156,12 @@
     const bandEdges = props.bandEdges || [];
     const width = PANEL_GRID_PANEL_WIDTH;
     const height = props.panelHeight || 128;
+    const showXAxisLabels = props.showXAxisLabels !== false;
     const margin = {
       left: 8,
       right: 8,
       top: 8,
-      bottom: 24,
+      bottom: showXAxisLabels ? 24 : 8,
     };
     const plotWidth = width - margin.left - margin.right;
     const plotHeight = height - margin.top - margin.bottom;
@@ -1161,7 +1424,9 @@
         : null;
     return html`
       <div
-        className=${"mini-plot-shell" + (interactionMode ? " interactive" : props.onDoubleClick ? " interactive" : "")}
+        className=${"mini-plot-shell"
+          + (interactionMode ? " interactive" : props.onDoubleClick ? " interactive" : "")
+          + (panel.disabled ? " disabled" : "")}
         style=${{ "--mini-panel-width": String(width), "--mini-panel-height": String(height) }}
         onDoubleClick=${function () {
           if (interactionMode === "zoom" && props.onResetViewport) {
@@ -1202,7 +1467,9 @@
             return html`
               <g key=${"x-" + idx}>
                 <line x1=${x} x2=${x} y1=${margin.top} y2=${margin.top + plotHeight} className="grid-line" />
-                <text x=${labelX} y=${height - 6} textAnchor=${anchor} className="mini-axis-label">${xTickLabels[idx] || formatNumber(tick)}</text>
+                ${showXAxisLabels
+                  ? html`<text x=${labelX} y=${height - 6} textAnchor=${anchor} className="mini-axis-label">${xTickLabels[idx] || formatNumber(tick)}</text>`
+                  : null}
               </g>
             `;
           })}
@@ -1290,6 +1557,9 @@
                 </g>
               `;
             })}
+            ${panel.disabled
+              ? html`<rect x=${margin.left} y=${margin.top} width=${plotWidth} height=${plotHeight} fill="rgba(120, 126, 132, 0.24)" />`
+              : null}
           </g>
           ${interactionMode
             ? html`<rect
@@ -1366,70 +1636,129 @@
               </div>
             `
           : null}
-        ${(data.panels || []).map(function (row, rowIdx) {
-          const yLimits = rowYLimits[rowIdx];
-          const rowYTicks = linearTicks(yLimits[0], yLimits[1], 3).slice().reverse();
-          return html`
-            <section key=${"row-" + rowIdx} className="panel-grid-row">
-              <div className="panel-grid-row-header">
-                <h3>${(data.row_labels && data.row_labels[rowIdx]) || "Row " + String(rowIdx + 1)}</h3>
-                <span className="tiny">${data.x_label}</span>
-              </div>
-              <div className="panel-grid-row-body">
-                <div className="panel-grid-yaxis" aria-hidden="true">
-                  ${rowYTicks.map(function (tick, tickIdx) {
-                    return html`<span key=${"y-tick-" + rowIdx + "-" + tickIdx} className="panel-grid-yaxis-label">${formatNumber(tick)}</span>`;
-                  })}
-                </div>
-                <div className="panel-grid-scroll">
-                  <div className="panel-grid-panels">
-                    ${row.map(function (panel, panelIdx) {
-                    const displayPanel = props.panelOverride ? props.panelOverride(rowIdx, panelIdx, panel) : panel;
-                    return html`<${MiniPanelPlot}
-                      key=${"panel-" + rowIdx + "-" + panelIdx}
-                      panel=${displayPanel}
-                      xLimits=${rowXLimits(rowIdx)}
-                      xTicks=${data.x_ticks}
-                      yLimits=${data.y_limits[rowIdx]}
-                      autoYLimits=${yLimits}
-                      panelHeight=${props.panelHeight}
-                      bandEdges=${data.band_edges}
-                      showBandWindow=${!!props.onBandWindowSelect}
-                      interactionMode=${props.interactionMode === "zoom" ? "zoom" : props.onBandWindowSelect ? "bandselect" : null}
-                      onBandWindowSelect=${props.onBandWindowSelect
-                        ? function (startBand, endBand, mode) {
-                            props.onBandWindowSelect(rowIdx, panelIdx, startBand, endBand, mode, displayPanel);
-                          }
-                        : null}
-                      onViewportChange=${props.interactionMode === "zoom"
-                        ? function (nextViewport) {
-                            setRowViewports(function (current) {
-                              return Object.assign({}, current, { [rowIdx]: nextViewport });
-                            });
-                          }
-                        : null}
-                      onResetViewport=${props.interactionMode === "zoom"
-                        ? function () {
-                            setRowViewports(function (current) {
-                              const next = Object.assign({}, current);
-                              delete next[rowIdx];
-                              return next;
-                            });
-                          }
-                        : null}
-                      onDoubleClick=${props.onPanelDoubleClick
-                        ? function () {
-                          props.onPanelDoubleClick(rowIdx, panelIdx, displayPanel);
-                          }
-                        : null}
-                    />`;
+        <div className="panel-grid-section-heading-row">
+          <span className="panel-grid-section-heading">${mergedSectionHeading(data.row_labels)}</span>
+          <span className="panel-grid-section-xlabel">${data.x_label}</span>
+        </div>
+        <div className="panel-grid-shared-body">
+          <div className="panel-grid-left-rail">
+            ${data.column_controls && data.column_controls.length
+              ? html`<div className="panel-grid-left-rail-spacer"></div>`
+              : null}
+            ${(data.panels || []).map(function (_row, rowIdx) {
+              const yLimits = rowYLimits[rowIdx];
+              const rowYTicks = linearTicks(yLimits[0], yLimits[1], 3);
+              const panelHeight = props.panelHeight || 128;
+              const isBottomRow = rowIdx === (data.panels || []).length - 1;
+              const axisTop = 8;
+              const axisBottom = isBottomRow ? 24 : 8;
+              const axisHeight = Math.max(panelHeight - axisTop - axisBottom, 1);
+              const yMin = Number(yLimits[0]);
+              const yMax = Number(yLimits[1]);
+              const ySpan = yMax - yMin;
+              return html`
+                <div key=${"yaxis-" + rowIdx} className="panel-grid-yaxis-block" style=${{ height: panelHeight + "px" }}>
+                  <div className="panel-grid-yaxis" aria-hidden="true">
+                    ${rowYTicks.map(function (tick, tickIdx) {
+                      const fraction = Math.abs(ySpan) < 1.0e-9 ? 0.5 : clamp((Number(tick) - yMin) / ySpan, 0, 1);
+                      const top = axisTop + (1.0 - fraction) * axisHeight;
+                      return html`<span
+                        key=${"y-tick-" + rowIdx + "-" + tickIdx}
+                        className="panel-grid-yaxis-label"
+                        style=${{ top: top + "px" }}
+                      >${formatNumber(tick)}</span>`;
                     })}
                   </div>
                 </div>
-              </div>
-            </section>
-          `;
-        })}
+              `;
+            })}
+          </div>
+          <div className="panel-grid-scroll">
+            ${data.column_controls && data.column_controls.length
+              ? html`
+                  <div className="panel-grid-column-controls">
+                    <div className="panel-grid-panels">
+                      ${data.column_controls.map(function (control) {
+                        return html`
+                          <label
+                            key=${"col-control-" + control.antenna}
+                            className=${"panel-grid-column-control"
+                              + (control.flagged ? " flagged" : "")
+                              + (control.auto_flagged ? " auto-flagged" : "")}
+                          >
+                            <input
+                              type="checkbox"
+                              checked=${!!control.checked}
+                              disabled=${!!props.busy}
+                              onChange=${props.onColumnToggle
+                                ? function (event) {
+                                    props.onColumnToggle(Number(control.antenna), !event.target.checked);
+                                  }
+                                : null}
+                            />
+                            <span>${control.label}</span>
+                          </label>
+                        `;
+                      })}
+                    </div>
+                  </div>
+                `
+              : null}
+            <div className="panel-grid-rows">
+              ${(data.panels || []).map(function (row, rowIdx) {
+                const yLimits = rowYLimits[rowIdx];
+                return html`
+                  <section key=${"row-" + rowIdx} className="panel-grid-row">
+                    <div className="panel-grid-panels">
+                      ${row.map(function (panel, panelIdx) {
+                        const displayPanel = props.panelOverride ? props.panelOverride(rowIdx, panelIdx, panel) : panel;
+                        return html`<${MiniPanelPlot}
+                          key=${"panel-" + rowIdx + "-" + panelIdx}
+                          panel=${displayPanel}
+                          xLimits=${rowXLimits(rowIdx)}
+                          xTicks=${data.x_ticks}
+                          yLimits=${data.y_limits[rowIdx]}
+                          autoYLimits=${yLimits}
+                          panelHeight=${props.panelHeight}
+                          bandEdges=${data.band_edges}
+                          showBandWindow=${!!props.onBandWindowSelect}
+                          showXAxisLabels=${rowIdx === (data.panels || []).length - 1}
+                          interactionMode=${props.interactionMode === "zoom" ? "zoom" : props.onBandWindowSelect ? "bandselect" : null}
+                          onBandWindowSelect=${props.onBandWindowSelect
+                            ? function (startBand, endBand, mode) {
+                                props.onBandWindowSelect(rowIdx, panelIdx, startBand, endBand, mode, displayPanel);
+                              }
+                            : null}
+                          onViewportChange=${props.interactionMode === "zoom"
+                            ? function (nextViewport) {
+                                setRowViewports(function (current) {
+                                  return Object.assign({}, current, { [rowIdx]: nextViewport });
+                                });
+                              }
+                            : null}
+                          onResetViewport=${props.interactionMode === "zoom"
+                            ? function () {
+                                setRowViewports(function (current) {
+                                  const next = Object.assign({}, current);
+                                  delete next[rowIdx];
+                                  return next;
+                                });
+                              }
+                            : null}
+                          onDoubleClick=${props.onPanelDoubleClick
+                            ? function () {
+                                props.onPanelDoubleClick(rowIdx, panelIdx, displayPanel);
+                              }
+                            : null}
+                        />`;
+                      })}
+                    </div>
+                  </section>
+                `;
+              })}
+            </div>
+          </div>
+        </div>
       </div>
     `;
   }
@@ -1961,22 +2290,6 @@
               `;
             })}
           </div>
-          ${pendingIntervals.length
-            ? html`
-                <div className="time-history-toolbar-actions">
-                  <button
-                    type="button"
-                    className="btn-outline-blue time-history-apply-inline"
-                    disabled=${props.busy}
-                    onClick=${function () {
-                      props.onApplyPending();
-                    }}
-                  >
-                    Apply Mask
-                  </button>
-                </div>
-              `
-            : null}
           <div className="time-history-readout">
             <span>${hoverReadout}</span>
             ${Number.isFinite(pendingAnchorJd)
@@ -1997,8 +2310,6 @@
           aria-label=${"Time history " + data.title}
           onMouseEnter=${focusShell}
         >
-          <text x=${width / 2} y="28" textAnchor="middle" className="plot-title">${"Time History: " + data.title}</text>
-
           ${ampTickLines(ampX0)}
           ${tickLines(phaseX0, phaseTicks(), phaseMap, function (value) {
             return String(value);
@@ -2082,6 +2393,7 @@
     const wrapperRef = useRef(null);
     const ampSvgRef = useRef(null);
     const phaseSvgRef = useRef(null);
+    const shellWidth = useMeasuredWidth(wrapperRef, 300);
     const [hoverOffset, setHoverOffset] = useState(null);
     const [hoverJd, setHoverJd] = useState(null);
     const [pendingAnchorJd, setPendingAnchorJd] = useState(null);
@@ -2106,11 +2418,11 @@
       return html`<div className="plot-placeholder">${data.message}</div>`;
     }
 
-    const width = 480;
-    const ampHeight = 164;
-    const phaseHeight = 192;
-    const ampOuter = { left: 50, right: 18, top: 12, bottom: 10 };
-    const phaseOuter = { left: 50, right: 18, top: 8, bottom: 28 };
+    const width = shellWidth > 0 ? shellWidth : 300;
+    const ampHeight = Math.round(width * 0.42);
+    const phaseHeight = Math.round(width * 0.50);
+    const ampOuter = { left: 48, right: 8, top: 8, bottom: 10 };
+    const phaseOuter = { left: 48, right: 8, top: 6, bottom: 30 };
     const plotWidth = width - ampOuter.left - ampOuter.right;
     const ampPlotHeight = ampHeight - ampOuter.top - ampOuter.bottom;
     const phasePlotHeight = phaseHeight - phaseOuter.top - phaseOuter.bottom;
@@ -2489,28 +2801,13 @@
               `;
             })}
           </div>
-          ${pendingIntervals.length
-            ? html`
-                <div className="time-history-toolbar-actions">
-                  <button
-                    type="button"
-                    className="btn-outline-blue time-history-apply-inline"
-                    disabled=${props.busy}
-                    onClick=${function () {
-                      props.onApplyPending();
-                    }}
-                  >
-                    Apply Mask
-                  </button>
-                </div>
-              `
-            : null}
         </div>
         <svg
           ref=${ampSvgRef}
           viewBox=${"0 0 " + width + " " + ampHeight}
           className="svg-plot"
-          preserveAspectRatio="none"
+          preserveAspectRatio="xMidYMid meet"
+          style=${{ aspectRatio: width + " / " + ampHeight }}
           role="img"
           aria-label=${"Time history amplitude " + data.title}
           onMouseEnter=${focusShell}
@@ -2556,7 +2853,8 @@
           ref=${phaseSvgRef}
           viewBox=${"0 0 " + width + " " + phaseHeight}
           className="svg-plot"
-          preserveAspectRatio="none"
+          preserveAspectRatio="xMidYMid meet"
+          style=${{ aspectRatio: width + " / " + phaseHeight }}
           role="img"
           aria-label=${"Time history phase " + data.title}
           onMouseEnter=${focusShell}
@@ -2609,6 +2907,7 @@
     const [dateText, setDateText] = useState(todayIso());
     const [requestedDateText, setRequestedDateText] = useState(null);
     const [checkedScanIds, setCheckedScanIds] = useState([]);
+    const [scanSelectionAnchor, setScanSelectionAnchor] = useState(null);
     const [dataRevision, setDataRevision] = useState(0);
     const [selectionRevision, setSelectionRevision] = useState(0);
     const [busy, setBusy] = useState(false);
@@ -2619,6 +2918,7 @@
     const [inbandPolScope, setInbandPolScope] = useState("selected");
     const [delayDraft, setDelayDraft] = useState({ ant: 1, x: "", y: "" });
     const [relativeDelayDraft, setRelativeDelayDraft] = useState({ ant: 1, x: "", y: "" });
+    const [yxThresholdDraft, setYxThresholdDraft] = useState(String(1.5));
     const [timeHistoryData, setTimeHistoryData] = useState(null);
     const [heatmapData, setHeatmapData] = useState(null);
     const [overviewData, setOverviewData] = useState(null);
@@ -2631,8 +2931,21 @@
     const [pendingProgressLoad, setPendingProgressLoad] = useState(null);
     const [activity, setActivity] = useState(null);
     const [inbandResidualInspector, setInbandResidualInspector] = useState(null);
+    const [paneMaxHeight, setPaneMaxHeight] = useState(null);
+    const [toolbarCollapsed, setToolbarCollapsed] = useState(function () {
+      if (typeof window === "undefined") {
+        return false;
+      }
+      try {
+        return window.localStorage.getItem("calwidget_v2_toolbar_collapsed") === "1";
+      } catch (_err) {
+        return false;
+      }
+    });
     const progressTimerRef = useRef(null);
     const finishTimerRef = useRef(null);
+    const shellRef = useRef(null);
+    const toolbarRef = useRef(null);
 
     function clearActivityTimers() {
       if (progressTimerRef.current) {
@@ -2682,19 +2995,55 @@
 
     useEffect(
       function () {
+        if (typeof window === "undefined") {
+          return;
+        }
+        try {
+          window.localStorage.setItem("calwidget_v2_toolbar_collapsed", toolbarCollapsed ? "1" : "0");
+        } catch (_err) {}
+      },
+      [toolbarCollapsed]
+    );
+
+    useEffect(
+      function () {
+        function updatePaneMaxHeight() {
+          if (!shellRef.current || !toolbarRef.current || typeof window === "undefined") {
+            return;
+          }
+          const shellStyle = window.getComputedStyle(shellRef.current);
+          const paddingTop = parseFloat(shellStyle.paddingTop) || 0;
+          const paddingBottom = parseFloat(shellStyle.paddingBottom) || 0;
+          const gap = parseFloat(shellStyle.rowGap || shellStyle.gap) || 0;
+          const toolbarHeight = toolbarRef.current.getBoundingClientRect().height || 0;
+          const available = Math.floor(window.innerHeight - paddingTop - paddingBottom - gap - toolbarHeight);
+          setPaneMaxHeight(Math.max(260, available));
+        }
+        updatePaneMaxHeight();
+        window.addEventListener("resize", updatePaneMaxHeight);
+        let resizeObserver = null;
+        if (typeof ResizeObserver !== "undefined" && toolbarRef.current) {
+          resizeObserver = new ResizeObserver(updatePaneMaxHeight);
+          resizeObserver.observe(toolbarRef.current);
+        }
+        return function () {
+          window.removeEventListener("resize", updatePaneMaxHeight);
+          if (resizeObserver) {
+            resizeObserver.disconnect();
+          }
+        };
+      },
+      []
+    );
+
+    useEffect(
+      function () {
         setInbandResidualInspector(null);
         setStagedTimeIntervals([]);
         setStagedInbandPanels({});
         setStagedInbandMasks({});
       },
       [dataRevision]
-    );
-
-    useEffect(
-      function () {
-        setStagedTimeIntervals([]);
-      },
-      [selectionRevision]
     );
 
     function syncDraft(nextState) {
@@ -2720,6 +3069,11 @@
               ? String(active.y_relative_delay_ns.toFixed(3))
               : "",
       });
+      setYxThresholdDraft(
+        active && active.yx_residual_threshold_rad !== null && active.yx_residual_threshold_rad !== undefined
+          ? String(Number(active.yx_residual_threshold_rad).toFixed(2))
+          : String(1.5)
+      );
     }
 
     async function refresh() {
@@ -2960,6 +3314,7 @@
       setInteractionMessage("");
       syncDraft(next);
       setCheckedScanIds([]);
+      setScanSelectionAnchor(next && next.selected_scan_id !== null ? next.selected_scan_id : null);
       setDataRevision(function (value) {
         return value + 1;
       });
@@ -3009,6 +3364,52 @@
           return mergeOverviewAntennaUpdates(current, next.overview_updates, patchAntenna);
         });
       }
+      if (next && next.heatmap) {
+        setHeatmapData(next.heatmap);
+      }
+      return next;
+    }
+
+    async function postJsonWithOverviewRefresh(url, payload) {
+      const next = await jsonFetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const nextState = next && next.state ? next.state : next;
+      setState(nextState);
+      setInteractionMessage("");
+      syncDraft(nextState);
+      if (next && next.overview) {
+        setOverviewData(next.overview);
+      }
+      if (next && next.heatmap) {
+        setHeatmapData(next.heatmap);
+      }
+      return next;
+    }
+
+    async function postJsonWithTimeFlagPatch(url, payload) {
+      const next = await jsonFetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const nextState = next && next.state ? next.state : next;
+      setState(nextState);
+      setInteractionMessage("");
+      syncDraft(nextState);
+      if (next && next.overview_updates) {
+        setOverviewData(function (current) {
+          return mergeOverviewAntennaUpdates(current, next.overview_updates, null);
+        });
+      }
+      if (next && next.heatmap) {
+        setHeatmapData(next.heatmap);
+      }
+      if (next && next.time_history) {
+        setTimeHistoryData(next.time_history);
+      }
       return next;
     }
 
@@ -3016,19 +3417,65 @@
       return state && state.selected_scan_id !== null ? state.selected_scan_id : null;
     }
 
-    function setChecked(scanId, checked) {
-      setCheckedScanIds(function (current) {
-        if (!checked) {
-          return current.filter(function (value) {
-            return value !== scanId;
-          });
-        }
-        return current
-          .filter(function (value) {
-            return value !== scanId;
-          })
-          .concat([scanId])
-          .slice(-2);
+    function orderedScanIds(scanIds) {
+      const scans = state && state.scans ? state.scans : [];
+      const order = new Map(
+        scans.map(function (scan, idx) {
+          return [scan.scan_id, idx];
+        })
+      );
+      return Array.from(new Set(scanIds)).sort(function (left, right) {
+        return (order.has(left) ? order.get(left) : Number.MAX_SAFE_INTEGER) - (order.has(right) ? order.get(right) : Number.MAX_SAFE_INTEGER);
+      });
+    }
+
+    function scanRangeIds(anchorId, targetId) {
+      const scans = state && state.scans ? state.scans : [];
+      const anchorIndex = scans.findIndex(function (scan) {
+        return scan.scan_id === anchorId;
+      });
+      const targetIndex = scans.findIndex(function (scan) {
+        return scan.scan_id === targetId;
+      });
+      if (anchorIndex < 0 || targetIndex < 0) {
+        return [targetId];
+      }
+      const start = Math.min(anchorIndex, targetIndex);
+      const stop = Math.max(anchorIndex, targetIndex) + 1;
+      return scans.slice(start, stop).map(function (scan) {
+        return scan.scan_id;
+      });
+    }
+
+    function onScanRowClick(event, scanId) {
+      if (!sessionId) {
+        return;
+      }
+      const isRange = !!(event && event.shiftKey);
+      const isToggle = !!(event && (event.metaKey || event.ctrlKey));
+      const anchorId = scanSelectionAnchor !== null ? scanSelectionAnchor : selectedScanId();
+      if (isRange) {
+        const nextSelection = anchorId !== null ? scanRangeIds(anchorId, scanId) : [scanId];
+        setCheckedScanIds(orderedScanIds(nextSelection));
+        setScanSelectionAnchor(anchorId !== null ? anchorId : scanId);
+      } else if (isToggle) {
+        setCheckedScanIds(function (current) {
+          const exists = current.indexOf(scanId) >= 0;
+          return orderedScanIds(
+            exists
+              ? current.filter(function (value) {
+                  return value !== scanId;
+                })
+              : current.concat([scanId])
+          );
+        });
+        setScanSelectionAnchor(scanId);
+      } else {
+        setCheckedScanIds([]);
+        setScanSelectionAnchor(scanId);
+      }
+      runAction(function () {
+        return postJson("/api/select-scan", { session_id: sessionId, scan_id: scanId });
       });
     }
 
@@ -3103,7 +3550,7 @@
       setInteractionMessage("");
       runAction(
         function () {
-          return postJson("/api/time-flags/add-batch", {
+          return postJsonWithTimeFlagPatch("/api/time-flags/add-batch", {
             session_id: sessionId,
             intervals: stagedTimeIntervals.map(function (item) {
               return {
@@ -3114,6 +3561,9 @@
                 scope: String(item.scope),
               };
             }),
+          }).then(function (next) {
+            setStagedTimeIntervals([]);
+            return next;
           });
         },
         { progressKind: "time_flag", successMessage: "Time flag applied" }
@@ -3124,7 +3574,7 @@
       setInteractionMessage("");
       runAction(
         function () {
-          return postJson("/api/time-flags/delete", {
+          return postJsonWithTimeFlagPatch("/api/time-flags/delete", {
             session_id: sessionId,
             group_id: groupId,
           });
@@ -3417,6 +3867,68 @@
       );
     }
 
+    function applyResidualInbandFit() {
+      const antennaIndex = Math.max(0, parseInt(relativeDelayDraft.ant || "1", 10) - 1);
+      runAction(
+        function () {
+          return postJsonWithOverviewPatch(
+            "/api/inband/apply-residual-fit",
+            {
+              session_id: sessionId,
+              antenna: antennaIndex,
+            },
+            antennaIndex
+          );
+        },
+        { progressKind: "active_delay", successMessage: "Residual in-band fit applied" }
+      );
+    }
+
+    function toggleManualAntennaFlag(antennaIndex, flagged) {
+      if (!sessionId) {
+        return;
+      }
+      postJsonWithOverviewPatch(
+        "/api/relative-phase/antenna-flag",
+        {
+          session_id: sessionId,
+          antenna: antennaIndex,
+          flagged: flagged,
+        },
+        antennaIndex
+      )
+        .then(function (next) {
+          const nextState = next && next.state ? next.state : null;
+          setInteractionMessage(
+            nextState && nextState.status_message
+              ? nextState.status_message
+              : flagged
+                ? "Antenna excluded"
+                : "Antenna restored"
+          );
+        })
+        .catch(function (err) {
+          setError(err.message || String(err));
+        });
+    }
+
+    function applyYxResidualThreshold() {
+      const threshold = parseFloat(yxThresholdDraft);
+      if (!Number.isFinite(threshold) || threshold < 0) {
+        setError("Y-X residual RMS threshold must be a non-negative number.");
+        return;
+      }
+      runAction(
+        function () {
+          return postJsonWithOverviewRefresh("/api/relative-phase/yx-threshold", {
+            session_id: sessionId,
+            value: threshold,
+          });
+        },
+        { progressKind: "relative_delay", successMessage: "Y-X residual RMS threshold updated" }
+      );
+    }
+
     function undoRelativeDelayEditor() {
       const antennaIndex = Math.max(0, parseInt(relativeDelayDraft.ant || "1", 10) - 1);
       runAction(
@@ -3455,6 +3967,16 @@
           Math.abs(Number(activeRelativeRef.y_suggested_relative_delay_ns || 0)) > 1e-9
         )
       );
+    const hasResidualInbandSuggestion =
+      !!(
+        activeRelativeRef &&
+        (
+          Math.abs(Number(activeRelativeRef.x_suggested_residual_inband_delay_ns || 0)) > 1e-9 ||
+          Math.abs(Number(activeRelativeRef.y_suggested_residual_inband_delay_ns || 0)) > 1e-9
+        )
+      );
+    const canApplyResidualFit =
+      !!(state && state.active_refcal && Number.isFinite(state.selected_ant) && Number(state.selected_ant) > 0);
     const selectedCellFlagSum =
       heatmapData &&
       !heatmapData.message &&
@@ -3466,6 +3988,7 @@
         : "—";
     const scanCount = state && state.scans ? state.scans.length : 0;
     const scanlistMaxHeightPx = Math.min(320, Math.max(80, 28 + scanCount * 29));
+    const metadataWarnings = state && state.scan_metadata_warnings ? state.scan_metadata_warnings : [];
     const selectedPendingTimeIntervals =
       state && timeHistoryData && !timeHistoryData.message
         ? stagedTimeIntervals
@@ -3491,145 +4014,54 @@
               };
             })
         : [];
+    const pendingFlagMapCells =
+      state && state.current_layout
+        ? Array.from(
+            stagedTimeIntervals.reduce(function (acc, interval) {
+              expandTimeFlagTargets(interval, state.current_layout).forEach(function (target) {
+                acc.set(String(target.antenna) + ":" + String(target.band), target);
+              });
+              return acc;
+            }, new Map()).values()
+          )
+        : [];
 
     return html`
-      <div className="app-shell">
-        <section className="toolbar panel">
-          <div className="field">
-            <label>Date</label>
-            <input type="date" value=${dateText} onChange=${function (event) { setDateText(event.target.value); }} />
-          </div>
-          <label className="field">
-            <input
-              type="checkbox"
-              checked=${!!(state && state.fix_drift)}
-              onChange=${function (event) {
-                runAction(function () {
-                  return postJson("/api/settings/fix-drift", {
-                    session_id: sessionId,
-                    fix_drift: event.target.checked,
-                  });
-                });
-              }}
-            />
-            Fix Phase Drift
-          </label>
-          <label className="field">
-            <input
-              type="checkbox"
-              checked=${!!(state && state.use_lobe)}
-              onChange=${function (event) {
-                runAction(function () {
-                  return postJson("/api/settings/lobe", {
-                    session_id: sessionId,
-                    use_lobe: event.target.checked,
-                  });
-                });
-              }}
-            />
-            Lobe Sum Pha
-          </label>
-          <button
-            type="button"
-            className="btn-outline-blue"
-            disabled=${!canAnalyze || busy}
-            onClick=${function () {
-              runAction(
-                function () {
-                  return postJson("/api/refcal/analyze", { session_id: sessionId, scan_id: selectedScanId() });
-                },
-                { progressKind: "refcal", successMessage: "Refcal analysis complete" }
-              );
-            }}
-          >
-            Analyze Refcal
-          </button>
-          <button
-            type="button"
-            className="btn-dark-fill"
-            disabled=${!canRefcal || busy}
-            onClick=${function () {
-              runAction(function () {
-                return postJson("/api/refcal/select", { session_id: sessionId, scan_id: selectedScanId() });
-              });
-            }}
-          >
-            Set Refcal
-          </button>
-          <button
-            type="button"
-            className="btn-filter-pill"
-            disabled=${!canCombine || busy}
-            onClick=${function () {
-              runAction(
-                function () {
-                  return postJson("/api/refcal/combine", { session_id: sessionId, scan_ids: checkedScanIds });
-                },
-                { progressKind: "combine_refcal", successMessage: "Refcal combination complete" }
-              );
-            }}
-          >
-            Combine 2 Refcals
-          </button>
-          <button
-            type="button"
-            className="btn-outline-blue"
-            disabled=${!canPhacal || busy}
-            onClick=${function () {
-              runAction(
-                function () {
-                  return postJson("/api/phacal/analyze", { session_id: sessionId, scan_id: selectedScanId() });
-                },
-                { progressKind: "phacal", successMessage: "Phacal analysis complete" }
-              );
-            }}
-          >
-            Analyze Phacal
-          </button>
-          <button
-            type="button"
-            className="btn-blue"
-            disabled=${!canAnalyze || busy}
-            onClick=${function () {
-              runAction(function () {
-                return postJson("/api/save/sql", { session_id: sessionId, scan_id: selectedScanId() });
-              });
-            }}
-          >
-            Save SQL
-          </button>
-          <div className=${"toolbar-status" + (activity ? " toolbar-status-progress" : "") + (activity && activity.error ? " error" : "")}>
-            ${activity
-              ? html`
-                  <div className="toolbar-status-top">
-                    <span className="toolbar-status-title">${activity.title}</span>
-                    <span className="toolbar-status-percent">${Math.max(0, Math.min(100, Math.round(activity.progress)))}%</span>
-                  </div>
-                  <div className="toolbar-status-stage">${activity.stage}</div>
-                  <div className="activity-meter">
-                    <div
-                      className="activity-meter-fill"
-                      style=${{ width: Math.max(4, Math.min(100, activity.progress)) + "%" }}
-                    ></div>
-                  </div>
-                `
-              : error
-                ? html`<span className="error">${error}</span>`
-                : interactionMessage || (state ? state.status_message : "Initializing session...")}
-          </div>
-        </section>
+      <div className="app-shell" ref=${shellRef}>
+        <section className=${"toolbar panel" + (toolbarCollapsed ? " toolbar-collapsed" : "")} ref=${toolbarRef}>
+          ${toolbarCollapsed
+            ? null
+            : html`<div className="toolbar-main">
+            <div className="toolbar-column toolbar-left-column">
+              <div className="toolbar-controls-row">
+                <div className="field">
+                  <label>Date</label>
+                  <input type="date" value=${dateText} onChange=${function (event) { setDateText(event.target.value); }} />
+                </div>
+                <label className="field">
+                  <input
+                    type="checkbox"
+                    checked=${!!(state && state.fix_drift)}
+                    onChange=${function (event) {
+                      runAction(function () {
+                        return postJson("/api/settings/fix-drift", {
+                          session_id: sessionId,
+                          fix_drift: event.target.checked,
+                        });
+                      });
+                    }}
+                  />
+                  Fix Phase Drift
+                </label>
+              </div>
 
-        <main className="content-grid">
-          <aside className="control-rail panel">
-            <section className="rail-section summary-box">
-              <h2>Session</h2>
-              <div className="summary-grid">
+              <div className="toolbar-session-grid">
                 <div>
                   <strong>Selected Scan</strong>
-                  <span>${state && state.current_scan ? state.current_scan.scan_time || state.current_scan.timestamp_iso : "None"}</span>
+                  <span>${currentScanLabel}</span>
                 </div>
                 <div>
-                  <strong>Active Refcal</strong>
+                  <strong>Anchor Refcal</strong>
                   <span>${activeRefLabel}</span>
                 </div>
                 <div>
@@ -3641,16 +4073,145 @@
                   <span>${selectedBandLabel}</span>
                 </div>
               </div>
-            </section>
 
-            <section className="rail-section scanlist-box">
-              <h2>Scans</h2>
-              <div className="scanlist-scroll" style=${{ maxHeight: scanlistMaxHeightPx + "px" }}>
+              <div className="toolbar-actions-row">
+                <button
+                  type="button"
+                  className="btn-outline-blue"
+                  disabled=${!canAnalyze || busy}
+                  onClick=${function () {
+                    runAction(
+                      function () {
+                        return postJson("/api/refcal/analyze", { session_id: sessionId, scan_id: selectedScanId() });
+                      },
+                      { progressKind: "refcal", successMessage: "Refcal analysis complete" }
+                    );
+                  }}
+                >
+                  Analyze Refcal
+                </button>
+                <button
+                  type="button"
+                  className="btn-dark-fill"
+                  disabled=${!canRefcal || busy}
+                  onClick=${function () {
+                    runAction(function () {
+                      return postJson("/api/refcal/select", { session_id: sessionId, scan_id: selectedScanId() });
+                    });
+                  }}
+                >
+                  Set Refcal
+                </button>
+                <button
+                  type="button"
+                  className="btn-filter-pill"
+                  disabled=${!canCombine || busy}
+                  onClick=${function () {
+                    runAction(
+                      function () {
+                        return postJson("/api/refcal/combine", { session_id: sessionId, scan_ids: checkedScanIds });
+                      },
+                      { progressKind: "combine_refcal", successMessage: "Refcal combination complete" }
+                    );
+                  }}
+                >
+                  Combine 2 Refcals
+                </button>
+                <button
+                  type="button"
+                  className="btn-outline-blue"
+                  disabled=${!canPhacal || busy}
+                  onClick=${function () {
+                    runAction(
+                      function () {
+                        return postJson("/api/phacal/analyze", { session_id: sessionId, scan_id: selectedScanId() });
+                      },
+                      { progressKind: "phacal", successMessage: "Phacal analysis complete" }
+                    );
+                  }}
+                >
+                  Analyze Phacal
+                </button>
+                <button
+                  type="button"
+                  className="btn-blue"
+                  disabled=${!canAnalyze || busy}
+                  onClick=${function () {
+                    runAction(
+                      function () {
+                        return postJson("/api/save/sql", { session_id: sessionId, scan_id: selectedScanId() });
+                      },
+                      { progressKind: "save_sql", successMessage: "Saved scan to SQL" }
+                    );
+                  }}
+                >
+                  Save SQL
+                </button>
+                <button
+                  type="button"
+                  className="btn-outline-blue"
+                  disabled=${!sessionId || busy || !checkedScanIds.length}
+                  onClick=${function () {
+                    runAction(
+                      function () {
+                        return jsonFetch("/api/save/npz", {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ session_id: sessionId, scan_ids: checkedScanIds }),
+                        }).then(function (next) {
+                          const nextState = next && next.state ? next.state : next;
+                          setState(nextState);
+                          syncDraft(nextState);
+                          return next;
+                        });
+                      },
+                      { progressKind: "save_npz", successMessage: "Daily NPZ bundle saved" }
+                    );
+                  }}
+                >
+                  Save NPZ
+                </button>
+              </div>
+
+              <section className="toolbar-workflow-box">
+                <h2>Workflow</h2>
+                <p>Set one HI refcal as the canonical anchor, tune in-band and relative-phase fits, then analyze the HI phacals and save SQL/NPZ. Handle LO separately; if a second HI refcal is available, keep it optional and use it only as secondary anchor metadata.</p>
+              </section>
+
+              <div className=${"toolbar-status" + (activity ? " toolbar-status-progress" : "") + (activity && activity.error ? " error" : "")}>
+                ${activity
+                  ? html`
+                      <div className="toolbar-status-top">
+                        <span className="toolbar-status-title">${activity.title}</span>
+                        <span className="toolbar-status-percent">${Math.max(0, Math.min(100, Math.round(activity.progress)))}%</span>
+                      </div>
+                      <div className="toolbar-status-stage">${activity.stage}</div>
+                      <div className="activity-meter">
+                        <div
+                          className="activity-meter-fill"
+                          style=${{ width: Math.max(4, Math.min(100, activity.progress)) + "%" }}
+                        ></div>
+                      </div>
+                    `
+                  : error
+                    ? html`<span className="error">${error}</span>`
+                    : interactionMessage || (state ? state.status_message : "Initializing session...")}
+              </div>
+            </div>
+
+            <div className="toolbar-column toolbar-right-column">
+              <div className="rail-title-row">
+                <h2>Scans</h2>
+                <div className="rail-title-meta">
+                  ${metadataWarnings.length ? html`<span>${metadataWarnings[0]}</span>` : null}
+                </div>
+              </div>
+              <div className="scanlist-scroll toolbar-scanlist-scroll" style=${{ maxHeight: scanlistMaxHeightPx + "px" }}>
                 <table className="scan-table">
                   <thead>
                     <tr>
-                      <th></th>
                       <th>Time</th>
+                      <th>Feed</th>
                       <th>Source</th>
                       <th>Dur</th>
                       <th>Status</th>
@@ -3669,27 +4230,12 @@
                               key=${scan.scan_id}
                               className=${cls}
                               style=${{ backgroundColor: scan.color }}
-                              onClick=${function () {
-                                runAction(function () {
-                                  return postJson("/api/select-scan", { session_id: sessionId, scan_id: scan.scan_id });
-                                });
+                              onClick=${function (event) {
+                                onScanRowClick(event, scan.scan_id);
                               }}
                             >
-                              <td>
-                                <input
-                                  type="checkbox"
-                                  checked=${checkedScanIds.indexOf(scan.scan_id) >= 0}
-                                  onChange=${function (event) {
-                                    event.stopPropagation();
-                                    const checked = !!event.target.checked;
-                                    setChecked(scan.scan_id, checked);
-                                    runAction(function () {
-                                      return postJson("/api/select-scan", { session_id: sessionId, scan_id: scan.scan_id });
-                                    });
-                                  }}
-                                />
-                              </td>
                               <td>${scan.scan_time}</td>
+                              <td>${String(scan.feed_kind || "unknown").toUpperCase()}</td>
                               <td>${scan.source}</td>
                               <td>${scan.duration_min.toFixed(1)}m</td>
                               <td>${scan.status}${scan.is_refcal ? " *R" : ""}</td>
@@ -3700,19 +4246,44 @@
                   </tbody>
                 </table>
               </div>
-            </section>
+            </div>
+          </div>`}
+          <button
+            type="button"
+            className=${"toolbar-chevron-toggle" + (toolbarCollapsed ? " collapsed" : "")}
+            aria-label=${toolbarCollapsed ? "Show toolbar" : "Hide toolbar"}
+            onClick=${function () {
+              setToolbarCollapsed(function (current) {
+                return !current;
+              });
+            }}
+          >
+            <span className="toolbar-chevron-glyph">»</span>
+          </button>
+        </section>
 
+        <main className="content-grid" style=${paneMaxHeight ? { "--content-pane-max-height": paneMaxHeight + "px" } : null}>
+          <aside className="control-rail panel">
             <section className="rail-section heatmap-box">
               <div className="rail-title-row">
-                <h2>Sigma Map</h2>
+                <h2>Flag Map</h2>
                 <div className="rail-title-meta">
                   <span>${"Flag " + selectedCellFlagSum}</span>
+                  <button
+                    type="button"
+                    className="btn-outline-blue"
+                    disabled=${busy || !stagedTimeIntervals.length}
+                    onClick=${applyStagedTimeFlags}
+                  >
+                    Apply Mask
+                  </button>
                 </div>
               </div>
               <${HeatmapPlot}
                 data=${heatmapData}
                 selectedAnt=${state ? state.selected_ant : null}
                 selectedBand=${state ? state.selected_band : null}
+                pendingCells=${pendingFlagMapCells}
                 onSelect=${onHeatmapSelect}
               />
             </section>
@@ -3739,36 +4310,37 @@
             </section>
 
             <section className="rail-section delay-box">
-              <h2>Active Refcal Delay Editor</h2>
+              <h2>Anchor Refcal Delay Editor</h2>
               ${state && state.active_refcal
                 ? html`
                     <div className="delay-summary">
-                      <span>${"Refcal: " + activeRefLabel}</span>
-                      <span>${"Selected antenna: " + delayDraft.ant}</span>
+                      <span>${"Refcal: " + activeRefLabel}; ${"Selected antenna: " + delayDraft.ant}</span>
                     </div>
-                    <div className="delay-grid">
-                      <label>
-                        X Delay (ns)
-                        <input
-                          type="number"
-                          step="0.1"
-                          value=${delayDraft.x}
-                          onChange=${function (event) {
-                            setDelayDraft(Object.assign({}, delayDraft, { x: event.target.value }));
-                          }}
-                        />
-                      </label>
-                      <label>
-                        Y Delay (ns)
-                        <input
-                          type="number"
-                          step="0.1"
-                          value=${delayDraft.y}
-                          onChange=${function (event) {
-                            setDelayDraft(Object.assign({}, delayDraft, { y: event.target.value }));
-                          }}
-                        />
-                      </label>
+                    <div className="delay-grid delay-pair-grid">
+                      <div className="delay-pair-row">
+                        <label>
+                          X Delay (ns)
+                          <input
+                            type="number"
+                            step="0.1"
+                            value=${delayDraft.x}
+                            onChange=${function (event) {
+                              setDelayDraft(Object.assign({}, delayDraft, { x: event.target.value }));
+                            }}
+                          />
+                        </label>
+                        <label>
+                          Y Delay (ns)
+                          <input
+                            type="number"
+                            step="0.1"
+                            value=${delayDraft.y}
+                            onChange=${function (event) {
+                              setDelayDraft(Object.assign({}, delayDraft, { y: event.target.value }));
+                            }}
+                          />
+                        </label>
+                      </div>
                       <div className="delay-actions full">
                         <button
                           type="button"
@@ -3808,8 +4380,7 @@
                 : html`
                     <div className="delay-empty">
                       <div className="delay-summary">
-                        <span>Refcal: None</span>
-                        <span>${"Selected antenna: " + delayDraft.ant}</span>
+                        <span>Refcal: None; ${"Selected antenna: " + delayDraft.ant}</span>
                       </div>
                       <div className="tiny">Set a refcal to edit per-antenna X/Y in-band delays.</div>
                     </div>
@@ -3821,56 +4392,63 @@
               ${state && state.active_refcal
                 ? html`
                     <div className="delay-summary">
-                      <span>${"Refcal: " + activeRefLabel}</span>
-                      <span>${"Selected antenna: " + relativeDelayDraft.ant}</span>
+                      <span>${"Refcal: " + activeRefLabel}; ${"Selected antenna: " + relativeDelayDraft.ant}</span>
                     </div>
-                    <div className="delay-grid">
-                      <label>
-                        X Auto Baseline (ns)
-                        <input type="text" disabled value=${formatNumber(Number(state.active_refcal.x_auto_relative_delay_ns || 0))} />
-                      </label>
-                      <label>
-                        Y Auto Baseline (ns)
-                        <input type="text" disabled value=${formatNumber(Number(state.active_refcal.y_auto_relative_delay_ns || 0))} />
-                      </label>
-                      <label>
-                        X Suggested Corr. (ns)
-                        <input type="text" disabled value=${formatNumber(Number(state.active_refcal.x_suggested_relative_delay_ns || 0))} />
-                      </label>
-                      <label>
-                        Y Suggested Corr. (ns)
-                        <input type="text" disabled value=${formatNumber(Number(state.active_refcal.y_suggested_relative_delay_ns || 0))} />
-                      </label>
-                      <label>
-                        X Applied Corr. (ns)
-                        <input
-                          type="number"
-                          step="0.1"
-                          value=${relativeDelayDraft.x}
-                          onChange=${function (event) {
-                            setRelativeDelayDraft(Object.assign({}, relativeDelayDraft, { x: event.target.value }));
-                          }}
-                        />
-                      </label>
-                      <label>
-                        Y Applied Corr. (ns)
-                        <input
-                          type="number"
-                          step="0.1"
-                          value=${relativeDelayDraft.y}
-                          onChange=${function (event) {
-                            setRelativeDelayDraft(Object.assign({}, relativeDelayDraft, { y: event.target.value }));
-                          }}
-                        />
-                      </label>
-                      <label>
-                        X Effective Fit (ns)
-                        <input type="text" disabled value=${formatNumber(Number(state.active_refcal.x_effective_relative_delay_ns || 0))} />
-                      </label>
-                      <label>
-                        Y Effective Fit (ns)
-                        <input type="text" disabled value=${formatNumber(Number(state.active_refcal.y_effective_relative_delay_ns || 0))} />
-                      </label>
+                    <div className="delay-grid delay-pair-grid">
+                      <div className="delay-pair-row">
+                        <label>
+                          X Auto Baseline (ns)
+                          <input type="text" disabled value=${formatNumber(Number(state.active_refcal.x_auto_relative_delay_ns || 0))} />
+                        </label>
+                        <label>
+                          Y Auto Baseline (ns)
+                          <input type="text" disabled value=${formatNumber(Number(state.active_refcal.y_auto_relative_delay_ns || 0))} />
+                        </label>
+                      </div>
+                      <div className="delay-pair-row">
+                        <label>
+                          X Suggested Corr. (ns)
+                          <input type="text" disabled value=${formatNumber(Number(state.active_refcal.x_suggested_relative_delay_ns || 0))} />
+                        </label>
+                        <label>
+                          Y Suggested Corr. (ns)
+                          <input type="text" disabled value=${formatNumber(Number(state.active_refcal.y_suggested_relative_delay_ns || 0))} />
+                        </label>
+                      </div>
+                      <div className="delay-pair-row">
+                        <label>
+                          X Applied Corr. (ns)
+                          <input
+                            type="number"
+                            step="0.1"
+                            value=${relativeDelayDraft.x}
+                            onChange=${function (event) {
+                              setRelativeDelayDraft(Object.assign({}, relativeDelayDraft, { x: event.target.value }));
+                            }}
+                          />
+                        </label>
+                        <label>
+                          Y Applied Corr. (ns)
+                          <input
+                            type="number"
+                            step="0.1"
+                            value=${relativeDelayDraft.y}
+                            onChange=${function (event) {
+                              setRelativeDelayDraft(Object.assign({}, relativeDelayDraft, { y: event.target.value }));
+                            }}
+                          />
+                        </label>
+                      </div>
+                      <div className="delay-pair-row">
+                        <label>
+                          X Effective Fit (ns)
+                          <input type="text" disabled value=${formatNumber(Number(state.active_refcal.x_effective_relative_delay_ns || 0))} />
+                        </label>
+                        <label>
+                          Y Effective Fit (ns)
+                          <input type="text" disabled value=${formatNumber(Number(state.active_refcal.y_effective_relative_delay_ns || 0))} />
+                        </label>
+                      </div>
                       <div className="delay-actions full">
                         <button
                           type="button"
@@ -3917,8 +4495,7 @@
                 : html`
                     <div className="delay-empty">
                       <div className="delay-summary">
-                        <span>Refcal: None</span>
-                        <span>${"Selected antenna: " + relativeDelayDraft.ant}</span>
+                        <span>Refcal: None; ${"Selected antenna: " + relativeDelayDraft.ant}</span>
                       </div>
                       <div className="tiny">Set or analyze a refcal to edit per-antenna X/Y relative residual delays.</div>
                     </div>
@@ -3936,7 +4513,6 @@
                     title=${section.label}
                     legend=${section.showLegend === false ? null : plotData && plotData.legend}
                     inlineControls=${section.id === "inband_fit"
-                        || section.id === "inband_relative_phase"
                       ? html`<${InbandWindowControls}
                           antennaScope=${inbandAntennaScope}
                           polScope=${inbandPolScope}
@@ -3947,11 +4523,72 @@
                           onPolScopeChange=${setInbandPolScope}
                           onApply=${applyStagedInbandWindow}
                         />`
+                      : section.id === "inband_relative_phase"
+                        ? html`
+                            <${InbandWindowControls}
+                              antennaScope=${inbandAntennaScope}
+                              polScope=${inbandPolScope}
+                              busy=${busy}
+                              hasPending=${Object.keys(stagedInbandMasks).length > 0}
+                              pendingCount=${Object.keys(stagedInbandMasks).length}
+                              onAntennaScopeChange=${setInbandAntennaScope}
+                              onPolScopeChange=${setInbandPolScope}
+                              onApply=${applyStagedInbandWindow}
+                            />
+                            <div className="plot-inline-threshold">
+                              <label>
+                                <span>Y-X RMS Threshold (rad)</span>
+                                <input
+                                  type="number"
+                                  step="0.1"
+                                  value=${yxThresholdDraft}
+                                  disabled=${busy || !(state && state.active_refcal)}
+                                  onChange=${function (event) {
+                                    setYxThresholdDraft(event.target.value);
+                                  }}
+                                />
+                              </label>
+                              <button
+                                type="button"
+                                className="btn-outline-blue"
+                                disabled=${busy || !(state && state.active_refcal)}
+                                onClick=${function () {
+                                  applyYxResidualThreshold();
+                                }}
+                              >
+                                Apply
+                              </button>
+                              <span className="plot-inline-summary">
+                                ${state && state.active_refcal
+                                  ? "Y-X residual RMS: "
+                                    + formatNumber(Number(state.active_refcal.yx_residual_rms || 0))
+                                    + " rad (threshold "
+                                    + formatNumber(Number(state.active_refcal.yx_residual_threshold_rad || 1.5))
+                                    + ")"
+                                  : "No active refcal"}
+                              </span>
+                            </div>
+                          `
+                      : section.id === "inband_residual_phase_band"
+                        ? html`
+                            <button
+                              type="button"
+                              className="btn-outline-blue"
+                              disabled=${busy || !canApplyResidualFit || !hasResidualInbandSuggestion}
+                              onClick=${function () {
+                                applyResidualInbandFit();
+                              }}
+                            >
+                              Apply Residual Fit
+                            </button>
+                          `
                       : null}
                   >
                     <${PanelGridPlot}
                       data=${plotData}
                       hideLegend=${true}
+                      busy=${busy}
+                      panelHeight=${section.panelHeight}
                       interactionMode=${section.id === "inband_residual_delay_band" ? "zoom" : null}
                       panelOverride=${section.id === "inband_fit" || section.id === "inband_relative_phase"
                         ? function (rowIdx, panelIdx, panel) {
@@ -3966,6 +4603,11 @@
                       onPanelDoubleClick=${section.id === "inband_fit" || section.id === "inband_relative_phase"
                         ? function (rowIdx, panelIdx) {
                             stageInbandMaskClear(rowIdx, panelIdx);
+                          }
+                        : null}
+                      onColumnToggle=${section.id === "inband_relative_phase"
+                        ? function (antennaIndex, flagged) {
+                            toggleManualAntennaFlag(antennaIndex, flagged);
                           }
                         : null}
                     />
