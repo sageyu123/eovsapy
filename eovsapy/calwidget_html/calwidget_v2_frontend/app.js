@@ -32,7 +32,7 @@
     {
       id: "inband_residual_phase_band",
       label: "Per-Band Residual Phase",
-      showLegend: false,
+      showLegend: true,
       panelHeight: 138,
     },
     {
@@ -563,6 +563,23 @@
     });
     if (!candidateMask.some(Boolean)) {
       return defaultKeptRanges(bandEdges);
+    }
+    return keptRangesFromMask(candidateMask, bandEdges);
+  }
+
+  function excludeRangeFromKeptRanges(ranges, bandEdges, startBand, endBand) {
+    if (!bandEdges || !bandEdges.length) {
+      return ranges || [];
+    }
+    const currentMask = bandMaskFromRanges(ranges, bandEdges);
+    const lo = Math.min(Number(startBand), Number(endBand));
+    const hi = Math.max(Number(startBand), Number(endBand));
+    const candidateMask = currentMask.map(function (keep, idx) {
+      const band = Number(bandEdges[idx].band);
+      return Boolean(keep) && !(band >= lo && band <= hi);
+    });
+    if (!candidateMask.some(Boolean)) {
+      return ranges && ranges.length ? ranges : defaultKeptRanges(bandEdges);
     }
     return keptRangesFromMask(candidateMask, bandEdges);
   }
@@ -1174,7 +1191,7 @@
     const interactionMode = props.interactionMode || null;
     const interactiveTitle =
       interactionMode === "bandselect"
-        ? "Drag to stage flagged range. Click Apply Mask to apply."
+        ? "Drag to stage flagged range. Click " + (props.bandSelectApplyLabel || "Apply Mask") + " to apply."
             + (props.onDoubleClick ? " Double-click to clear mask." : "")
         : interactionMode === "zoom"
           ? "Drag to zoom. Shift + drag to pan. Double-click to reset."
@@ -1183,7 +1200,7 @@
             : null;
     const hintText =
       interactionMode === "bandselect"
-        ? "Drag to stage flagged range · Click Apply Mask"
+        ? "Drag to stage flagged range · Click " + (props.bandSelectApplyLabel || "Apply Mask")
             + (props.onDoubleClick ? " · Double-click to clear mask" : "")
         : interactionMode === "zoom"
           ? "Drag to zoom · Shift+drag to pan · Double-click to reset"
@@ -1724,6 +1741,7 @@
                           showBandWindow=${!!props.onBandWindowSelect}
                           showXAxisLabels=${rowIdx === (data.panels || []).length - 1}
                           interactionMode=${props.interactionMode === "zoom" ? "zoom" : props.onBandWindowSelect ? "bandselect" : null}
+                          bandSelectApplyLabel=${props.bandSelectApplyLabel}
                           onBandWindowSelect=${props.onBandWindowSelect
                             ? function (startBand, endBand, mode) {
                                 props.onBandWindowSelect(rowIdx, panelIdx, startBand, endBand, mode, displayPanel);
@@ -2919,12 +2937,15 @@
     const [delayDraft, setDelayDraft] = useState({ ant: 1, x: "", y: "" });
     const [relativeDelayDraft, setRelativeDelayDraft] = useState({ ant: 1, x: "", y: "" });
     const [yxThresholdDraft, setYxThresholdDraft] = useState(String(1.5));
+    const [residualThresholdDraft, setResidualThresholdDraft] = useState(String(1.0));
     const [timeHistoryData, setTimeHistoryData] = useState(null);
     const [heatmapData, setHeatmapData] = useState(null);
     const [overviewData, setOverviewData] = useState(null);
     const [stagedTimeIntervals, setStagedTimeIntervals] = useState([]);
     const [stagedInbandPanels, setStagedInbandPanels] = useState({});
     const [stagedInbandMasks, setStagedInbandMasks] = useState({});
+    const [stagedResidualPanels, setStagedResidualPanels] = useState({});
+    const [stagedResidualMasks, setStagedResidualMasks] = useState({});
     const [heatmapLoadedRevision, setHeatmapLoadedRevision] = useState(-1);
     const [timeHistoryLoadedRevision, setTimeHistoryLoadedRevision] = useState(-1);
     const [overviewLoadedRevision, setOverviewLoadedRevision] = useState(-1);
@@ -3042,6 +3063,8 @@
         setStagedTimeIntervals([]);
         setStagedInbandPanels({});
         setStagedInbandMasks({});
+        setStagedResidualPanels({});
+        setStagedResidualMasks({});
       },
       [dataRevision]
     );
@@ -3073,6 +3096,11 @@
         active && active.yx_residual_threshold_rad !== null && active.yx_residual_threshold_rad !== undefined
           ? String(Number(active.yx_residual_threshold_rad).toFixed(2))
           : String(1.5)
+      );
+      setResidualThresholdDraft(
+        active && active.residual_band_threshold_rad !== null && active.residual_band_threshold_rad !== undefined
+          ? String(Number(active.residual_band_threshold_rad).toFixed(2))
+          : String(1.0)
       );
     }
 
@@ -3698,6 +3726,84 @@
       setStagedInbandMasks({});
     }
 
+    function clearStagedResidualSelection() {
+      setStagedResidualPanels({});
+      setStagedResidualMasks({});
+    }
+
+    function stageResidualSelection(startBand, endBand, rowIdx, panelIdx) {
+      if (!overviewData) {
+        return false;
+      }
+      const section = overviewData.inband_residual_phase_band;
+      const bandEdges = section && section.band_edges ? section.band_edges : [];
+      const row = section && section.panels && section.panels[rowIdx] ? section.panels[rowIdx] : [];
+      const originalPanel = row[panelIdx];
+      if (!originalPanel || !bandEdges.length) {
+        return false;
+      }
+      const key = panelSelectionKey("inband_residual_phase_band", rowIdx, panelIdx);
+      const currentPanel = stagedResidualPanels[key]
+        ? Object.assign({}, originalPanel, stagedResidualPanels[key])
+        : originalPanel;
+      const nextRanges = excludeRangeFromKeptRanges(currentPanel.kept_ranges, bandEdges, startBand, endBand);
+      setStagedResidualPanels(function (current) {
+        return Object.assign({}, current, {
+          [key]: optimisticPanelUpdate(currentPanel, nextRanges, bandEdges),
+        });
+      });
+      setStagedResidualMasks(function (current) {
+        return Object.assign({}, current, {
+          [targetMaskKey(rowIdx, panelIdx)]: {
+            antenna: panelIdx,
+            polarization: rowIdx,
+            kept_ranges: nextRanges,
+          },
+        });
+      });
+      setInteractionMessage("Residual mask staged. Click Apply Residual Fit to apply.");
+      return true;
+    }
+
+    function stageResidualMaskClear(rowIdx, panelIdx) {
+      if (!overviewData) {
+        return false;
+      }
+      const section = overviewData.inband_residual_phase_band;
+      const bandEdges = section && section.band_edges ? section.band_edges : [];
+      const row = section && section.panels && section.panels[rowIdx] ? section.panels[rowIdx] : [];
+      const originalPanel = row[panelIdx];
+      if (!originalPanel || !bandEdges.length) {
+        return false;
+      }
+      const nextRanges =
+        originalPanel.auto_kept_ranges && originalPanel.auto_kept_ranges.length
+          ? originalPanel.auto_kept_ranges
+          : defaultKeptRanges(bandEdges);
+      const key = panelSelectionKey("inband_residual_phase_band", rowIdx, panelIdx);
+      setStagedResidualPanels(function (current) {
+        return Object.assign({}, current, {
+          [key]: optimisticPanelUpdate(originalPanel, nextRanges, bandEdges),
+        });
+      });
+      setStagedResidualMasks(function (current) {
+        return Object.assign({}, current, {
+          [targetMaskKey(rowIdx, panelIdx)]: {
+            antenna: panelIdx,
+            polarization: rowIdx,
+            kept_ranges: nextRanges,
+          },
+        });
+      });
+      setInteractionMessage("Residual mask reset to the auto mask. Click Apply Residual Fit to apply.");
+      return true;
+    }
+
+    function panelWithStagedResidualSelection(rowIdx, panelIdx, panel) {
+      const override = stagedResidualPanels[panelSelectionKey("inband_residual_phase_band", rowIdx, panelIdx)];
+      return override ? Object.assign({}, panel, override) : panel;
+    }
+
     function panelWithStagedInbandSelection(sectionId, rowIdx, panelIdx, panel) {
       if (sectionId === "inband_relative_phase" && rowIdx === 2) {
         const section = overviewData && overviewData[sectionId] ? overviewData[sectionId] : null;
@@ -3868,17 +3974,28 @@
     }
 
     function applyResidualInbandFit() {
-      const antennaIndex = Math.max(0, parseInt(relativeDelayDraft.ant || "1", 10) - 1);
       runAction(
         function () {
-          return postJsonWithOverviewPatch(
-            "/api/inband/apply-residual-fit",
-            {
+          return jsonFetch("/api/inband/apply-residual-fit", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
               session_id: sessionId,
-              antenna: antennaIndex,
-            },
-            antennaIndex
-          );
+              targets: Object.values(stagedResidualMasks),
+            }),
+          }).then(function (next) {
+            const nextState = next && next.state ? next.state : next;
+            setState(nextState);
+            setInteractionMessage("");
+            syncDraft(nextState);
+            if (next && next.overview_updates) {
+              setOverviewData(function (current) {
+                return mergeOverviewAntennaUpdates(current, next.overview_updates, null);
+              });
+            }
+            clearStagedResidualSelection();
+            return next;
+          });
         },
         { progressKind: "active_delay", successMessage: "Residual in-band fit applied" }
       );
@@ -3929,6 +4046,39 @@
       );
     }
 
+    function applyResidualBandThreshold() {
+      const threshold = parseFloat(residualThresholdDraft);
+      if (!Number.isFinite(threshold) || threshold < 0) {
+        setError("Residual bad-band threshold must be a non-negative number.");
+        return;
+      }
+      runAction(
+        function () {
+          return jsonFetch("/api/inband/residual-threshold", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              session_id: sessionId,
+              value: threshold,
+            }),
+          }).then(function (next) {
+            const nextState = next && next.state ? next.state : next;
+            setState(nextState);
+            setInteractionMessage("");
+            syncDraft(nextState);
+            if (next && next.overview_updates) {
+              setOverviewData(function (current) {
+                return mergeOverviewAntennaUpdates(current, next.overview_updates, null);
+              });
+            }
+            clearStagedResidualSelection();
+            return next;
+          });
+        },
+        { progressKind: "active_delay", successMessage: "Residual bad-band threshold updated" }
+      );
+    }
+
     function undoRelativeDelayEditor() {
       const antennaIndex = Math.max(0, parseInt(relativeDelayDraft.ant || "1", 10) - 1);
       runAction(
@@ -3967,16 +4117,7 @@
           Math.abs(Number(activeRelativeRef.y_suggested_relative_delay_ns || 0)) > 1e-9
         )
       );
-    const hasResidualInbandSuggestion =
-      !!(
-        activeRelativeRef &&
-        (
-          Math.abs(Number(activeRelativeRef.x_suggested_residual_inband_delay_ns || 0)) > 1e-9 ||
-          Math.abs(Number(activeRelativeRef.y_suggested_residual_inband_delay_ns || 0)) > 1e-9
-        )
-      );
-    const canApplyResidualFit =
-      !!(state && state.active_refcal && Number.isFinite(state.selected_ant) && Number(state.selected_ant) > 0);
+    const canApplyResidualFit = !!(state && state.active_refcal);
     const selectedCellFlagSum =
       heatmapData &&
       !heatmapData.message &&
@@ -4571,16 +4712,40 @@
                           `
                       : section.id === "inband_residual_phase_band"
                         ? html`
-                            <button
-                              type="button"
-                              className="btn-outline-blue"
-                              disabled=${busy || !canApplyResidualFit || !hasResidualInbandSuggestion}
-                              onClick=${function () {
-                                applyResidualInbandFit();
-                              }}
-                            >
-                              Apply Residual Fit
-                            </button>
+                            <div className="plot-inline-threshold">
+                              <label>
+                                <span>Residual Band Threshold (rad)</span>
+                                <input
+                                  type="number"
+                                  step="0.1"
+                                  value=${residualThresholdDraft}
+                                  disabled=${busy || !(state && state.active_refcal)}
+                                  onChange=${function (event) {
+                                    setResidualThresholdDraft(event.target.value);
+                                  }}
+                                />
+                              </label>
+                              <button
+                                type="button"
+                                className="btn-outline-blue"
+                                disabled=${busy || !(state && state.active_refcal)}
+                                onClick=${function () {
+                                  applyResidualBandThreshold();
+                                }}
+                              >
+                                Apply Threshold
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-outline-blue"
+                                disabled=${busy || !canApplyResidualFit}
+                                onClick=${function () {
+                                  applyResidualInbandFit();
+                                }}
+                              >
+                                Apply Residual Fit
+                              </button>
+                            </div>
                           `
                       : null}
                   >
@@ -4594,17 +4759,30 @@
                         ? function (rowIdx, panelIdx, panel) {
                             return panelWithStagedInbandSelection(section.id, rowIdx, panelIdx, panel);
                           }
+                        : section.id === "inband_residual_phase_band"
+                          ? function (rowIdx, panelIdx, panel) {
+                              return panelWithStagedResidualSelection(rowIdx, panelIdx, panel);
+                            }
                         : null}
                       onBandWindowSelect=${section.id === "inband_fit" || section.id === "inband_relative_phase"
                         ? function (rowIdx, panelIdx, startBand, endBand, mode) {
                             stageInbandWindow(startBand, endBand, rowIdx, panelIdx, mode);
                           }
+                        : section.id === "inband_residual_phase_band"
+                          ? function (rowIdx, panelIdx, startBand, endBand) {
+                              stageResidualSelection(startBand, endBand, rowIdx, panelIdx);
+                            }
                         : null}
                       onPanelDoubleClick=${section.id === "inband_fit" || section.id === "inband_relative_phase"
                         ? function (rowIdx, panelIdx) {
                             stageInbandMaskClear(rowIdx, panelIdx);
                           }
+                        : section.id === "inband_residual_phase_band"
+                          ? function (rowIdx, panelIdx) {
+                              stageResidualMaskClear(rowIdx, panelIdx);
+                            }
                         : null}
+                      bandSelectApplyLabel=${section.id === "inband_residual_phase_band" ? "Apply Residual Fit" : "Apply Mask"}
                       onColumnToggle=${section.id === "inband_relative_phase"
                         ? function (antennaIndex, flagged) {
                             toggleManualAntennaFlag(antennaIndex, flagged);

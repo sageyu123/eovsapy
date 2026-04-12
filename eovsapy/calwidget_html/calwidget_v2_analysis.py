@@ -24,6 +24,7 @@ from eovsapy.util import Time, extract, lin_phase_fit, lobe, nearest_val_idx
 
 SIDECAR_DIR = Path("/common/webplots/phasecal")
 YX_RESIDUAL_THRESHOLD_RAD = 1.5
+RESIDUAL_BAND_THRESHOLD_RAD = 1.0
 TIME_FLAG_SCOPE_LABELS = {
     "selected": "Selected",
     "this_ant": "This Ant",
@@ -71,6 +72,9 @@ class DelaySolution:
     band_values: np.ndarray
     band_centers_ghz: np.ndarray
     kept_band_mask: np.ndarray
+    residual_kept_band_mask: np.ndarray
+    residual_auto_band_mask: np.ndarray
+    residual_mask_initialized: np.ndarray
     manual_ant_flag_override: np.ndarray
     manual_ant_keep_override: np.ndarray
 
@@ -162,10 +166,47 @@ class DelaySolution:
             return np.ones(self.band_values.shape, dtype=bool)
         return mask.copy()
 
+    def included_residual_band_mask(self, ant: int, pol: int) -> np.ndarray:
+        """Return the committed residual-mask band selection for one target.
+
+        :param ant: Zero-based antenna index.
+        :type ant: int
+        :param pol: Zero-based polarization index.
+        :type pol: int
+        :returns: Boolean residual kept-band mask over ``band_values``.
+        :rtype: np.ndarray
+        """
+
+        if self.band_values.size == 0:
+            return np.zeros(0, dtype=bool)
+        mask = np.asarray(self.residual_kept_band_mask[int(ant), int(pol)], dtype=bool)
+        if mask.shape[0] != self.band_values.size:
+            return np.ones(self.band_values.shape, dtype=bool)
+        return mask.copy()
+
     def kept_band_ranges(self, ant: int, pol: int) -> List[Tuple[int, int]]:
         """Return contiguous kept-band ranges for one antenna/polarization."""
 
         mask = self.included_band_mask(ant, pol)
+        if mask.size == 0 or not np.any(mask):
+            return []
+        bands = self.band_values[mask].astype(int)
+        ranges: List[Tuple[int, int]] = []
+        start = int(bands[0])
+        previous = int(bands[0])
+        for value in bands[1:]:
+            current = int(value)
+            if current != previous + 1:
+                ranges.append((start, previous))
+                start = current
+            previous = current
+        ranges.append((start, previous))
+        return ranges
+
+    def residual_kept_band_ranges(self, ant: int, pol: int) -> List[Tuple[int, int]]:
+        """Return contiguous residual kept-band ranges for one target."""
+
+        mask = self.included_residual_band_mask(ant, pol)
         if mask.size == 0 or not np.any(mask):
             return []
         bands = self.band_values[mask].astype(int)
@@ -288,6 +329,61 @@ class DelaySolution:
         self.kept_band_mask[int(ant), int(pol)] = mask
         self._recompute_active_delay(int(ant), int(pol))
 
+    def set_residual_auto_band_mask(self, ant: int, pol: int, mask: np.ndarray) -> None:
+        """Update one target's automatic residual kept-band mask.
+
+        Untouched targets track the automatic mask. Targets manually edited by
+        the user keep their committed residual mask when the auto mask changes.
+
+        :param ant: Zero-based antenna index.
+        :type ant: int
+        :param pol: Zero-based polarization index.
+        :type pol: int
+        :param mask: Boolean auto-mask over ``band_values``.
+        :type mask: np.ndarray
+        """
+
+        if self.band_values.size == 0:
+            return
+        ant_i = int(ant)
+        pol_i = int(pol)
+        next_mask = np.asarray(mask, dtype=bool)
+        if next_mask.shape != self.band_values.shape or not np.any(next_mask):
+            return
+        was_initialized = bool(self.residual_mask_initialized[ant_i, pol_i])
+        current = np.asarray(self.residual_kept_band_mask[ant_i, pol_i], dtype=bool)
+        previous_auto = np.asarray(self.residual_auto_band_mask[ant_i, pol_i], dtype=bool)
+        untouched = (not was_initialized) or np.array_equal(current, previous_auto)
+        self.residual_auto_band_mask[ant_i, pol_i] = next_mask
+        if untouched:
+            self.residual_kept_band_mask[ant_i, pol_i] = next_mask
+        self.residual_mask_initialized[ant_i, pol_i] = True
+
+    def set_residual_kept_band_ranges(self, ant: int, pol: int, ranges: Sequence[Tuple[int, int]]) -> None:
+        """Set one target's committed residual kept-band mask from ranges.
+
+        :param ant: Zero-based antenna index.
+        :type ant: int
+        :param pol: Zero-based polarization index.
+        :type pol: int
+        :param ranges: Inclusive kept-band ranges.
+        :type ranges: Sequence[tuple[int, int]]
+        """
+
+        if self.band_values.size == 0:
+            return
+        mask = np.zeros(self.band_values.shape, dtype=bool)
+        band_min = int(self.band_values[0])
+        band_max = int(self.band_values[-1])
+        for start_band, end_band in ranges:
+            lo = max(min(int(start_band), int(end_band)), band_min)
+            hi = min(max(int(start_band), int(end_band)), band_max)
+            mask |= np.logical_and(self.band_values >= lo, self.band_values <= hi)
+        if not np.any(mask):
+            return
+        self.residual_kept_band_mask[int(ant), int(pol)] = mask
+        self.residual_mask_initialized[int(ant), int(pol)] = True
+
     def window_signature(self) -> str:
         """Return a compact signature for active window-dependent caches.
 
@@ -313,6 +409,23 @@ class DelaySolution:
         manual_keep = np.asarray(self.manual_ant_keep_override, dtype=np.int8).ravel().tolist()
         return json.dumps(
             {"relative": relative, "manual_ant_flag": manual, "manual_ant_keep": manual_keep},
+            separators=(",", ":"),
+        )
+
+    def residual_signature(self) -> str:
+        """Return a compact signature for residual-mask-dependent caches.
+
+        :returns: Residual-mask cache signature string.
+        :rtype: str
+        """
+
+        if self.band_values.size == 0:
+            return "empty"
+        residual = self.residual_kept_band_mask.astype(np.int8).ravel().tolist()
+        residual_auto = self.residual_auto_band_mask.astype(np.int8).ravel().tolist()
+        initialized = self.residual_mask_initialized.astype(np.int8).ravel().tolist()
+        return json.dumps(
+            {"residual": residual, "residual_auto": residual_auto, "initialized": initialized},
             separators=(",", ":"),
         )
 
@@ -502,6 +615,26 @@ def yx_residual_threshold(scan: Optional[ScanAnalysis] = None) -> float:
         threshold = float(value)
     except (TypeError, ValueError):
         threshold = float(YX_RESIDUAL_THRESHOLD_RAD)
+    return max(threshold, 0.0)
+
+
+def residual_band_threshold(scan: Optional[ScanAnalysis] = None) -> float:
+    """Return the active residual bad-band scatter threshold for one scan.
+
+    :param scan: Optional analyzed scan.
+    :type scan: ScanAnalysis | None
+    :returns: Residual scatter threshold in radians.
+    :rtype: float
+    """
+
+    if scan is None:
+        return float(RESIDUAL_BAND_THRESHOLD_RAD)
+    meta = dict(scan.scan_meta or {})
+    value = meta.get("residual_band_threshold_rad", RESIDUAL_BAND_THRESHOLD_RAD)
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError):
+        threshold = float(RESIDUAL_BAND_THRESHOLD_RAD)
     return max(threshold, 0.0)
 
 
@@ -1557,6 +1690,9 @@ def _fit_uniform_inband_delay(
     delay_flag = np.ones((layout.nsolant, 2), dtype=np.float64)
     band_centers_ghz = np.array([np.nanmean(freq_ghz[band_id == band]) for band in band_values], dtype=np.float64)
     kept_band_mask = np.ones((layout.nsolant, 2, nbands_used), dtype=bool)
+    residual_kept_band_mask = np.ones((layout.nsolant, 2, nbands_used), dtype=bool)
+    residual_auto_band_mask = np.ones((layout.nsolant, 2, nbands_used), dtype=bool)
+    residual_mask_initialized = np.zeros((layout.nsolant, 2), dtype=bool)
     chan_avg = _safe_nanmean(channel_vis[:, :2], axis=3)
     for ant in range(layout.nsolant):
         for pol in range(2):
@@ -1593,6 +1729,9 @@ def _fit_uniform_inband_delay(
         band_values=band_values,
         band_centers_ghz=band_centers_ghz,
         kept_band_mask=kept_band_mask,
+        residual_kept_band_mask=residual_kept_band_mask,
+        residual_auto_band_mask=residual_auto_band_mask,
+        residual_mask_initialized=residual_mask_initialized,
         manual_ant_flag_override=np.zeros(layout.nsolant, dtype=bool),
         manual_ant_keep_override=np.zeros(layout.nsolant, dtype=bool),
     )
@@ -2329,6 +2468,9 @@ def write_sidecar(scan: ScanAnalysis) -> str:
         "band_values": scan.delay_solution.band_values,
         "band_centers_ghz": scan.delay_solution.band_centers_ghz,
         "kept_band_mask": scan.delay_solution.kept_band_mask.astype(np.uint8),
+        "residual_kept_band_mask": scan.delay_solution.residual_kept_band_mask.astype(np.uint8),
+        "residual_auto_band_mask": scan.delay_solution.residual_auto_band_mask.astype(np.uint8),
+        "residual_mask_initialized": scan.delay_solution.residual_mask_initialized.astype(np.uint8),
         "manual_ant_flag_override": np.asarray(scan.delay_solution.manual_ant_flag_override, dtype=np.uint8),
         "manual_ant_keep_override": np.asarray(scan.delay_solution.manual_ant_keep_override, dtype=np.uint8),
         "active_band_start": active_band_start,
@@ -2388,6 +2530,24 @@ def attach_sidecar_delay(scan: ScanAnalysis, sidecar: Dict[str, Any]) -> None:
     kept_band_mask = np.asarray(kept_band_mask, dtype=bool)
     if kept_band_mask.shape != (nsolant, 2, band_values.size):
         kept_band_mask = np.ones((nsolant, 2, band_values.size), dtype=bool)
+    residual_kept_band_mask = np.asarray(
+        sidecar.get("residual_kept_band_mask", np.ones((nsolant, 2, band_values.size), dtype=np.uint8)),
+        dtype=bool,
+    )
+    if residual_kept_band_mask.shape != (nsolant, 2, band_values.size):
+        residual_kept_band_mask = np.ones((nsolant, 2, band_values.size), dtype=bool)
+    residual_auto_band_mask = np.asarray(
+        sidecar.get("residual_auto_band_mask", residual_kept_band_mask.astype(np.uint8)),
+        dtype=bool,
+    )
+    if residual_auto_band_mask.shape != (nsolant, 2, band_values.size):
+        residual_auto_band_mask = np.asarray(residual_kept_band_mask, dtype=bool)
+    residual_mask_initialized = np.asarray(
+        sidecar.get("residual_mask_initialized", np.zeros((nsolant, 2), dtype=np.uint8)),
+        dtype=bool,
+    )
+    if residual_mask_initialized.shape != (nsolant, 2):
+        residual_mask_initialized = np.zeros((nsolant, 2), dtype=bool)
     delay_solution = DelaySolution(
         fitted_ns=np.asarray(sidecar["fitted_ns"], dtype=np.float64),
         active_ns=np.asarray(sidecar["active_ns"], dtype=np.float64),
@@ -2404,6 +2564,9 @@ def attach_sidecar_delay(scan: ScanAnalysis, sidecar: Dict[str, Any]) -> None:
         band_values=band_values,
         band_centers_ghz=np.asarray(sidecar["band_centers_ghz"], dtype=np.float64),
         kept_band_mask=kept_band_mask,
+        residual_kept_band_mask=residual_kept_band_mask,
+        residual_auto_band_mask=residual_auto_band_mask,
+        residual_mask_initialized=residual_mask_initialized,
         manual_ant_flag_override=np.asarray(
             sidecar.get("manual_ant_flag_override", np.zeros(nsolant, dtype=np.uint8)),
             dtype=bool,

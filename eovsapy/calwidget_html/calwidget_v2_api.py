@@ -52,6 +52,8 @@ from .calwidget_v2_plots import (
     heatmap_payload,
     heatmap_plot_meta,
     inband_delay_update_payloads,
+    residual_inband_apply_payloads,
+    residual_mask_update_payloads,
     relative_delay_update_payloads,
     inband_window_update_payloads,
     overview_payloads,
@@ -207,6 +209,18 @@ class YXResidualThresholdRequest(SessionRequest):
     """Update the active refcal Y-X residual RMS auto-keep threshold."""
 
     value: float
+
+
+class ResidualBandThresholdRequest(SessionRequest):
+    """Update the active refcal residual bad-band scatter threshold."""
+
+    value: float
+
+
+class ResidualInbandFitRequest(SessionRequest):
+    """Apply residual in-band correction after committing residual masks."""
+
+    targets: List[InbandMaskTarget] = []
 
 
 class TimeFlagAddRequest(SessionRequest):
@@ -619,6 +633,27 @@ class WidgetSession:
         refcal.saved_to_sql = False
         self.status_message = "Set the Y-X residual RMS threshold to {0:.2f} rad.".format(threshold)
 
+    def update_residual_band_threshold(self, value: float) -> None:
+        """Update the active refcal residual bad-band scatter threshold.
+
+        :param value: Threshold in radians.
+        :type value: float
+        """
+
+        _ref_id, refcal = self._editable_inband_refcal()
+        threshold = max(float(value), 0.0)
+        refcal.scan_meta["residual_band_threshold_rad"] = threshold
+        if refcal.raw:
+            refcal.raw.pop("overview_payload_cache", None)
+            refcal.raw.pop("residual_diagnostics_cache", None)
+        residual_mask_update_payloads(refcal)
+        try:
+            refcal.sidecar_path = write_sidecar(refcal)
+        except Exception:
+            pass
+        refcal.saved_to_sql = False
+        self.status_message = "Set the residual bad-band threshold to {0:.2f} rad.".format(threshold)
+
     def delete_time_flag(self, group_id: str) -> List[int]:
         """Delete one browser-native time-flag interval group and live-recompute."""
 
@@ -726,29 +761,42 @@ class WidgetSession:
         self.selected_ant = ant
         self.status_message = "Applied residual-guided relative-phase suggestion for antenna {0:d}.".format(ant + 1)
 
-    def apply_residual_inband_fit(self, antenna: int) -> None:
-        """Apply one antenna's residual in-band delay suggestion.
+    def apply_residual_inband_fit(self, targets: Optional[List[InbandMaskTarget]] = None) -> None:
+        """Apply residual in-band delay suggestions for all antennas/pols.
 
-        :param antenna: Zero-based antenna index.
-        :type antenna: int
+        :param targets: Optional committed residual kept-band masks.
+        :type targets: list[InbandMaskTarget] | None
         """
 
         ref_id, refcal = self._editable_inband_refcal()
-        ant = int(max(0, min(antenna, refcal.layout.nsolant - 1)))
-        meta = relative_delay_editor_meta(refcal, ant)
-        x_suggest = float(meta.get("x_suggested_residual_inband_delay_ns", 0.0) or 0.0)
-        y_suggest = float(meta.get("y_suggested_residual_inband_delay_ns", 0.0) or 0.0)
-        refcal.delay_solution.active_ns[ant, 0] = float(refcal.delay_solution.active_ns[ant, 0] + x_suggest)
-        refcal.delay_solution.active_ns[ant, 1] = float(refcal.delay_solution.active_ns[ant, 1] + y_suggest)
-        refresh_refcal_solution(refcal, antenna_indices=[ant], invalidate_legacy_summary=False)
+        if targets:
+            for target in targets:
+                ant = int(max(0, min(int(target.antenna), refcal.layout.nsolant - 1)))
+                pol = int(max(0, min(int(target.polarization), 1)))
+                ranges = [(int(item.start_band), int(item.end_band)) for item in target.kept_ranges]
+                refcal.delay_solution.set_residual_kept_band_ranges(ant, pol, ranges)
+        if refcal.raw:
+            refcal.raw.pop("overview_payload_cache", None)
+            refcal.raw.pop("residual_diagnostics_cache", None)
+        residual_mask_update_payloads(refcal)
+        for ant in range(refcal.layout.nsolant):
+            meta = relative_delay_editor_meta(refcal, ant)
+            x_suggest = float(meta.get("x_suggested_residual_inband_delay_ns", 0.0) or 0.0)
+            y_suggest = float(meta.get("y_suggested_residual_inband_delay_ns", 0.0) or 0.0)
+            refcal.delay_solution.active_ns[ant, 0] = float(refcal.delay_solution.active_ns[ant, 0] + x_suggest)
+            refcal.delay_solution.active_ns[ant, 1] = float(refcal.delay_solution.active_ns[ant, 1] + y_suggest)
+        refresh_refcal_solution(
+            refcal,
+            antenna_indices=list(range(refcal.layout.nsolant)),
+            invalidate_legacy_summary=False,
+        )
         try:
             refcal.sidecar_path = write_sidecar(refcal)
         except Exception:
             pass
         refcal.saved_to_sql = False
         self._invalidate_dependent_phacals(ref_id)
-        self.selected_ant = ant
-        self.status_message = "Applied residual in-band delay correction for antenna {0:d}.".format(ant + 1)
+        self.status_message = "Applied residual in-band delay correction for all antennas."
 
     def undo_relative_delay(self, antenna: int) -> None:
         """Undo the last applied relative-delay edit for one antenna.
@@ -1479,23 +1527,33 @@ def build_app() -> FastAPI:
         }
 
     @app.post("/api/inband/apply-residual-fit")
-    def apply_residual_inband_fit(payload: RelativeDelayAntennaRequest) -> Dict:
-        """Apply one antenna's residual in-band correction from residual fits."""
+    def apply_residual_inband_fit(payload: ResidualInbandFitRequest) -> Dict:
+        """Apply residual in-band correction after committing residual masks."""
 
         session = _get_session(payload.session_id)
         try:
-            session.apply_residual_inband_fit(payload.antenna)
+            session.apply_residual_inband_fit(payload.targets)
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         scan, _refcal = _overview_context(session)
         return {
             "state": session.state(),
-            "overview_updates": inband_delay_update_payloads(
-                scan,
-                use_lobe=session.use_lobe,
-                antenna=payload.antenna,
-            ),
-            "updated_antenna": int(max(0, payload.antenna)),
+            "overview_updates": residual_inband_apply_payloads(scan, use_lobe=session.use_lobe),
+        }
+
+    @app.post("/api/inband/residual-threshold")
+    def set_residual_band_threshold(payload: ResidualBandThresholdRequest) -> Dict:
+        """Update the active refcal residual bad-band threshold."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.update_residual_band_threshold(payload.value)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        scan, _refcal = _overview_context(session)
+        return {
+            "state": session.state(),
+            "overview_updates": residual_mask_update_payloads(scan),
         }
 
     @app.post("/api/relative-delay/undo")
