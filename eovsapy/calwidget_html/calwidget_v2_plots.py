@@ -144,8 +144,12 @@ def _heatmap_flag_map(scan: ScanAnalysis) -> np.ndarray:
     if scan.delay_solution is not None and scan.raw and scan.scan_kind == "refcal" and scan_feed_kind(scan) == "hi":
         yx_rms = np.asarray(scan.raw.get("yx_residual_rms", np.full(scan.layout.nsolant, np.nan)), dtype=float)
         if yx_rms.shape == (scan.layout.nsolant,):
-            keep_mask = np.isfinite(yx_rms) & (yx_rms <= yx_residual_threshold(scan))
+            no_data_mask = _antennas_with_no_relative_data(scan)
+            keep_mask = np.isfinite(yx_rms) & (yx_rms <= yx_residual_threshold(scan)) & ~no_data_mask
             flag_cube[keep_mask, :2, :] = 0
+            auto_flagged = _auto_quality_flagged_antennas(scan)
+            if auto_flagged.shape == (scan.layout.nsolant,):
+                flag_cube[auto_flagged, :2, :] = 1
         manual = np.asarray(scan.delay_solution.manual_ant_flag_override, dtype=bool)
         if manual.shape == (scan.layout.nsolant,):
             flag_cube[manual, :2, :] = 1
@@ -474,6 +478,7 @@ def refresh_model_flag_state(scan: ScanAnalysis, antenna_indices: Optional[Seque
     if yx_rms.shape != (scan.layout.nsolant,):
         yx_rms = np.full(scan.layout.nsolant, np.nan, dtype=float)
     threshold = yx_residual_threshold(scan)
+    no_data_mask = _antennas_with_no_relative_data(scan)
 
     for ant_i in ants:
         effective[ant_i, :, :] = base_flags[ant_i, :, :]
@@ -487,6 +492,10 @@ def refresh_model_flag_state(scan: ScanAnalysis, antenna_indices: Optional[Seque
     if scan_feed_kind(scan) == "hi":
         context = _inband_diag_context(scan)
         for ant_i in ants:
+            if ant_i < no_data_mask.size and no_data_mask[ant_i]:
+                effective[ant_i, :2, :] = 1
+                yx_rms[ant_i] = np.nan
+                continue
             antenna_payload = _inband_diagnostic_for_antenna(scan, ant_i, context=context)
             rms = float(antenna_payload["xy_panel"].get("yx_residual_rms", np.nan))
             yx_rms[ant_i] = rms
@@ -560,11 +569,136 @@ def _auto_quality_flagged_antennas(scan: ScanAnalysis) -> np.ndarray:
     yx_rms = np.asarray(scan.raw.get("yx_residual_rms", np.full(scan.layout.nsolant, np.nan)), dtype=float)
     if yx_rms.shape != (scan.layout.nsolant,):
         return np.zeros(scan.layout.nsolant, dtype=bool)
-    flagged = np.isfinite(yx_rms) & (yx_rms > yx_residual_threshold(scan))
+    flagged = _antennas_with_no_relative_data(scan) | (np.isfinite(yx_rms) & (yx_rms > yx_residual_threshold(scan)))
     keep_override = np.asarray(scan.delay_solution.manual_ant_keep_override, dtype=bool)
     if keep_override.shape == flagged.shape:
         flagged &= ~keep_override
     return flagged
+
+
+def _antennas_with_no_relative_data(scan: ScanAnalysis) -> np.ndarray:
+    """Return antennas with no usable X/Y relative-phase data."""
+
+    if scan.delay_solution is None or not scan.raw or scan.scan_kind != "refcal" or scan_feed_kind(scan) != "hi":
+        return np.zeros(scan.layout.nsolant, dtype=bool)
+    try:
+        _raw_avg, corrected_avg = combined_channel_vis_with_time_flags(scan)
+    except Exception:
+        return np.zeros(scan.layout.nsolant, dtype=bool)
+    corrected = np.asarray(corrected_avg[: scan.layout.nsolant, :2], dtype=np.complex128)
+    if corrected.ndim != 3 or corrected.shape[0] < scan.layout.nsolant or corrected.shape[1] < 2:
+        return np.zeros(scan.layout.nsolant, dtype=bool)
+    ref_x_valid = np.isfinite(corrected[0, 0].real) & np.isfinite(corrected[0, 0].imag) & (np.abs(corrected[0, 0]) > 0.0)
+    ref_y_valid = np.isfinite(corrected[0, 1].real) & np.isfinite(corrected[0, 1].imag) & (np.abs(corrected[0, 1]) > 0.0)
+    out = np.zeros(scan.layout.nsolant, dtype=bool)
+    for ant_i in range(scan.layout.nsolant):
+        cur_x_valid = np.isfinite(corrected[ant_i, 0].real) & np.isfinite(corrected[ant_i, 0].imag) & (np.abs(corrected[ant_i, 0]) > 0.0)
+        cur_y_valid = np.isfinite(corrected[ant_i, 1].real) & np.isfinite(corrected[ant_i, 1].imag) & (np.abs(corrected[ant_i, 1]) > 0.0)
+        valid_x = cur_x_valid if ant_i == 0 else (cur_x_valid & ref_x_valid)
+        valid_y = cur_y_valid if ant_i == 0 else (cur_y_valid & ref_y_valid)
+        out[ant_i] = not np.any(valid_x & valid_y)
+    return out
+
+
+def _effective_disabled_antennas(scan: ScanAnalysis) -> np.ndarray:
+    """Return antennas excluded from relative/residual diagnostics."""
+
+    manual = (
+        np.asarray(scan.delay_solution.manual_ant_flag_override, dtype=bool)
+        if scan.delay_solution is not None
+        else np.zeros(scan.layout.nsolant, dtype=bool)
+    )
+    if manual.shape != (scan.layout.nsolant,):
+        manual = np.zeros(scan.layout.nsolant, dtype=bool)
+    auto_quality = _auto_quality_flagged_antennas(scan)
+    if auto_quality.shape != manual.shape:
+        auto_quality = np.zeros_like(manual)
+    return manual | auto_quality
+
+
+def _manual_disabled_antennas(scan: ScanAnalysis) -> np.ndarray:
+    """Return antennas manually excluded by the user."""
+
+    manual = (
+        np.asarray(scan.delay_solution.manual_ant_flag_override, dtype=bool)
+        if scan.delay_solution is not None
+        else np.zeros(scan.layout.nsolant, dtype=bool)
+    )
+    if manual.shape != (scan.layout.nsolant,):
+        manual = np.zeros(scan.layout.nsolant, dtype=bool)
+    return manual
+
+
+def _relative_panel_title(ant: int) -> str:
+    """Return the relative-phase panel title for one antenna."""
+
+    ant_i = int(ant)
+    return "Ant 1" if ant_i == 0 else "Ant {0:d}-Ant1".format(ant_i + 1)
+
+
+def _blank_inband_diagnostic_antenna(scan: ScanAnalysis, ant: int) -> dict[str, Any]:
+    """Return a lightweight blank diagnostic payload for one disabled antenna."""
+
+    if scan.delay_solution is None:
+        raise ValueError("Blank in-band diagnostics require a delay solution.")
+    ant_i = int(max(0, min(int(ant), scan.layout.nsolant - 1)))
+    band_values = np.asarray(scan.delay_solution.band_values, dtype=int)
+    title = _relative_panel_title(ant_i)
+    panels = []
+    for pol in range(2):
+        kept_mask = scan.delay_solution.included_band_mask(ant_i, pol)
+        residual_kept_mask = scan.delay_solution.included_residual_band_mask(ant_i, pol)
+        residual_auto_mask = np.asarray(scan.delay_solution.residual_auto_band_mask[ant_i, pol], dtype=bool)
+        panels.append(
+            {
+                "start_band": int(scan.delay_solution.band_window(ant_i, pol)[0]),
+                "end_band": int(scan.delay_solution.band_window(ant_i, pol)[1]),
+                "kept_ranges": [
+                    {"start_band": int(start_band), "end_band": int(end_band)}
+                    for start_band, end_band in scan.delay_solution.kept_band_ranges(ant_i, pol)
+                ],
+                "included_bands": [int(value) for value in band_values[kept_mask].tolist()],
+                "residual_kept_ranges": [
+                    {"start_band": int(start_band), "end_band": int(end_band)}
+                    for start_band, end_band in scan.delay_solution.residual_kept_band_ranges(ant_i, pol)
+                ],
+                "residual_auto_kept_ranges": _kept_ranges_from_mask(band_values, residual_auto_mask),
+                "residual_included_bands": [int(value) for value in band_values[residual_kept_mask].tolist()],
+                "all_residual_delay_ns": np.nan,
+                "raw_phase_by_band": [],
+                "fit_phase_by_band": [],
+                "residual_phase_by_band": [],
+                "residual_fit_segments": [],
+                "applied_phase_by_band": [],
+                "relative_phase_by_band": [],
+                "relative_fit_segments": [],
+                "relative_fit_annotation": None,
+                "relative_title": title,
+                "relative_model_phase": np.asarray([], dtype=float),
+                "relative_model_mask": np.asarray([], dtype=bool),
+                "residual_delay_per_band_ns": np.full(band_values.shape, np.nan, dtype=float),
+                "residual_inband_delay_ns": 0.0,
+                "fit_method": "complex_poly_lowfreq",
+            }
+        )
+    xy_kept_mask = scan.delay_solution.included_band_mask(ant_i, 0) & scan.delay_solution.included_band_mask(ant_i, 1)
+    yx_rms = np.asarray(scan.raw.get("yx_residual_rms", np.full(scan.layout.nsolant, np.nan)), dtype=float)
+    return {
+        "panels": panels,
+        "xy_panel": {
+            "title": title,
+            "annotation": None,
+            "kept_ranges": _kept_ranges_from_mask(band_values, xy_kept_mask),
+            "included_bands": [int(value) for value in band_values[xy_kept_mask].tolist()],
+            "phase_by_band": [],
+            "fit_segments": [],
+            "model_phase": np.asarray([], dtype=float),
+            "model_mask": np.asarray([], dtype=bool),
+            "yx_residual_rms": float(yx_rms[ant_i]) if ant_i < yx_rms.size else np.nan,
+        },
+        "relative_auto_ns": np.asarray(scan.delay_solution.relative_auto_ns[ant_i], dtype=float),
+        "relative_suggested_ns": np.asarray(scan.delay_solution.relative_suggested_ns[ant_i], dtype=float),
+    }
 
 
 def _tick_values(values: np.ndarray, max_ticks: int = 4) -> Dict[str, Any]:
@@ -602,18 +736,7 @@ def _shared_column_controls(scan: ScanAnalysis) -> list[dict[str, Any]]:
         if scan.delay_solution is not None
         else np.zeros(scan.layout.nsolant, dtype=bool)
     )
-    manual_keep = (
-        np.asarray(scan.delay_solution.manual_ant_keep_override, dtype=bool)
-        if scan.delay_solution is not None
-        else np.zeros(scan.layout.nsolant, dtype=bool)
-    )
-    yx_rms = np.asarray(scan.raw.get("yx_residual_rms", np.full(scan.layout.nsolant, np.nan)), dtype=float)
-    auto_quality_raw = (
-        np.isfinite(yx_rms) & (yx_rms > yx_residual_threshold(scan))
-        if yx_rms.shape == (scan.layout.nsolant,)
-        else np.zeros(scan.layout.nsolant, dtype=bool)
-    )
-    auto_quality = auto_quality_raw & ~manual_keep
+    auto_quality = _auto_quality_flagged_antennas(scan)
     return [
         {
             "antenna": int(ant_idx),
@@ -677,7 +800,13 @@ def _band_color_map(band_values: np.ndarray) -> Dict[int, str]:
     return {int(band): to_hex(cmap(float(idx) / denom)) for idx, band in enumerate(band_values.tolist())}
 
 
-def _band_edges(freq_ghz: np.ndarray, band_id: np.ndarray, band_values: np.ndarray, band_colors: Dict[int, str]) -> list[dict[str, Any]]:
+def _band_edges(
+    freq_ghz: np.ndarray,
+    band_id: np.ndarray,
+    band_values: np.ndarray,
+    band_colors: Dict[int, str],
+    band_indices: Optional[Dict[int, np.ndarray]] = None,
+) -> list[dict[str, Any]]:
     """Return per-band x extents used for snapping and dimming.
 
     :param freq_ghz: Channel frequencies in GHz.
@@ -694,7 +823,9 @@ def _band_edges(freq_ghz: np.ndarray, band_id: np.ndarray, band_values: np.ndarr
 
     out = []
     for band in np.asarray(band_values, dtype=int):
-        idx = np.where(band_id == int(band))[0]
+        idx = None if band_indices is None else band_indices.get(int(band))
+        if idx is None:
+            idx = np.where(band_id == int(band))[0]
         if idx.size == 0:
             continue
         xvals = np.asarray(freq_ghz[idx], dtype=float)
@@ -726,12 +857,15 @@ def _band_series_payload(
     band_id: np.ndarray,
     band_values: np.ndarray,
     y_values: np.ndarray,
+    band_indices: Optional[Dict[int, np.ndarray]] = None,
 ) -> list[dict[str, Any]]:
     """Split one channel-domain y-series into per-band x/y payloads."""
 
     out = []
     for band_value in np.asarray(band_values, dtype=int):
-        idx = np.where(band_id == int(band_value))[0]
+        idx = None if band_indices is None else band_indices.get(int(band_value))
+        if idx is None:
+            idx = np.where(band_id == int(band_value))[0]
         if idx.size == 0:
             continue
         out.append(
@@ -1129,8 +1263,8 @@ def _fit_joint_xy_relative_model(
     band_values = np.asarray(band_values, dtype=int)
     freq_hz = freq_ghz * 1e9
     weights = _lowfreq_weights(freq_ghz)
-    valid_x = np.isfinite(freq_ghz) & np.isfinite(vis_x.real) & np.isfinite(vis_x.imag)
-    valid_y = np.isfinite(freq_ghz) & np.isfinite(vis_y.real) & np.isfinite(vis_y.imag)
+    valid_x = np.isfinite(freq_ghz) & np.isfinite(vis_x.real) & np.isfinite(vis_x.imag) & (np.abs(vis_x) > 0.0)
+    valid_y = np.isfinite(freq_ghz) & np.isfinite(vis_y.real) & np.isfinite(vis_y.imag) & (np.abs(vis_y) > 0.0)
     fit_mask_x = np.ones(freq_ghz.shape, dtype=bool) if fit_mask_x is None else np.asarray(fit_mask_x, dtype=bool).reshape(-1)
     fit_mask_y = np.ones(freq_ghz.shape, dtype=bool) if fit_mask_y is None else np.asarray(fit_mask_y, dtype=bool).reshape(-1)
     if fit_mask_x.shape != freq_ghz.shape:
@@ -1154,9 +1288,12 @@ def _fit_joint_xy_relative_model(
     else:
         dxy = 0.0
 
-    display_phase_x = np.angle(vis_x)
-    display_phase_y = np.angle(vis_y)
-    display_phase_y_rot = np.angle(vis_y * np.exp(-1j * dxy))
+    display_phase_x = np.full(freq_ghz.shape, np.nan, dtype=float)
+    display_phase_y = np.full(freq_ghz.shape, np.nan, dtype=float)
+    display_phase_y_rot = np.full(freq_ghz.shape, np.nan, dtype=float)
+    display_phase_x[valid_x] = np.angle(vis_x[valid_x])
+    display_phase_y[valid_y] = np.angle(vis_y[valid_y])
+    display_phase_y_rot[valid_y] = np.angle(vis_y[valid_y] * np.exp(-1j * dxy))
 
     coarse_x = _band_phase_samples(freq_ghz, band_id, band_values, display_phase_x, weights, fit_valid_x)
     coarse_y = _band_phase_samples(freq_ghz, band_id, band_values, display_phase_y_rot, weights, fit_valid_y)
@@ -1456,13 +1593,15 @@ def _inband_diag_context(scan: ScanAnalysis) -> dict[str, Any]:
     band_id = np.asarray(scan.raw["channel_band"], dtype=int)
     band_values = np.asarray(scan.delay_solution.band_values, dtype=int)
     band_colors = _band_color_map(band_values)
-    band_edges = _band_edges(freq_ghz, band_id, band_values, band_colors)
+    band_indices = {int(band): np.where(band_id == int(band))[0] for band in band_values.tolist()}
+    band_edges = _band_edges(freq_ghz, band_id, band_values, band_colors, band_indices=band_indices)
     raw_avg, corrected_avg = combined_channel_vis_with_time_flags(scan)
     return {
         "freq_ghz": freq_ghz,
         "freq_hz": freq_ghz * 1e9,
         "band_id": band_id,
         "band_values": band_values,
+        "band_indices": band_indices,
         "band_colors": band_colors,
         "band_edges": band_edges,
         "raw_avg": raw_avg,
@@ -1484,10 +1623,13 @@ def _compute_inband_diagnostic_antenna(scan: ScanAnalysis, ant: int, context: di
     """
 
     ant_i = int(max(0, min(int(ant), scan.layout.nsolant - 1)))
+    if _manual_disabled_antennas(scan)[ant_i]:
+        return _blank_inband_diagnostic_antenna(scan, ant_i)
     freq_ghz = np.asarray(context["freq_ghz"], dtype=float)
     freq_hz = np.asarray(context["freq_hz"], dtype=float)
     band_id = np.asarray(context["band_id"], dtype=int)
     band_values = np.asarray(context["band_values"], dtype=int)
+    band_indices = dict(context["band_indices"])
     raw_avg = np.asarray(context["raw_avg"], dtype=np.complex128)
     corrected_avg = np.asarray(context["corrected_avg"], dtype=np.complex128)
 
@@ -1513,12 +1655,18 @@ def _compute_inband_diagnostic_antenna(scan: ScanAnalysis, ant: int, context: di
         raw_phase_by_band: list[dict[str, Any]] = []
         fit_phase_by_band: list[dict[str, Any]] = []
         residual_band_fits: list[dict[str, Any]] = []
-        corrected_phase = np.angle(corrected_avg[ant_i, pol])
-        applied_phase_by_band = _band_series_payload(freq_ghz, band_id, band_values, corrected_phase)
+        corrected_phase = np.full(freq_ghz.shape, np.nan, dtype=float)
+        corrected_valid = (
+            np.isfinite(corrected_avg[ant_i, pol].real)
+            & np.isfinite(corrected_avg[ant_i, pol].imag)
+            & (np.abs(corrected_avg[ant_i, pol]) > 0.0)
+        )
+        corrected_phase[corrected_valid] = np.angle(corrected_avg[ant_i, pol, corrected_valid])
+        applied_phase_by_band = _band_series_payload(freq_ghz, band_id, band_values, corrected_phase, band_indices=band_indices)
         relative_phase = np.asarray(joint_fit["phase_by_pol"][pol], dtype=float)
         relative_model_phase = np.asarray(joint_fit["model_by_pol"][pol], dtype=float)
         relative_model_mask = np.asarray(joint_fit["model_mask_by_pol"][pol], dtype=bool)
-        relative_phase_by_band = _band_series_payload(freq_ghz, band_id, band_values, relative_phase)
+        relative_phase_by_band = _band_series_payload(freq_ghz, band_id, band_values, relative_phase, band_indices=band_indices)
         relative_fit_segments = _line_series_payload(
             wrapped_line_segments(
                 freq_ghz,
@@ -1528,40 +1676,49 @@ def _compute_inband_diagnostic_antenna(scan: ScanAnalysis, ant: int, context: di
             )
         )
         smooth_residual = np.asarray(joint_fit["residual_by_pol"][pol], dtype=float)
-        residual_phase_by_band = _band_series_payload(freq_ghz, band_id, band_values, smooth_residual)
+        residual_phase_by_band = _band_series_payload(freq_ghz, band_id, band_values, smooth_residual, band_indices=band_indices)
         residual_fit_segments = _line_series_payload(joint_fit["residual_fit_segments_by_pol"][pol])
         residual_inband_delay_ns = np.nan
         residual_inband_weights = []
         residual_inband_delays = []
         for band_idx, band_value in enumerate(band_values):
-            idx = np.where(band_id == int(band_value))[0]
+            idx = band_indices.get(int(band_value))
+            if idx is None:
+                continue
             if idx.size == 0:
                 continue
-            raw_phase = np.angle(raw_avg[ant_i, pol, idx])
-            raw_phase_by_band.append(
-                {
-                    "band": int(band_value),
-                    "x": np.asarray(freq_ghz[idx], dtype=float),
-                    "y": np.asarray(raw_phase, dtype=float),
-                }
-            )
+            raw_band = np.asarray(raw_avg[ant_i, pol, idx], dtype=np.complex128)
+            raw_valid = np.isfinite(raw_band.real) & np.isfinite(raw_band.imag) & (np.abs(raw_band) > 0.0)
+            if np.any(raw_valid):
+                raw_x = np.asarray(freq_ghz[idx][raw_valid], dtype=float)
+                raw_phase = np.angle(raw_band[raw_valid])
+                raw_phase_by_band.append(
+                    {
+                        "band": int(band_value),
+                        "x": raw_x,
+                        "y": np.asarray(raw_phase, dtype=float),
+                    }
+                )
             delay_ns = scan.delay_solution.per_band_delay_ns[ant_i, pol, band_idx]
             phase0 = scan.delay_solution.per_band_phase0[ant_i, pol, band_idx]
-            if np.isfinite(delay_ns) and np.isfinite(phase0):
-                model = np.angle(np.exp(1j * (phase0 + 2.0 * np.pi * np.asarray(freq_ghz[idx], dtype=float) * delay_ns)))
+            if np.isfinite(delay_ns) and np.isfinite(phase0) and np.count_nonzero(raw_valid) >= 2:
+                model = np.angle(np.exp(1j * (phase0 + 2.0 * np.pi * raw_x * delay_ns)))
                 fit_phase_by_band.append(
                     {
                         "band": int(band_value),
-                        "x": np.asarray(freq_ghz[idx], dtype=float),
+                        "x": raw_x,
                         "y": np.asarray(model, dtype=float),
                     }
                 )
-            residual_band = solve_residual_delay_phi0(freq_hz[idx], corrected_avg[ant_i, pol, idx])
-            if np.isfinite(residual_band["dly_res_s"]):
-                residual_per_band_delay_ns[band_idx] = residual_band["dly_res_s"] * 1e9
+            corrected_band = np.asarray(corrected_avg[ant_i, pol, idx], dtype=np.complex128)
+            corrected_band_valid = np.isfinite(corrected_band.real) & np.isfinite(corrected_band.imag) & (np.abs(corrected_band) > 0.0)
+            if np.count_nonzero(corrected_band_valid) >= 2:
+                residual_band = solve_residual_delay_phi0(freq_hz[idx][corrected_band_valid], corrected_band[corrected_band_valid])
+                if np.isfinite(residual_band["dly_res_s"]):
+                    residual_per_band_delay_ns[band_idx] = residual_band["dly_res_s"] * 1e9
             band_fit = _per_band_phase_fit(
-                np.asarray(freq_ghz[idx], dtype=float),
-                np.asarray(smooth_residual[idx], dtype=float),
+                np.asarray(freq_ghz[idx][corrected_band_valid], dtype=float),
+                np.asarray(smooth_residual[idx][corrected_band_valid], dtype=float),
                 int(band_value),
             )
             residual_band_fits.append(band_fit)
@@ -1632,7 +1789,13 @@ def _compute_inband_diagnostic_antenna(scan: ScanAnalysis, ant: int, context: di
         )
     xy_kept_mask = scan.delay_solution.included_band_mask(ant_i, 0) & scan.delay_solution.included_band_mask(ant_i, 1)
     xy_included_bands = band_values[xy_kept_mask]
-    xy_phase_by_band = _band_series_payload(freq_ghz, band_id, band_values, np.asarray(joint_fit["xy_phase"], dtype=float))
+    xy_phase_by_band = _band_series_payload(
+        freq_ghz,
+        band_id,
+        band_values,
+        np.asarray(joint_fit["xy_phase"], dtype=float),
+        band_indices=band_indices,
+    )
     xy_fit_segments = _line_series_payload(
         wrapped_line_segments(
             freq_ghz,
@@ -1761,20 +1924,18 @@ def _inband_diagnostics(scan: ScanAnalysis) -> Dict[str, Any]:
     freq_ghz = np.asarray(context["freq_ghz"], dtype=float)
     band_values = np.asarray(context["band_values"], dtype=int)
     panel_meta: list[list[dict[str, Any]]] = [[], []]
+    xy_panel_meta: list[dict[str, Any]] = []
+    yx_residual_rms = np.full(scan.layout.nsolant, np.nan, dtype=float)
     relative_auto_ns = np.zeros((scan.layout.nsolant, 2), dtype=float)
     relative_suggested_ns = np.zeros((scan.layout.nsolant, 2), dtype=float)
     for ant in range(scan.layout.nsolant):
         antenna_payload = _inband_diagnostic_for_antenna(scan, ant, context=context)
         panel_meta[0].append(antenna_payload["panels"][0])
         panel_meta[1].append(antenna_payload["panels"][1])
-        relative_auto_ns[ant, :] = np.asarray(antenna_payload["relative_auto_ns"], dtype=float)
-        relative_suggested_ns[ant, :] = np.asarray(antenna_payload["relative_suggested_ns"], dtype=float)
-    xy_panel_meta: list[dict[str, Any]] = []
-    yx_residual_rms = np.full(scan.layout.nsolant, np.nan, dtype=float)
-    for ant in range(scan.layout.nsolant):
-        antenna_payload = _inband_diagnostic_for_antenna(scan, ant, context=context)
         xy_panel_meta.append(antenna_payload["xy_panel"])
         yx_residual_rms[ant] = float(antenna_payload["xy_panel"].get("yx_residual_rms", np.nan))
+        relative_auto_ns[ant, :] = np.asarray(antenna_payload["relative_auto_ns"], dtype=float)
+        relative_suggested_ns[ant, :] = np.asarray(antenna_payload["relative_suggested_ns"], dtype=float)
     refreshed_key = _inband_diag_cache_key(scan)
     if refreshed_key != combined_key:
         scan.raw.pop("residual_diagnostics_cache", None)
@@ -2091,62 +2252,66 @@ def inband_residual_phase_band_payload(scan: Optional[ScanAnalysis]) -> Dict[str
     if scan.delay_solution is None or not scan.raw:
         return _blank_payload("No in-band residual phase data are available.", "Per-Band Residual Phase")
     diag = _inband_diagnostics(scan)
+    disabled_antennas = _effective_disabled_antennas(scan)
+    manual_disabled_antennas = _manual_disabled_antennas(scan)
     panels = []
     all_x = np.asarray(diag["freq_ghz"], dtype=float)
     for pol, pol_name in enumerate(("X", "Y")):
         row = []
         for ant_idx in range(scan.layout.nsolant):
             panel_diag = diag["panels"][pol][ant_idx]
-            included_bands = set(panel_diag["residual_included_bands"])
             series_list = []
-            for segment in panel_diag.get("residual_fit_segments", []):
-                slope_series = _finite_series(segment["x"], segment["y"])
-                series_list.append(
-                    {
-                        "label": "Multiband Fit",
-                        "role": "fit",
-                        "mode": "line",
-                        "color": "#c43c35",
-                        "opacity": 0.95,
-                        "x": slope_series["x"],
-                        "y": slope_series["y"],
-                    }
-                )
-            for band_residual in panel_diag["residual_phase_by_band"]:
-                band_value = int(band_residual["band"])
-                series = _finite_series(band_residual["x"], band_residual["y"])
-                series_list.append(
-                    {
-                        "label": "Residual phase",
-                        "role": "data",
-                        "band": band_value,
-                        "mode": "points",
-                        "color": diag["band_colors"][band_value],
-                        "opacity": 0.95 if band_value in included_bands else 0.18,
-                        "x": series["x"],
-                        "y": series["y"],
-                    }
-                )
-                band_fit = _per_band_phase_fit(band_residual["x"], band_residual["y"], band_value)
-                for segment in band_fit.get("segments", []):
-                    fit_series = _finite_series(segment["x"], segment["y"])
+            if not manual_disabled_antennas[ant_idx]:
+                included_bands = set(panel_diag["residual_included_bands"])
+                for segment in panel_diag.get("residual_fit_segments", []):
+                    slope_series = _finite_series(segment["x"], segment["y"])
                     series_list.append(
                         {
-                            "label": "Inband Fit",
+                            "label": "Multiband Fit",
                             "role": "fit",
                             "mode": "line",
-                            "color": "#2a6fdb",
-                            "opacity": 0.95 if band_value in included_bands else 0.18,
-                            "x": fit_series["x"],
-                            "y": fit_series["y"],
+                            "color": "#c43c35",
+                            "opacity": 0.95,
+                            "x": slope_series["x"],
+                            "y": slope_series["y"],
                         }
                     )
+                for band_residual in panel_diag["residual_phase_by_band"]:
+                    band_value = int(band_residual["band"])
+                    series = _finite_series(band_residual["x"], band_residual["y"])
+                    series_list.append(
+                        {
+                            "label": "Residual phase",
+                            "role": "data",
+                            "band": band_value,
+                            "mode": "points",
+                            "color": diag["band_colors"][band_value],
+                            "opacity": 0.95 if band_value in included_bands else 0.18,
+                            "x": series["x"],
+                            "y": series["y"],
+                        }
+                    )
+                    band_fit = _per_band_phase_fit(band_residual["x"], band_residual["y"], band_value)
+                    for segment in band_fit.get("segments", []):
+                        fit_series = _finite_series(segment["x"], segment["y"])
+                        series_list.append(
+                            {
+                                "label": "Inband Fit",
+                                "role": "fit",
+                                "mode": "line",
+                                "color": "#2a6fdb",
+                                "opacity": 0.95 if band_value in included_bands else 0.18,
+                                "x": fit_series["x"],
+                                "y": fit_series["y"],
+                            }
+                        )
             row.append(
                 {
                     "title": "Ant {0:d}".format(ant_idx + 1),
                     "annotation": None,
                     "kept_ranges": panel_diag["residual_kept_ranges"],
                     "auto_kept_ranges": panel_diag["residual_auto_kept_ranges"],
+                    "disabled": bool(disabled_antennas[ant_idx]),
                     "series": series_list,
                 }
             )
@@ -2178,21 +2343,65 @@ def inband_relative_phase_payload(scan: Optional[ScanAnalysis]) -> Dict[str, Any
     if scan.delay_solution is None or not scan.raw:
         return _blank_payload("No relative-phase data are available.", "Relative Phase + Fit")
     diag = _inband_diagnostics(scan)
-    manual_flagged = np.asarray(scan.delay_solution.manual_ant_flag_override, dtype=bool)
-    auto_quality_flagged = _auto_quality_flagged_antennas(scan)
+    disabled_antennas = _effective_disabled_antennas(scan)
+    manual_disabled_antennas = _manual_disabled_antennas(scan)
     panels = []
     all_x = np.asarray(diag["freq_ghz"], dtype=float)
     for pol in range(2):
         row = []
         for ant_idx in range(scan.layout.nsolant):
             panel_diag = diag["panels"][pol][ant_idx]
-            included_bands = set(panel_diag["residual_included_bands"])
             series_list = []
-            for band_phase in panel_diag["relative_phase_by_band"]:
+            if not manual_disabled_antennas[ant_idx]:
+                included_bands = set(panel_diag["residual_included_bands"])
+                for band_phase in panel_diag["relative_phase_by_band"]:
+                    series = _finite_series(band_phase["x"], band_phase["y"])
+                    series_list.append(
+                        {
+                            "label": "Relative phase",
+                            "role": "data",
+                            "band": int(band_phase["band"]),
+                            "mode": "points",
+                            "color": diag["band_colors"][int(band_phase["band"])],
+                            "opacity": 0.95 if int(band_phase["band"]) in included_bands else 0.18,
+                            "x": series["x"],
+                            "y": series["y"],
+                        }
+                    )
+                for segment in panel_diag.get("relative_fit_segments", []):
+                    series = _finite_series(segment["x"], segment["y"])
+                    series_list.append(
+                        {
+                            "label": "Fit",
+                            "role": "fit",
+                            "mode": "line",
+                            "color": "#c43c35",
+                            "opacity": 0.95,
+                            "x": series["x"],
+                            "y": series["y"],
+                        }
+                    )
+            row.append(
+                {
+                    "title": panel_diag.get("relative_title", "Ant {0:d}".format(ant_idx + 1)),
+                    "annotation": panel_diag["relative_fit_annotation"],
+                    "kept_ranges": panel_diag["kept_ranges"],
+                    "disabled": bool(disabled_antennas[ant_idx]),
+                    "series": series_list,
+                }
+            )
+        panels.append(row)
+    xy_row = []
+    for ant_idx in range(scan.layout.nsolant):
+        panel_diag = diag["xy_panels"][ant_idx]
+        series_list = []
+        if not manual_disabled_antennas[ant_idx]:
+            included_bands = set(panel_diag["included_bands"])
+            for band_phase in panel_diag["phase_by_band"]:
                 series = _finite_series(band_phase["x"], band_phase["y"])
                 series_list.append(
                     {
-                        "label": "Relative phase",
+                        "label": "Y-X phase",
                         "role": "data",
                         "band": int(band_phase["band"]),
                         "mode": "points",
@@ -2202,7 +2411,7 @@ def inband_relative_phase_payload(scan: Optional[ScanAnalysis]) -> Dict[str, Any
                         "y": series["y"],
                     }
                 )
-            for segment in panel_diag.get("relative_fit_segments", []):
+            for segment in panel_diag.get("fit_segments", []):
                 series = _finite_series(segment["x"], segment["y"])
                 series_list.append(
                     {
@@ -2215,54 +2424,12 @@ def inband_relative_phase_payload(scan: Optional[ScanAnalysis]) -> Dict[str, Any
                         "y": series["y"],
                     }
                 )
-            row.append(
-                {
-                    "title": panel_diag.get("relative_title", "Ant {0:d}".format(ant_idx + 1)),
-                    "annotation": panel_diag["relative_fit_annotation"],
-                    "kept_ranges": panel_diag["kept_ranges"],
-                    "disabled": bool(manual_flagged[ant_idx] or auto_quality_flagged[ant_idx]),
-                    "series": series_list,
-                }
-            )
-        panels.append(row)
-    xy_row = []
-    for ant_idx in range(scan.layout.nsolant):
-        panel_diag = diag["xy_panels"][ant_idx]
-        included_bands = set(panel_diag["included_bands"])
-        series_list = []
-        for band_phase in panel_diag["phase_by_band"]:
-            series = _finite_series(band_phase["x"], band_phase["y"])
-            series_list.append(
-                {
-                    "label": "Y-X phase",
-                    "role": "data",
-                    "band": int(band_phase["band"]),
-                    "mode": "points",
-                    "color": diag["band_colors"][int(band_phase["band"])],
-                    "opacity": 0.95 if int(band_phase["band"]) in included_bands else 0.18,
-                    "x": series["x"],
-                    "y": series["y"],
-                }
-            )
-        for segment in panel_diag.get("fit_segments", []):
-            series = _finite_series(segment["x"], segment["y"])
-            series_list.append(
-                {
-                    "label": "Fit",
-                    "role": "fit",
-                    "mode": "line",
-                    "color": "#c43c35",
-                    "opacity": 0.95,
-                    "x": series["x"],
-                    "y": series["y"],
-                }
-            )
         xy_row.append(
             {
                 "title": panel_diag["title"],
                 "annotation": panel_diag["annotation"],
                 "kept_ranges": panel_diag["kept_ranges"],
-                "disabled": bool(manual_flagged[ant_idx] or auto_quality_flagged[ant_idx]),
+                "disabled": bool(disabled_antennas[ant_idx]),
                 "series": series_list,
             }
         )
@@ -2292,6 +2459,8 @@ def inband_residual_delay_band_payload(scan: Optional[ScanAnalysis]) -> Dict[str
     if scan.delay_solution is None or not scan.raw:
         return _blank_payload("No residual-delay data are available.", "Residual Delay Per Band")
     diag = _inband_diagnostics(scan)
+    disabled_antennas = _effective_disabled_antennas(scan)
+    manual_disabled_antennas = _manual_disabled_antennas(scan)
     xvals = np.asarray([edge["x_center"] for edge in diag["band_edges"]], dtype=float)
     if xvals.size == 0:
         return _blank_payload("No residual-delay data are available.", "Residual Delay Per Band")
@@ -2300,40 +2469,48 @@ def inband_residual_delay_band_payload(scan: Optional[ScanAnalysis]) -> Dict[str
         row = []
         for ant_idx in range(scan.layout.nsolant):
             panel_diag = diag["panels"][pol][ant_idx]
-            included_bands = set(panel_diag["residual_included_bands"])
             series_list = []
-            for band_idx, band_value in enumerate(diag["band_values"]):
-                yval = panel_diag["residual_delay_per_band_ns"][band_idx]
-                if not np.isfinite(yval):
-                    continue
-                center = next((edge["x_center"] for edge in diag["band_edges"] if int(edge["band"]) == int(band_value)), None)
-                if center is None:
-                    continue
-                series_list.append(
-                    {
-                        "label": "Residual delay",
-                        "role": "data",
-                        "band": int(band_value),
-                        "mode": "points",
-                        "color": diag["band_colors"][int(band_value)],
-                        "opacity": 0.95 if int(band_value) in included_bands else 0.18,
-                        "x": [float(center)],
-                        "y": [float(yval)],
-                    }
-                )
-            if np.isfinite(panel_diag["all_residual_delay_ns"]):
-                series_list.append(
-                    {
-                        "label": "All-band residual delay",
-                        "role": "fit",
-                        "mode": "line",
-                        "color": "#c43c35",
-                        "dasharray": "5 4",
-                        "x": [float(np.nanmin(xvals)), float(np.nanmax(xvals))],
-                        "y": [float(panel_diag["all_residual_delay_ns"]), float(panel_diag["all_residual_delay_ns"])],
-                    }
-                )
-            row.append({"title": "Ant {0:d}".format(ant_idx + 1), "annotation": None, "series": series_list})
+            if not manual_disabled_antennas[ant_idx]:
+                included_bands = set(panel_diag["residual_included_bands"])
+                for band_idx, band_value in enumerate(diag["band_values"]):
+                    yval = panel_diag["residual_delay_per_band_ns"][band_idx]
+                    if not np.isfinite(yval):
+                        continue
+                    center = next((edge["x_center"] for edge in diag["band_edges"] if int(edge["band"]) == int(band_value)), None)
+                    if center is None:
+                        continue
+                    series_list.append(
+                        {
+                            "label": "Residual delay",
+                            "role": "data",
+                            "band": int(band_value),
+                            "mode": "points",
+                            "color": diag["band_colors"][int(band_value)],
+                            "opacity": 0.95 if int(band_value) in included_bands else 0.18,
+                            "x": [float(center)],
+                            "y": [float(yval)],
+                        }
+                    )
+                if np.isfinite(panel_diag["all_residual_delay_ns"]):
+                    series_list.append(
+                        {
+                            "label": "All-band residual delay",
+                            "role": "fit",
+                            "mode": "line",
+                            "color": "#c43c35",
+                            "dasharray": "5 4",
+                            "x": [float(np.nanmin(xvals)), float(np.nanmax(xvals))],
+                            "y": [float(panel_diag["all_residual_delay_ns"]), float(panel_diag["all_residual_delay_ns"])],
+                        }
+                    )
+            row.append(
+                {
+                    "title": "Ant {0:d}".format(ant_idx + 1),
+                    "annotation": None,
+                    "disabled": bool(disabled_antennas[ant_idx]),
+                    "series": series_list,
+                }
+            )
         panels.append(row)
     payload = _panel_grid_payload(
         "Residual Delay Per Band (After In-Band Correction)",
@@ -2675,16 +2852,37 @@ def residual_mask_update_payloads(scan: Optional[ScanAnalysis]) -> Dict[str, Dic
 def residual_inband_apply_payloads(
     scan: Optional[ScanAnalysis],
     use_lobe: bool = False,
+    antenna_indices: Optional[Sequence[int]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Return overview sections affected by global residual in-band apply."""
 
-    return {
+    sparse_antennas = None if antenna_indices is None else [int(ant) for ant in antenna_indices]
+    payload = {
         "sum_amp": sum_amp_payload(scan),
         "sum_pha": sum_phase_payload(scan, use_lobe=use_lobe),
-        "inband_relative_phase": inband_relative_phase_payload(scan),
-        "inband_residual_phase_band": inband_residual_phase_band_payload(scan),
-        "inband_residual_delay_band": inband_residual_delay_band_payload(scan),
     }
+    if scan is None:
+        payload.update(
+            {
+                "inband_relative_phase": inband_relative_phase_payload(scan),
+                "inband_residual_phase_band": inband_residual_phase_band_payload(scan),
+                "inband_residual_delay_band": inband_residual_delay_band_payload(scan),
+            }
+        )
+        return payload
+    if sparse_antennas is None:
+        payload.update(
+            {
+                "inband_relative_phase": inband_relative_phase_payload(scan),
+                "inband_residual_phase_band": inband_residual_phase_band_payload(scan),
+                "inband_residual_delay_band": inband_residual_delay_band_payload(scan),
+            }
+        )
+        return payload
+    if not sparse_antennas:
+        return payload
+    payload.update(_relative_delay_partial_payloads(scan, sparse_antennas))
+    return payload
 
 
 def _relative_delay_partial_payloads(scan: ScanAnalysis, antenna_indices: Sequence[int]) -> Dict[str, Dict[str, Any]]:
@@ -2707,8 +2905,8 @@ def _relative_delay_partial_payloads(scan: ScanAnalysis, antenna_indices: Sequen
         }
     context = _inband_diag_context(scan)
     band_colors = context["band_colors"]
-    manual_flagged = np.asarray(scan.delay_solution.manual_ant_flag_override, dtype=bool)
-    manual_kept = np.asarray(scan.delay_solution.manual_ant_keep_override, dtype=bool)
+    disabled_antennas = _effective_disabled_antennas(scan)
+    manual_disabled_antennas = _manual_disabled_antennas(scan)
     all_x = np.asarray(context["freq_ghz"], dtype=float)
     x_limits = [float(np.nanmin(all_x)), float(np.nanmax(all_x))]
     x_ticks = _tick_values(all_x, max_ticks=4)
@@ -2717,32 +2915,66 @@ def _relative_delay_partial_payloads(scan: ScanAnalysis, antenna_indices: Sequen
     relative_panels = [[None] * nsolant for _ in range(3)]
     for ant_i in sparse_antennas:
         antenna_payload = _inband_diagnostic_for_antenna(scan, ant_i, context=context)
-        antenna_auto_flagged = bool(
-            np.isfinite(antenna_payload["xy_panel"].get("yx_residual_rms", np.nan))
-            and float(antenna_payload["xy_panel"].get("yx_residual_rms", np.nan)) > yx_residual_threshold(scan)
-            and not bool(manual_kept[ant_i])
-        )
         for pol in range(2):
             panel_diag = antenna_payload["panels"][pol]
-            included_bands = set(panel_diag["included_bands"])
             series_list = []
-            for band_phase in panel_diag["relative_phase_by_band"]:
+            if not manual_disabled_antennas[ant_i]:
+                included_bands = set(panel_diag["included_bands"])
+                for band_phase in panel_diag["relative_phase_by_band"]:
+                    series = _finite_series(band_phase["x"], band_phase["y"])
+                    series_list.append(
+                        {
+                            "label": "Relative phase",
+                            "role": "data",
+                            "band": int(band_phase["band"]),
+                            "mode": "points",
+                            "color": band_colors[int(band_phase["band"])],
+                            "opacity": 0.95 if int(band_phase["band"]) in included_bands else 0.18,
+                            "x": series["x"],
+                            "y": series["y"],
+                        }
+                    )
+                for segment in panel_diag.get("relative_fit_segments", []):
+                    series = _finite_series(segment["x"], segment["y"])
+                    series_list.append(
+                        {
+                            "label": "Fit",
+                            "role": "fit",
+                            "mode": "line",
+                            "color": "#c43c35",
+                            "opacity": 0.95,
+                            "x": series["x"],
+                            "y": series["y"],
+                        }
+                    )
+            relative_panels[pol][ant_i] = {
+                "title": panel_diag.get("relative_title", "Ant {0:d}".format(ant_i + 1)),
+                "annotation": panel_diag["relative_fit_annotation"],
+                "kept_ranges": panel_diag["kept_ranges"],
+                "disabled": bool(disabled_antennas[ant_i]),
+                "series": series_list,
+            }
+        xy_panel_diag = antenna_payload["xy_panel"]
+        xy_series_list = []
+        if not manual_disabled_antennas[ant_i]:
+            xy_included_bands = set(xy_panel_diag["included_bands"])
+            for band_phase in xy_panel_diag["phase_by_band"]:
                 series = _finite_series(band_phase["x"], band_phase["y"])
-                series_list.append(
+                xy_series_list.append(
                     {
-                        "label": "Relative phase",
+                        "label": "Y-X phase",
                         "role": "data",
                         "band": int(band_phase["band"]),
                         "mode": "points",
                         "color": band_colors[int(band_phase["band"])],
-                        "opacity": 0.95 if int(band_phase["band"]) in included_bands else 0.18,
+                        "opacity": 0.95 if int(band_phase["band"]) in xy_included_bands else 0.18,
                         "x": series["x"],
                         "y": series["y"],
                     }
                 )
-            for segment in panel_diag.get("relative_fit_segments", []):
+            for segment in xy_panel_diag.get("fit_segments", []):
                 series = _finite_series(segment["x"], segment["y"])
-                series_list.append(
+                xy_series_list.append(
                     {
                         "label": "Fit",
                         "role": "fit",
@@ -2753,48 +2985,11 @@ def _relative_delay_partial_payloads(scan: ScanAnalysis, antenna_indices: Sequen
                         "y": series["y"],
                     }
                 )
-            relative_panels[pol][ant_i] = {
-                "title": panel_diag.get("relative_title", "Ant {0:d}".format(ant_i + 1)),
-                "annotation": panel_diag["relative_fit_annotation"],
-                "kept_ranges": panel_diag["kept_ranges"],
-                "disabled": bool(manual_flagged[ant_i] or antenna_auto_flagged),
-                "series": series_list,
-            }
-        xy_panel_diag = antenna_payload["xy_panel"]
-        xy_included_bands = set(xy_panel_diag["included_bands"])
-        xy_series_list = []
-        for band_phase in xy_panel_diag["phase_by_band"]:
-            series = _finite_series(band_phase["x"], band_phase["y"])
-            xy_series_list.append(
-                {
-                    "label": "Y-X phase",
-                    "role": "data",
-                    "band": int(band_phase["band"]),
-                    "mode": "points",
-                    "color": band_colors[int(band_phase["band"])],
-                    "opacity": 0.95 if int(band_phase["band"]) in xy_included_bands else 0.18,
-                    "x": series["x"],
-                    "y": series["y"],
-                }
-            )
-        for segment in xy_panel_diag.get("fit_segments", []):
-            series = _finite_series(segment["x"], segment["y"])
-            xy_series_list.append(
-                {
-                    "label": "Fit",
-                    "role": "fit",
-                    "mode": "line",
-                    "color": "#c43c35",
-                    "opacity": 0.95,
-                    "x": series["x"],
-                    "y": series["y"],
-                }
-            )
         relative_panels[2][ant_i] = {
             "title": xy_panel_diag["title"],
             "annotation": xy_panel_diag["annotation"],
             "kept_ranges": xy_panel_diag["kept_ranges"],
-            "disabled": bool(manual_flagged[ant_i] or antenna_auto_flagged),
+            "disabled": bool(disabled_antennas[ant_i]),
             "series": xy_series_list,
         }
     relative_payload = _panel_grid_payload(
@@ -2818,55 +3013,57 @@ def _relative_delay_partial_payloads(scan: ScanAnalysis, antenna_indices: Sequen
         antenna_payload = _inband_diagnostic_for_antenna(scan, ant_i, context=context)
         for pol in range(2):
             panel_diag = antenna_payload["panels"][pol]
-            included_bands = set(panel_diag["residual_included_bands"])
             series_list = []
-            for segment in panel_diag.get("residual_fit_segments", []):
-                slope_series = _finite_series(segment["x"], segment["y"])
-                series_list.append(
-                    {
-                        "label": "Multiband Fit",
-                        "role": "fit",
-                        "mode": "line",
-                        "color": "#c43c35",
-                        "opacity": 0.95,
-                        "x": slope_series["x"],
-                        "y": slope_series["y"],
-                    }
-                )
-            for band_residual in panel_diag["residual_phase_by_band"]:
-                band_value = int(band_residual["band"])
-                series = _finite_series(band_residual["x"], band_residual["y"])
-                series_list.append(
-                    {
-                        "label": "Residual phase",
-                        "role": "data",
-                        "band": band_value,
-                        "mode": "points",
-                        "color": band_colors[band_value],
-                        "opacity": 0.95 if band_value in included_bands else 0.18,
-                        "x": series["x"],
-                        "y": series["y"],
-                    }
-                )
-                band_fit = _per_band_phase_fit(band_residual["x"], band_residual["y"], band_value)
-                for segment in band_fit.get("segments", []):
-                    fit_series = _finite_series(segment["x"], segment["y"])
+            if not manual_disabled_antennas[ant_i]:
+                included_bands = set(panel_diag["residual_included_bands"])
+                for segment in panel_diag.get("residual_fit_segments", []):
+                    slope_series = _finite_series(segment["x"], segment["y"])
                     series_list.append(
                         {
-                            "label": "Inband Fit",
+                            "label": "Multiband Fit",
                             "role": "fit",
                             "mode": "line",
-                            "color": "#2a6fdb",
-                            "opacity": 0.95 if band_value in included_bands else 0.18,
-                            "x": fit_series["x"],
-                            "y": fit_series["y"],
+                            "color": "#c43c35",
+                            "opacity": 0.95,
+                            "x": slope_series["x"],
+                            "y": slope_series["y"],
                         }
                     )
+                for band_residual in panel_diag["residual_phase_by_band"]:
+                    band_value = int(band_residual["band"])
+                    series = _finite_series(band_residual["x"], band_residual["y"])
+                    series_list.append(
+                        {
+                            "label": "Residual phase",
+                            "role": "data",
+                            "band": band_value,
+                            "mode": "points",
+                            "color": band_colors[band_value],
+                            "opacity": 0.95 if band_value in included_bands else 0.18,
+                            "x": series["x"],
+                            "y": series["y"],
+                        }
+                    )
+                    band_fit = _per_band_phase_fit(band_residual["x"], band_residual["y"], band_value)
+                    for segment in band_fit.get("segments", []):
+                        fit_series = _finite_series(segment["x"], segment["y"])
+                        series_list.append(
+                            {
+                                "label": "Inband Fit",
+                                "role": "fit",
+                                "mode": "line",
+                                "color": "#2a6fdb",
+                                "opacity": 0.95 if band_value in included_bands else 0.18,
+                                "x": fit_series["x"],
+                                "y": fit_series["y"],
+                            }
+                        )
             residual_phase_panels[pol][ant_i] = {
                 "title": "Ant {0:d}".format(ant_i + 1),
                 "annotation": None,
                 "kept_ranges": panel_diag["residual_kept_ranges"],
                 "auto_kept_ranges": panel_diag["residual_auto_kept_ranges"],
+                "disabled": bool(disabled_antennas[ant_i]),
                 "series": series_list,
             }
     residual_phase_payload = _panel_grid_payload(
@@ -2893,42 +3090,44 @@ def _relative_delay_partial_payloads(scan: ScanAnalysis, antenna_indices: Sequen
         antenna_payload = _inband_diagnostic_for_antenna(scan, ant_i, context=context)
         for pol in range(2):
             panel_diag = antenna_payload["panels"][pol]
-            included_bands = set(panel_diag["residual_included_bands"])
             series_list = []
-            for band_idx, band_value in enumerate(context["band_values"]):
-                yval = panel_diag["residual_delay_per_band_ns"][band_idx]
-                if not np.isfinite(yval):
-                    continue
-                center = next((edge["x_center"] for edge in context["band_edges"] if int(edge["band"]) == int(band_value)), None)
-                if center is None:
-                    continue
-                series_list.append(
-                    {
-                        "label": "Residual delay",
-                        "role": "data",
-                        "band": int(band_value),
-                        "mode": "points",
-                        "color": band_colors[int(band_value)],
-                        "opacity": 0.95 if int(band_value) in included_bands else 0.18,
-                        "x": [float(center)],
-                        "y": [float(yval)],
-                    }
-                )
-            if np.isfinite(panel_diag["all_residual_delay_ns"]):
-                series_list.append(
-                    {
-                        "label": "All-band residual delay",
-                        "role": "fit",
-                        "mode": "line",
-                        "color": "#c43c35",
-                        "dasharray": "5 4",
-                        "x": [float(np.nanmin(band_centers)), float(np.nanmax(band_centers))],
-                        "y": [float(panel_diag["all_residual_delay_ns"]), float(panel_diag["all_residual_delay_ns"])],
-                    }
-                )
+            if not disabled_antennas[ant_i]:
+                included_bands = set(panel_diag["residual_included_bands"])
+                for band_idx, band_value in enumerate(context["band_values"]):
+                    yval = panel_diag["residual_delay_per_band_ns"][band_idx]
+                    if not np.isfinite(yval):
+                        continue
+                    center = next((edge["x_center"] for edge in context["band_edges"] if int(edge["band"]) == int(band_value)), None)
+                    if center is None:
+                        continue
+                    series_list.append(
+                        {
+                            "label": "Residual delay",
+                            "role": "data",
+                            "band": int(band_value),
+                            "mode": "points",
+                            "color": band_colors[int(band_value)],
+                            "opacity": 0.95 if int(band_value) in included_bands else 0.18,
+                            "x": [float(center)],
+                            "y": [float(yval)],
+                        }
+                    )
+                if np.isfinite(panel_diag["all_residual_delay_ns"]):
+                    series_list.append(
+                        {
+                            "label": "All-band residual delay",
+                            "role": "fit",
+                            "mode": "line",
+                            "color": "#c43c35",
+                            "dasharray": "5 4",
+                            "x": [float(np.nanmin(band_centers)), float(np.nanmax(band_centers))],
+                            "y": [float(panel_diag["all_residual_delay_ns"]), float(panel_diag["all_residual_delay_ns"])],
+                        }
+                    )
             residual_delay_panels[pol][ant_i] = {
                 "title": "Ant {0:d}".format(ant_i + 1),
                 "annotation": None,
+                "disabled": bool(disabled_antennas[ant_i]),
                 "series": series_list,
             }
     residual_delay_payload = _panel_grid_payload(
@@ -3106,7 +3305,7 @@ def export_model_bundle_entry(scan: ScanAnalysis) -> Dict[str, Any]:
     freq_fine = np.asarray(scan.raw["channel_freq_ghz"], dtype=float) if scan.raw else np.asarray([], dtype=float)
     band_id = np.asarray(scan.raw["channel_band"], dtype=int) if scan.raw else np.asarray([], dtype=int)
     model_phase_fine = np.full((scan.layout.nsolant, 2, freq_fine.size), np.nan, dtype=float)
-    model_phase_band = np.full((scan.layout.nsolant, 2, scan.bands_band.size), np.nan, dtype=float)
+    model_phase_band = np.zeros((scan.layout.nsolant, 2, scan.bands_band.size), dtype=float)
     if scan.delay_solution is not None and scan.raw:
         context = _inband_diag_context(scan)
         for ant_i in range(scan.layout.nsolant):
@@ -3117,7 +3316,20 @@ def export_model_bundle_entry(scan: ScanAnalysis) -> Dict[str, Any]:
                 wrapped = np.angle(np.exp(1j * model_phase))
                 wrapped[~model_mask] = np.nan
                 model_phase_fine[ant_i, pol, :] = wrapped
-                model_phase_band[ant_i, pol, :] = _band_mean_wrapped_phase(freq_fine, band_id, scan.delay_solution.band_values, wrapped)
+                compact_band_phase = _band_mean_wrapped_phase(
+                    freq_fine,
+                    band_id,
+                    scan.delay_solution.band_values,
+                    wrapped,
+                )
+                for compact_idx, band_value in enumerate(np.asarray(scan.delay_solution.band_values, dtype=int)):
+                    full_idx = scan.band_to_full_index.get(int(band_value), int(band_value) - 1)
+                    if full_idx < 0 or full_idx >= model_phase_band.shape[2]:
+                        continue
+                    if compact_idx >= compact_band_phase.size:
+                        continue
+                    if np.isfinite(compact_band_phase[compact_idx]):
+                        model_phase_band[ant_i, pol, full_idx] = float(compact_band_phase[compact_idx])
 
     if scan_feed_kind(scan) != "hi":
         model_flag = np.asarray(v2_flag, dtype=np.int32).copy()

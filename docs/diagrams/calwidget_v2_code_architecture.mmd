@@ -1,0 +1,39 @@
+flowchart LR
+    A[Raw IDB/UDB or legacy NPZ] --> B[calwidget_v2_analysis.py]
+    B --> C[ScanAnalysis]
+    B --> D[DelaySolution]
+
+    D --> E[kept_band_mask]
+    D --> F[residual_kept_band_mask]
+    D --> G[relative_ns]
+    D --> H[manual antenna overrides]
+
+    C --> I[calwidget_v2_plots.py]
+    D --> I
+
+    I --> J[Sum Amp]
+    I --> K[Sum Pha]
+    I --> L[Inband Fit]
+    I --> M[Relative Phase plus Fit]
+    I --> N[Per-Band Residual Phase]
+    I --> O[Residual Delay Per Band]
+    I --> P[Daily NPZ export entry]
+
+    C --> Q[calwidget_v2_api.py]
+    D --> Q
+    I --> Q
+
+    Q --> R[overview-data]
+    Q --> S[heatmap-data]
+    Q --> T[time-history]
+    Q --> U[update and apply endpoints]
+
+    R --> V[calwidget_v2_frontend/app.js]
+    S --> V
+    T --> V
+    U --> V
+
+    V --> W[Interactive browser workflow]
+    W --> X[Sidecar persistence]
+    W --> Y[SQL save]
+    W --> Z[Daily NPZ save]

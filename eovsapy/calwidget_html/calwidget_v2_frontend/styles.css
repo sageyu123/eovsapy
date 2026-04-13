@@ -95,6 +95,35 @@ button:disabled {
   gap: 0.1rem;
 }
 
+.toolbar-collapsed-progress {
+  display: grid;
+  gap: 0.14rem;
+  width: 100%;
+  padding: 0.08rem 0.2rem 0.12rem;
+}
+
+.toolbar-collapsed-progress.error .toolbar-status-title,
+.toolbar-collapsed-progress.error .toolbar-collapsed-progress-stage {
+  color: #9f2c2c;
+}
+
+.toolbar-collapsed-progress-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.45rem;
+}
+
+.toolbar-collapsed-progress-stage {
+  font-size: 0.72rem;
+  color: #5d7581;
+  line-height: 1.25;
+}
+
+.toolbar-collapsed-progress-meter {
+  height: 5px;
+}
+
 .toolbar-chevron-toggle {
   align-self: center;
   display: inline-flex;

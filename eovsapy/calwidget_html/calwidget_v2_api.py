@@ -48,6 +48,8 @@ from .calwidget_v2_analysis import (
 )
 from .calwidget_v2_plots import (
     TAB_NAMES,
+    _auto_quality_flagged_antennas,
+    _effective_disabled_antennas,
     export_model_bundle_entry,
     heatmap_payload,
     heatmap_plot_meta,
@@ -590,10 +592,8 @@ class WidgetSession:
         ref_id, refcal = self._editable_inband_refcal()
         ant = int(max(0, min(antenna, refcal.layout.nsolant - 1)))
         refcal.delay_solution.manual_ant_flag_override[ant] = bool(flagged)
-        yx_rms = np.asarray(refcal.raw.get("yx_residual_rms", np.full(refcal.layout.nsolant, np.nan)), dtype=float)
-        auto_flagged = bool(
-            ant < yx_rms.size and np.isfinite(yx_rms[ant]) and float(yx_rms[ant]) > yx_residual_threshold(refcal)
-        )
+        auto_flagged_mask = _auto_quality_flagged_antennas(refcal)
+        auto_flagged = bool(ant < auto_flagged_mask.size and auto_flagged_mask[ant])
         refcal.delay_solution.manual_ant_keep_override[ant] = bool((not flagged) and auto_flagged)
         refresh_model_flag_state(refcal, antenna_indices=[ant])
         if refcal.raw:
@@ -761,11 +761,13 @@ class WidgetSession:
         self.selected_ant = ant
         self.status_message = "Applied residual-guided relative-phase suggestion for antenna {0:d}.".format(ant + 1)
 
-    def apply_residual_inband_fit(self, targets: Optional[List[InbandMaskTarget]] = None) -> None:
+    def apply_residual_inband_fit(self, targets: Optional[List[InbandMaskTarget]] = None) -> List[int]:
         """Apply residual in-band delay suggestions for all antennas/pols.
 
         :param targets: Optional committed residual kept-band masks.
         :type targets: list[InbandMaskTarget] | None
+        :returns: Zero-based antenna indices whose active delays were refreshed.
+        :rtype: list[int]
         """
 
         ref_id, refcal = self._editable_inband_refcal()
@@ -779,24 +781,34 @@ class WidgetSession:
             refcal.raw.pop("overview_payload_cache", None)
             refcal.raw.pop("residual_diagnostics_cache", None)
         residual_mask_update_payloads(refcal)
+        disabled_antennas = _effective_disabled_antennas(refcal)
+        updated_ants = []
         for ant in range(refcal.layout.nsolant):
+            if ant < disabled_antennas.size and disabled_antennas[ant]:
+                continue
             meta = relative_delay_editor_meta(refcal, ant)
             x_suggest = float(meta.get("x_suggested_residual_inband_delay_ns", 0.0) or 0.0)
             y_suggest = float(meta.get("y_suggested_residual_inband_delay_ns", 0.0) or 0.0)
             refcal.delay_solution.active_ns[ant, 0] = float(refcal.delay_solution.active_ns[ant, 0] + x_suggest)
             refcal.delay_solution.active_ns[ant, 1] = float(refcal.delay_solution.active_ns[ant, 1] + y_suggest)
-        refresh_refcal_solution(
-            refcal,
-            antenna_indices=list(range(refcal.layout.nsolant)),
-            invalidate_legacy_summary=False,
-        )
+            updated_ants.append(int(ant))
+        if updated_ants:
+            refresh_refcal_solution(
+                refcal,
+                antenna_indices=updated_ants,
+                invalidate_legacy_summary=False,
+            )
         try:
             refcal.sidecar_path = write_sidecar(refcal)
         except Exception:
             pass
-        refcal.saved_to_sql = False
-        self._invalidate_dependent_phacals(ref_id)
-        self.status_message = "Applied residual in-band delay correction for all antennas."
+        if updated_ants:
+            refcal.saved_to_sql = False
+            self._invalidate_dependent_phacals(ref_id)
+            self.status_message = "Applied residual in-band delay correction for unflagged antennas."
+        else:
+            self.status_message = "No residual in-band correction was applied because all antennas are flagged."
+        return updated_ants
 
     def undo_relative_delay(self, antenna: int) -> None:
         """Undo the last applied relative-delay edit for one antenna.
@@ -1532,13 +1544,17 @@ def build_app() -> FastAPI:
 
         session = _get_session(payload.session_id)
         try:
-            session.apply_residual_inband_fit(payload.targets)
+            updated_antennas = session.apply_residual_inband_fit(payload.targets)
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         scan, _refcal = _overview_context(session)
         return {
             "state": session.state(),
-            "overview_updates": residual_inband_apply_payloads(scan, use_lobe=session.use_lobe),
+            "overview_updates": residual_inband_apply_payloads(
+                scan,
+                use_lobe=session.use_lobe,
+                antenna_indices=updated_antennas,
+            ),
         }
 
     @app.post("/api/inband/residual-threshold")

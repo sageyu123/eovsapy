@@ -1554,23 +1554,26 @@ def _masked_time_combined_channel_vis(
     time-resolved visibility cube each time a panel refreshes.
     """
 
-    vis = deepcopy(np.asarray(channel_vis[: layout.nsolant, :2], dtype=np.complex128))
+    source = np.asarray(channel_vis[: layout.nsolant, :2], dtype=np.complex128)
+    if not time_flag_groups:
+        return _safe_complex_nanmean(source, axis=3)
+    vis = np.array(source, dtype=np.complex128, copy=True)
     bands = np.asarray(channel_band, dtype=int)
     times = np.asarray(times_jd, dtype=np.float64)
-    if time_flag_groups:
-        for group in time_flag_groups:
-            start_jd, end_jd = _normalize_interval(group.start_jd, group.end_jd)
-            bad, = np.where(np.logical_and(times >= start_jd, times <= end_jd))
-            if bad.size == 0:
+    channel_index_by_band = {int(band): np.where(bands == int(band))[0] for band in np.unique(bands)}
+    for group in time_flag_groups:
+        start_jd, end_jd = _normalize_interval(group.start_jd, group.end_jd)
+        bad, = np.where(np.logical_and(times >= start_jd, times <= end_jd))
+        if bad.size == 0:
+            continue
+        for ant, band_idx in group.targets:
+            if ant < 0 or ant >= layout.nsolant or band_idx < 0 or band_idx >= layout.maxnbd:
                 continue
-            for ant, band_idx in group.targets:
-                if ant < 0 or ant >= layout.nsolant or band_idx < 0 or band_idx >= layout.maxnbd:
-                    continue
-                chan_idx, = np.where(bands == int(band_idx) + 1)
-                if chan_idx.size == 0:
-                    continue
-                for pol in range(min(vis.shape[1], 2)):
-                    vis[ant, pol, chan_idx[:, None], bad] = np.nan
+            chan_idx = channel_index_by_band.get(int(band_idx) + 1)
+            if chan_idx is None or chan_idx.size == 0:
+                continue
+            for pol in range(min(vis.shape[1], 2)):
+                vis[ant, pol, chan_idx[:, None], bad] = np.nan
     return _safe_complex_nanmean(vis, axis=3)
 
 

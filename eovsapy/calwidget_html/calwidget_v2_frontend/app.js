@@ -1173,6 +1173,7 @@
     const bandEdges = props.bandEdges || [];
     const width = PANEL_GRID_PANEL_WIDTH;
     const height = props.panelHeight || 128;
+    const showTitle = props.showTitle !== false;
     const showXAxisLabels = props.showXAxisLabels !== false;
     const margin = {
       left: 8,
@@ -1530,7 +1531,15 @@
                 className="band-window-drag-rect"
               />`
             : null}
-          <text x=${width / 2} y="13" textAnchor="middle" className="mini-panel-title">${panel.title || ""}</text>
+          ${showTitle && panel.title
+            ? html`<text
+                x=${width / 2}
+                y="2"
+                textAnchor="middle"
+                dominantBaseline="hanging"
+                className="mini-panel-title"
+              >${panel.title}</text>`
+            : null}
           ${panel.annotation
             ? html`<text x=${margin.left + 4} y=${margin.top + 12} className="mini-annotation">${panel.annotation}</text>`
             : null}
@@ -1732,6 +1741,7 @@
                         return html`<${MiniPanelPlot}
                           key=${"panel-" + rowIdx + "-" + panelIdx}
                           panel=${displayPanel}
+                          showTitle=${rowIdx === 0}
                           xLimits=${rowXLimits(rowIdx)}
                           xTicks=${data.x_ticks}
                           yLimits=${data.y_limits[rowIdx]}
@@ -2990,6 +3000,23 @@
         if (!pendingProgressLoad) {
           return;
         }
+        const loadedCount = [
+          heatmapLoadedRevision >= pendingProgressLoad.revision,
+          timeHistoryLoadedRevision >= pendingProgressLoad.revision,
+          overviewLoadedRevision >= pendingProgressLoad.revision,
+        ].filter(Boolean).length;
+        setActivity(function (current) {
+          if (!current || current.kind !== pendingProgressLoad.kind) {
+            return current;
+          }
+          const progress = loadedCount >= 3 ? current.progress : 94 + loadedCount * 2;
+          return Object.assign({}, current, {
+            progress: Math.max(current.progress, progress),
+            stage: loadedCount > 0 && loadedCount < 3
+              ? "Loading plots and refreshed products (" + String(loadedCount) + "/3)"
+              : current.stage,
+          });
+        });
         if (
           heatmapLoadedRevision < pendingProgressLoad.revision ||
           timeHistoryLoadedRevision < pendingProgressLoad.revision ||
@@ -4171,7 +4198,23 @@
       <div className="app-shell" ref=${shellRef}>
         <section className=${"toolbar panel" + (toolbarCollapsed ? " toolbar-collapsed" : "")} ref=${toolbarRef}>
           ${toolbarCollapsed
-            ? null
+            ? activity
+              ? html`
+                  <div className=${"toolbar-collapsed-progress" + (activity.error ? " error" : "")}>
+                    <div className="toolbar-collapsed-progress-top">
+                      <span className="toolbar-status-title">${activity.title}</span>
+                      <span className="toolbar-status-percent">${Math.max(0, Math.min(100, Math.round(activity.progress)))}%</span>
+                    </div>
+                    <div className="toolbar-collapsed-progress-stage">${activity.stage}</div>
+                    <div className="activity-meter toolbar-collapsed-progress-meter">
+                      <div
+                        className="activity-meter-fill"
+                        style=${{ width: Math.max(4, Math.min(100, activity.progress)) + "%" }}
+                      ></div>
+                    </div>
+                  </div>
+                `
+              : null
             : html`<div className="toolbar-main">
             <div className="toolbar-column toolbar-left-column">
               <div className="toolbar-controls-row">

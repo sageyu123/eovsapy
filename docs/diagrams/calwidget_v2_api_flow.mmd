@@ -1,0 +1,34 @@
+flowchart TD
+    A[Browser UI actions] --> B[app.js request helper]
+    B --> C{Request type}
+
+    C -->|Initial load| D[GET /api/state]
+    C -->|Initial load| E[GET /api/plot/heatmap-data]
+    C -->|Initial load| F[GET /api/plot/time-history]
+    C -->|Initial load| G[GET /api/plot/overview-data]
+
+    C -->|Per-antenna edit| H[POST update endpoint]
+    C -->|Threshold edit| I[POST threshold endpoint]
+    C -->|Time mask apply| J[POST time-flag batch endpoint]
+    C -->|Residual apply| K[POST /api/inband/apply-residual-fit]
+
+    H --> L[calwidget_v2_api.py]
+    I --> L
+    J --> L
+    K --> L
+
+    L --> M{Payload builder}
+
+    M -->|Full wall| N[overview_payloads]
+    M -->|Sparse overview patch| O[inband_delay_update_payloads / relative_delay_update_payloads / inband_window_update_payloads]
+    M -->|Residual patch| P[residual_mask_update_payloads / residual_inband_apply_payloads]
+    M -->|Time-mask patch| Q[time_flag_update_payloads]
+    M -->|Heatmap| R[heatmap_payload]
+    M -->|Time history| S[legacy_time_history_payload]
+
+    N --> T[Browser replaces overview data]
+    O --> U[Browser merges overview_updates]
+    P --> U
+    Q --> U
+    R --> V[Browser replaces heatmap data]
+    S --> W[Browser replaces time-history data]
