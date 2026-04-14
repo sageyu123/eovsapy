@@ -457,6 +457,54 @@ class TimeFlagGroup:
 
 
 @dataclass
+class PhacalSolveState:
+    """Per-phacal multiband delay and phase-offset editor state."""
+
+    auto_delay_ns: np.ndarray
+    auto_offset_rad: np.ndarray
+    suggested_delay_ns: np.ndarray
+    suggested_offset_rad: np.ndarray
+    applied_delay_ns: np.ndarray
+    applied_offset_rad: np.ndarray
+    prev_delay_ns: np.ndarray
+    prev_offset_rad: np.ndarray
+    prev_valid: np.ndarray
+    manual_skip_override: np.ndarray
+    fallback_used: np.ndarray
+    missing_in_phacal: np.ndarray
+    missing_in_refcal: np.ndarray
+
+    def snapshot_ant(self, ant: int) -> None:
+        """Store one-step undo state for one antenna.
+
+        :param ant: Zero-based antenna index.
+        :type ant: int
+        """
+
+        ant_i = int(ant)
+        self.prev_delay_ns[ant_i, :] = self.applied_delay_ns[ant_i, :]
+        self.prev_offset_rad[ant_i, :] = self.applied_offset_rad[ant_i, :]
+        self.prev_valid[ant_i] = True
+
+    def undo_ant(self, ant: int) -> bool:
+        """Restore one antenna's previously applied phacal correction.
+
+        :param ant: Zero-based antenna index.
+        :type ant: int
+        :returns: ``True`` when an undo snapshot was available.
+        :rtype: bool
+        """
+
+        ant_i = int(ant)
+        if not bool(self.prev_valid[ant_i]):
+            return False
+        self.applied_delay_ns[ant_i, :] = self.prev_delay_ns[ant_i, :]
+        self.applied_offset_rad[ant_i, :] = self.prev_offset_rad[ant_i, :]
+        self.prev_valid[ant_i] = False
+        return True
+
+
+@dataclass
 class ScanAnalysis:
     """In-memory state for one analyzed scan."""
 
@@ -484,6 +532,7 @@ class ScanAnalysis:
     mbd_flag: Optional[np.ndarray] = None
     offsets: Optional[np.ndarray] = None
     pdiff: Optional[np.ndarray] = None
+    phacal_state: Optional[PhacalSolveState] = None
     applied_ref_id: Optional[int] = None
     saved_to_sql: bool = False
     sidecar_path: Optional[str] = None
@@ -636,6 +685,98 @@ def residual_band_threshold(scan: Optional[ScanAnalysis] = None) -> float:
     except (TypeError, ValueError):
         threshold = float(RESIDUAL_BAND_THRESHOLD_RAD)
     return max(threshold, 0.0)
+
+
+def ensure_phacal_solve_state(scan: ScanAnalysis) -> PhacalSolveState:
+    """Return mutable phacal solve/editor state, creating defaults if needed.
+
+    :param scan: Analyzed phacal scan.
+    :type scan: ScanAnalysis
+    :returns: Mutable phacal solve state.
+    :rtype: PhacalSolveState
+    """
+
+    if scan.scan_kind != "phacal":
+        raise CalWidgetV2Error("Phacal solve state is only available for phacal scans.")
+    existing = scan.phacal_state
+    shape = (scan.layout.nsolant, 2)
+    ant_shape = (scan.layout.nsolant,)
+    if (
+        existing is not None
+        and np.asarray(existing.auto_delay_ns).shape == shape
+        and np.asarray(existing.auto_offset_rad).shape == shape
+    ):
+        return existing
+    scan.phacal_state = PhacalSolveState(
+        auto_delay_ns=np.zeros(shape, dtype=np.float64),
+        auto_offset_rad=np.zeros(shape, dtype=np.float64),
+        suggested_delay_ns=np.zeros(shape, dtype=np.float64),
+        suggested_offset_rad=np.zeros(shape, dtype=np.float64),
+        applied_delay_ns=np.zeros(shape, dtype=np.float64),
+        applied_offset_rad=np.zeros(shape, dtype=np.float64),
+        prev_delay_ns=np.zeros(shape, dtype=np.float64),
+        prev_offset_rad=np.zeros(shape, dtype=np.float64),
+        prev_valid=np.zeros(ant_shape, dtype=bool),
+        manual_skip_override=np.zeros(ant_shape, dtype=bool),
+        fallback_used=np.zeros(ant_shape, dtype=bool),
+        missing_in_phacal=np.zeros(ant_shape, dtype=bool),
+        missing_in_refcal=np.zeros(ant_shape, dtype=bool),
+    )
+    return scan.phacal_state
+
+
+def phacal_effective_disabled_antennas(scan: ScanAnalysis) -> np.ndarray:
+    """Return phacal antennas skipped by internal-only v2 processing.
+
+    :param scan: Analyzed phacal scan.
+    :type scan: ScanAnalysis
+    :returns: Boolean skip mask for displayed antennas.
+    :rtype: np.ndarray
+    """
+
+    if scan.scan_kind != "phacal":
+        return np.zeros(scan.layout.nsolant, dtype=bool)
+    state = ensure_phacal_solve_state(scan)
+    return np.asarray(state.manual_skip_override | state.missing_in_phacal, dtype=bool)
+
+
+def _valid_complex_mask(values: np.ndarray) -> np.ndarray:
+    """Return finite non-zero complex samples.
+
+    :param values: Complex array.
+    :type values: np.ndarray
+    :returns: Boolean validity mask.
+    :rtype: np.ndarray
+    """
+
+    arr = np.asarray(values, dtype=np.complex128)
+    return np.isfinite(arr.real) & np.isfinite(arr.imag) & (np.abs(arr) > 0.0)
+
+
+def _phacal_effective_delay_offset(
+    scan: ScanAnalysis,
+    ant: int,
+    pol: int,
+) -> Tuple[float, float]:
+    """Return one phacal antenna/polarization effective delay and offset.
+
+    :param scan: Analyzed phacal scan.
+    :type scan: ScanAnalysis
+    :param ant: Zero-based displayed antenna index.
+    :type ant: int
+    :param pol: Zero-based polarization index.
+    :type pol: int
+    :returns: Effective delay in ns and phase offset in radians.
+    :rtype: tuple[float, float]
+    """
+
+    state = ensure_phacal_solve_state(scan)
+    ant_i = int(ant)
+    pol_i = int(pol)
+    return (
+        float(state.auto_delay_ns[ant_i, pol_i] + state.applied_delay_ns[ant_i, pol_i]),
+        float(state.auto_offset_rad[ant_i, pol_i] + state.applied_offset_rad[ant_i, pol_i]),
+    )
 
 
 def _apply_effective_refcal_flags(scan: ScanAnalysis, antenna_indices: Optional[Sequence[int]] = None) -> None:
@@ -2234,10 +2375,195 @@ def refresh_phacal_solution(scan: ScanAnalysis, refcal: ScanAnalysis) -> None:
     scan.band_to_full_index = _band_index_map(used_band_ids)
     scan.tflags = tflags
     _phase_diff(scan, refcal)
+    _solve_phacal_against_anchor(scan, refcal)
     if scan.raw:
         scan.raw.pop("overview_payload_cache", None)
         scan.raw.pop("residual_diagnostics_cache", None)
         scan.raw.pop("combined_channel_vis_cache", None)
+
+
+def _refcal_band_flag_cube(refcal: ScanAnalysis, layout: LayoutInfo) -> np.ndarray:
+    """Return refcal-driven band flags for phacal save compatibility.
+
+    :param refcal: Anchor refcal analysis.
+    :type refcal: ScanAnalysis
+    :param layout: Layout metadata for the phacal scan.
+    :type layout: LayoutInfo
+    :returns: Integer refcal flag cube matching the phacal display shape.
+    :rtype: np.ndarray
+    """
+
+    out = np.zeros((layout.nant, 2, layout.maxnbd), dtype=np.int32)
+    source = np.asarray(refcal.flags[:, :2], dtype=np.int32)
+    ants = min(out.shape[0], source.shape[0])
+    bands = min(out.shape[2], source.shape[2])
+    out[:ants, :, :bands] = source[:ants, :, :bands]
+    if bands < out.shape[2]:
+        out[:, :, bands:] = 1
+    return out
+
+
+def _zero_phacal_saved_solution(phacal: ScanAnalysis) -> None:
+    """Reset saved phacal delay/offset products to zero.
+
+    :param phacal: Phasecal scan to update.
+    :type phacal: ScanAnalysis
+    """
+
+    phacal.mbd = np.zeros((phacal.layout.nant, 2), dtype=np.float64)
+    phacal.offsets = np.zeros((phacal.layout.nant, 2), dtype=np.float64)
+    phacal.mbd_flag = np.zeros((phacal.layout.nant, 2), dtype=np.float64)
+
+
+def sync_phacal_saved_products(phacal: ScanAnalysis, refcal: ScanAnalysis) -> None:
+    """Sync saved phacal delay/offset arrays from current phacal editor state.
+
+    :param phacal: Phasecal analysis to update.
+    :type phacal: ScanAnalysis
+    :param refcal: Anchor refcal analysis used for legacy-compatible flags.
+    :type refcal: ScanAnalysis
+    """
+
+    state = ensure_phacal_solve_state(phacal)
+    _zero_phacal_saved_solution(phacal)
+    ref_flag_cube = _refcal_band_flag_cube(refcal, phacal.layout)
+    phacal.flags[:, :2] = ref_flag_cube[:, :2]
+    ref_band_keep = np.any(ref_flag_cube[: phacal.layout.nant, :2] == 0, axis=2)
+    phacal.mbd_flag = np.where(ref_band_keep, 0.0, 1.0)
+    if phacal.delay_solution is not None:
+        phacal.delay_solution.relative_auto_ns[: phacal.layout.nsolant, :] = np.asarray(state.auto_delay_ns, dtype=np.float64)
+        phacal.delay_solution.relative_suggested_ns[: phacal.layout.nsolant, :] = np.asarray(state.suggested_delay_ns, dtype=np.float64)
+        phacal.delay_solution.relative_ns[: phacal.layout.nsolant, :] = np.asarray(state.applied_delay_ns, dtype=np.float64)
+    for ant in range(phacal.layout.nsolant):
+        if state.missing_in_phacal[ant]:
+            continue
+        for pol in range(2):
+            phacal.mbd[ant, pol] = float(state.auto_delay_ns[ant, pol] + state.applied_delay_ns[ant, pol])
+            phacal.offsets[ant, pol] = float(state.auto_offset_rad[ant, pol] + state.applied_offset_rad[ant, pol])
+
+
+def _solve_phacal_against_anchor(phacal: ScanAnalysis, refcal: ScanAnalysis) -> None:
+    """Solve one phacal against the tuned anchor refcal on fine channels.
+
+    The saved phacal model uses one shared multiband delay baseline per
+    antenna, duplicated across X/Y for legacy ``pslope`` compatibility, and
+    one constant phase offset per polarization. Any manual phacal skip state is
+    internal to the browser and does not alter the saved SQL flag arrays.
+
+    :param phacal: Phasecal analysis to update.
+    :type phacal: ScanAnalysis
+    :param refcal: Anchor refcal analysis used as the model reference.
+    :type refcal: ScanAnalysis
+    """
+
+    state = ensure_phacal_solve_state(phacal)
+    _zero_phacal_saved_solution(phacal)
+    if not phacal.raw or not refcal.raw:
+        return
+    freq_ghz = np.asarray(phacal.raw["channel_freq_ghz"], dtype=np.float64)
+    freq_hz = freq_ghz * 1e9
+    channel_band = np.asarray(phacal.raw.get("channel_band", np.zeros(freq_ghz.shape, dtype=int)), dtype=int)
+    phacal_avg = _safe_complex_nanmean(phacal.corrected_channel_vis[: phacal.layout.nsolant, :2], axis=3)
+    ref_avg = _safe_complex_nanmean(refcal.corrected_channel_vis[: refcal.layout.nsolant, :2], axis=3)
+    for ant in range(phacal.layout.nsolant):
+        ph_x = np.asarray(phacal_avg[ant, 0], dtype=np.complex128)
+        ph_y = np.asarray(phacal_avg[ant, 1], dtype=np.complex128)
+        ref_x = np.asarray(ref_avg[ant, 0], dtype=np.complex128)
+        ref_y = np.asarray(ref_avg[ant, 1], dtype=np.complex128)
+        ph_valid_x = _valid_complex_mask(ph_x)
+        ph_valid_y = _valid_complex_mask(ph_y)
+        ref_valid_x = _valid_complex_mask(ref_x)
+        ref_valid_y = _valid_complex_mask(ref_y)
+        missing_in_phacal = not (np.any(ph_valid_x) and np.any(ph_valid_y))
+        missing_in_refcal = not (np.any(ref_valid_x) and np.any(ref_valid_y))
+        state.missing_in_phacal[ant] = bool(missing_in_phacal)
+        state.missing_in_refcal[ant] = bool((not missing_in_phacal) and missing_in_refcal)
+        state.fallback_used[ant] = bool((not missing_in_phacal) and missing_in_refcal)
+        if missing_in_phacal:
+            state.auto_delay_ns[ant, :] = 0.0
+            state.auto_offset_rad[ant, :] = 0.0
+            state.suggested_delay_ns[ant, :] = 0.0
+            state.suggested_offset_rad[ant, :] = 0.0
+            continue
+
+        base_vis = []
+        base_masks = []
+        for pol, (ph_vis, ref_vis, ph_valid, ref_valid) in enumerate(
+            (
+                (ph_x, ref_x, ph_valid_x, ref_valid_x),
+                (ph_y, ref_y, ph_valid_y, ref_valid_y),
+            )
+        ):
+            kept_band_mask = (
+                phacal.delay_solution.included_band_mask(ant, pol)
+                if phacal.delay_solution is not None
+                else np.ones(0, dtype=bool)
+            )
+            kept_bands = (
+                np.asarray(phacal.delay_solution.band_values, dtype=int)[kept_band_mask]
+                if phacal.delay_solution is not None and phacal.delay_solution.band_values.size == kept_band_mask.size
+                else np.asarray([], dtype=int)
+            )
+            keep_channels = (
+                np.isin(channel_band, kept_bands)
+                if kept_bands.size
+                else np.zeros(channel_band.shape, dtype=bool)
+            )
+            if missing_in_refcal:
+                vis = np.asarray(ph_vis, dtype=np.complex128)
+                valid = np.asarray(ph_valid & keep_channels, dtype=bool)
+            else:
+                valid = np.asarray(ph_valid & ref_valid & keep_channels, dtype=bool)
+                vis = np.divide(
+                    np.asarray(ph_vis, dtype=np.complex128),
+                    np.asarray(ref_vis, dtype=np.complex128),
+                    out=np.full(ph_vis.shape, np.nan + 0j, dtype=np.complex128),
+                    where=valid,
+                )
+            base_vis.append(vis)
+            base_masks.append(valid)
+
+        delay_estimates_ns: List[float] = []
+        delay_weights: List[float] = []
+        for pol in range(2):
+            valid = np.asarray(base_masks[pol], dtype=bool)
+            if np.count_nonzero(valid) < 3:
+                continue
+            solved = solve_residual_delay_phi0(freq_hz[valid], np.asarray(base_vis[pol][valid], dtype=np.complex128))
+            if np.isfinite(solved["dly_res_s"]):
+                delay_estimates_ns.append(float(solved["dly_res_s"]) * 1e9)
+                delay_weights.append(float(np.count_nonzero(valid)))
+        shared_delay_ns = 0.0
+        if delay_weights:
+            shared_delay_ns = float(
+                np.nansum(np.asarray(delay_estimates_ns, dtype=float) * np.asarray(delay_weights, dtype=float))
+                / np.nansum(np.asarray(delay_weights, dtype=float))
+            )
+
+        for pol in range(2):
+            valid = np.asarray(base_masks[pol], dtype=bool)
+            vis = np.asarray(base_vis[pol], dtype=np.complex128)
+            state.auto_delay_ns[ant, pol] = shared_delay_ns
+            if np.count_nonzero(valid) < 3:
+                state.auto_offset_rad[ant, pol] = 0.0
+                state.suggested_delay_ns[ant, pol] = 0.0
+                state.suggested_offset_rad[ant, pol] = 0.0
+                continue
+            base_rot = vis[valid] * np.exp(-1j * 2.0 * np.pi * freq_hz[valid] * shared_delay_ns * 1e-9)
+            offset_rad = float(np.angle(np.nanmean(base_rot))) if np.any(_valid_complex_mask(base_rot)) else 0.0
+            state.auto_offset_rad[ant, pol] = offset_rad
+            eff_delay_ns, eff_offset_rad = _phacal_effective_delay_offset(phacal, ant, pol)
+            residual_rot = vis[valid] * np.exp(
+                -1j * (2.0 * np.pi * freq_hz[valid] * eff_delay_ns * 1e-9 + eff_offset_rad)
+            )
+            residual_fit = solve_residual_delay_phi0(freq_hz[valid], residual_rot)
+            state.suggested_delay_ns[ant, pol] = (
+                float(residual_fit["dly_res_s"]) * 1e9 if np.isfinite(residual_fit["dly_res_s"]) else 0.0
+            )
+            state.suggested_offset_rad[ant, pol] = (
+                float(residual_fit["phi0_rad"]) if np.isfinite(residual_fit["phi0_rad"]) else 0.0
+            )
+    sync_phacal_saved_products(phacal, refcal)
 
 
 def _phase_diff(phacal: ScanAnalysis, refcal: ScanAnalysis) -> None:
@@ -2255,7 +2581,7 @@ def _phase_diff(phacal: ScanAnalysis, refcal: ScanAnalysis) -> None:
     if phacal.fghz_band.size != refcal.fghz_band.size:
         raise CalWidgetV2Error("Phasecal and refcal have different band definitions.")
     dpha = np.angle(phacal.corrected_band_vis[:, :2]) - np.angle(refcal.corrected_band_vis[:, :2])
-    flags = np.logical_or(phacal.flags[:, :2], refcal.flags[:, :2]).astype(np.int32)
+    flags = _refcal_band_flag_cube(refcal, phacal.layout)[:, :2]
     amp_pc = np.abs(phacal.corrected_band_vis[:, :2])
     amp_rc = np.abs(refcal.corrected_band_vis[:, :2])
     sigma = np.sqrt(
@@ -2264,25 +2590,54 @@ def _phase_diff(phacal: ScanAnalysis, refcal: ScanAnalysis) -> None:
     )
     slopes = np.zeros((phacal.layout.nant, 2), np.float64)
     offsets = np.zeros((phacal.layout.nant, 2), np.float64)
-    flag = np.ones((phacal.layout.nant, 2), np.float64)
+    flag = np.where(np.any(flags == 0, axis=2), 0.0, 1.0)
     for ant in range(phacal.layout.nsolant):
         for pol in range(2):
-            good, = np.where(flags[ant, pol] == 0)
-            if good.size <= 3:
+            phase_band = np.asarray(dpha[ant, pol], dtype=np.float64)
+            sigma_band = np.asarray(sigma[ant, pol], dtype=np.float64)
+            good = (
+                (flags[ant, pol] == 0)
+                & np.isfinite(phacal.fghz_band)
+                & np.isfinite(phase_band)
+                & np.isfinite(sigma_band)
+            )
+            good_idx, = np.where(good)
+            if good_idx.size <= 3:
                 continue
-            x = phacal.fghz_band[good]
-            t0 = coarse_delay(x, dpha[ant, pol, good])
-            y = np.unwrap(lobe(dpha[ant, pol, good] - 2.0 * np.pi * t0 * x))
+            x = np.asarray(phacal.fghz_band[good_idx], dtype=np.float64)
+            phase_fit = np.asarray(lobe(phase_band[good_idx]), dtype=np.float64)
+            sigma_fit = sigma_band[good_idx]
+            finite = np.isfinite(x) & np.isfinite(phase_fit) & np.isfinite(sigma_fit)
+            if np.count_nonzero(finite) <= 3:
+                continue
+            x = x[finite]
+            phase_fit = phase_fit[finite]
+            sigma_fit = sigma_fit[finite]
+            valid_sigma = sigma_fit > 0
+            if np.any(valid_sigma):
+                sigma_fill = float(np.nanmedian(sigma_fit[valid_sigma]))
+                sigma_fit = np.where(valid_sigma, sigma_fit, sigma_fill)
+            else:
+                sigma_fit = np.ones_like(sigma_fit)
+            t0 = coarse_delay(x, phase_fit)
+            if not np.isfinite(t0):
+                continue
+            y = np.unwrap(lobe(phase_fit - 2.0 * np.pi * t0 * x))
+            finite = np.isfinite(y) & np.isfinite(sigma_fit)
+            if np.count_nonzero(finite) <= 3:
+                continue
+            x = x[finite]
+            y = y[finite]
+            sigma_fit = sigma_fit[finite]
             fit, _pcov = curve_fit(
                 mbdfunc0,
                 x,
                 y,
                 p0=[0.0],
-                sigma=sigma[ant, pol, good],
+                sigma=sigma_fit,
                 absolute_sigma=False,
             )
             slopes[ant, pol] = fit[0] + t0
-            flag[ant, pol] = 0.0
     phacal.mbd = slopes
     phacal.mbd_flag = flag
     phacal.offsets = offsets
@@ -2348,11 +2703,20 @@ def analyze_phacal_input(
         bands_band=used_band_ids,
         band_to_full_index=_band_index_map(used_band_ids),
         base_flags=np.asarray(flags, dtype=np.int32).copy(),
-        delay_solution=refcal.delay_solution,
+        delay_solution=deepcopy(refcal.delay_solution),
         tflags=tflags,
         applied_ref_id=refcal.scan_id,
     )
+    if phacal.delay_solution is not None:
+        phacal.delay_solution.relative_ns[:] = 0.0
+        phacal.delay_solution.relative_auto_ns[:] = 0.0
+        phacal.delay_solution.relative_suggested_ns[:] = 0.0
+        phacal.delay_solution.relative_prev_ns[:] = 0.0
+        phacal.delay_solution.relative_prev_valid[:] = False
+        phacal.delay_solution.manual_ant_flag_override[:] = False
+        phacal.delay_solution.manual_ant_keep_override[:] = False
     _phase_diff(phacal, refcal)
+    _solve_phacal_against_anchor(phacal, refcal)
     return phacal
 
 

@@ -20,6 +20,7 @@ import uvicorn
 from eovsapy.util import Time
 
 from .calwidget_v2_analysis import (
+    _solve_phacal_against_anchor,
     CalWidgetV2Error,
     SIDECAR_DIR,
     ScanAnalysis,
@@ -43,6 +44,7 @@ from .calwidget_v2_analysis import (
     sql2refcalX,
     sql_phacal_to_scan,
     sql_refcal_to_scan,
+    ensure_phacal_solve_state,
     write_sidecar,
     yx_residual_threshold,
 )
@@ -53,12 +55,20 @@ from .calwidget_v2_plots import (
     export_model_bundle_entry,
     heatmap_payload,
     heatmap_plot_meta,
+    inband_fit_payload,
     inband_delay_update_payloads,
+    inband_relative_phase_payload,
+    inband_residual_phase_band_payload,
     residual_inband_apply_payloads,
     residual_mask_update_payloads,
     relative_delay_update_payloads,
     inband_window_update_payloads,
     overview_payloads,
+    phacal_anchor_phase_payload,
+    phacal_delay_editor_meta,
+    phacal_multiband_residual_payload,
+    phacal_per_band_residual_payload,
+    phacal_residual_inband_suggestions,
     refresh_model_flag_state,
     relative_delay_editor_meta,
     render_heatmap,
@@ -122,6 +132,16 @@ class UpdateRelativeDelayRequest(SessionRequest):
     antenna: int
     x_delay_ns: Optional[float] = None
     y_delay_ns: Optional[float] = None
+
+
+class UpdatePhacalSolveRequest(SessionRequest):
+    """Update one phacal antenna's manual delay/offset corrections."""
+
+    antenna: int
+    x_delay_ns: Optional[float] = None
+    y_delay_ns: Optional[float] = None
+    x_offset_rad: Optional[float] = None
+    y_offset_rad: Optional[float] = None
 
 
 class RelativeDelayAntennaRequest(SessionRequest):
@@ -225,6 +245,13 @@ class ResidualInbandFitRequest(SessionRequest):
     targets: List[InbandMaskTarget] = []
 
 
+class SectionMaskPreviewRequest(SessionRequest):
+    """Preview one masked section without committing state."""
+
+    section_id: str
+    targets: List[InbandMaskTarget] = []
+
+
 class TimeFlagAddRequest(SessionRequest):
     """Add one browser-native time-flag interval group."""
 
@@ -270,6 +297,7 @@ class WidgetSession:
     status_message: str = "Ready."
     fix_drift: bool = True
     use_lobe: bool = True
+    residual_panel_history: List[Dict] = field(default_factory=list)
 
     def load_date(self, date_text: str) -> None:
         """Load the scan list for one day and reset the working set."""
@@ -501,6 +529,236 @@ class WidgetSession:
         entry["status"] = "phacal"
         self.selected_scan_id = scan_id
         self.status_message = "Analyzed phacal {0} against refcal {1}.".format(scan_id, self.ref_scan_id)
+
+    def _editable_phacal_scan(self) -> tuple[int, ScanAnalysis, ScanAnalysis]:
+        """Return the selected analyzed phacal and its active anchor refcal."""
+
+        if self.selected_scan_id is None or self.selected_scan_id not in self.analyses:
+            raise CalWidgetV2Error("Analyze a phacal before editing phasecal solve values.")
+        scan = self.analyses[int(self.selected_scan_id)]
+        if scan.scan_kind != "phacal":
+            raise CalWidgetV2Error("Select an analyzed phacal to edit phasecal solve values.")
+        ref_id_value = scan.applied_ref_id if scan.applied_ref_id is not None else self.ref_scan_id
+        if ref_id_value is None:
+            raise CalWidgetV2Error("An active anchor refcal is required for phacal editing.")
+        ref_id = int(ref_id_value)
+        refcal = self._ensure_refcal_analysis(ref_id)
+        ensure_phacal_solve_state(scan)
+        return int(scan.scan_id), scan, refcal
+
+    def update_phacal_solve(
+        self,
+        antenna: int,
+        x_delay_ns: Optional[float],
+        y_delay_ns: Optional[float],
+        x_offset_rad: Optional[float],
+        y_offset_rad: Optional[float],
+    ) -> None:
+        """Apply one phacal antenna's manual delay/offset correction."""
+
+        _scan_id, scan, refcal = self._editable_phacal_scan()
+        ant = int(max(0, min(int(antenna), scan.layout.nsolant - 1)))
+        state = ensure_phacal_solve_state(scan)
+        state.snapshot_ant(ant)
+        if x_delay_ns is not None:
+            state.applied_delay_ns[ant, 0] = float(x_delay_ns)
+        if y_delay_ns is not None:
+            state.applied_delay_ns[ant, 1] = float(y_delay_ns)
+        if x_offset_rad is not None:
+            state.applied_offset_rad[ant, 0] = float(x_offset_rad)
+        if y_offset_rad is not None:
+            state.applied_offset_rad[ant, 1] = float(y_offset_rad)
+        _solve_phacal_against_anchor(scan, refcal)
+        if scan.raw:
+            scan.raw.pop("overview_payload_cache", None)
+            scan.raw.pop("residual_diagnostics_cache", None)
+        scan.saved_to_sql = False
+        self.selected_ant = ant
+        self.status_message = "Updated phacal multiband solve values for antenna {0:d}.".format(ant + 1)
+
+    def apply_phacal_suggestion(self, antenna: int) -> None:
+        """Apply one phacal antenna's current suggested correction."""
+
+        _scan_id, scan, refcal = self._editable_phacal_scan()
+        ant = int(max(0, min(int(antenna), scan.layout.nsolant - 1)))
+        state = ensure_phacal_solve_state(scan)
+        meta = phacal_delay_editor_meta(scan, refcal, ant)
+        state.snapshot_ant(ant)
+        state.applied_delay_ns[ant, 0] = float(state.applied_delay_ns[ant, 0] + float(meta.get("x_suggested_delay_ns", 0.0) or 0.0))
+        state.applied_delay_ns[ant, 1] = float(state.applied_delay_ns[ant, 1] + float(meta.get("y_suggested_delay_ns", 0.0) or 0.0))
+        state.applied_offset_rad[ant, 0] = float(state.applied_offset_rad[ant, 0] + float(meta.get("x_suggested_offset_rad", 0.0) or 0.0))
+        state.applied_offset_rad[ant, 1] = float(state.applied_offset_rad[ant, 1] + float(meta.get("y_suggested_offset_rad", 0.0) or 0.0))
+        _solve_phacal_against_anchor(scan, refcal)
+        if scan.raw:
+            scan.raw.pop("overview_payload_cache", None)
+            scan.raw.pop("residual_diagnostics_cache", None)
+        scan.saved_to_sql = False
+        self.selected_ant = ant
+        self.status_message = "Applied the phacal suggested correction for antenna {0:d}.".format(ant + 1)
+
+    def undo_phacal_solve(self, antenna: int) -> None:
+        """Undo the last applied phacal manual correction for one antenna."""
+
+        _scan_id, scan, refcal = self._editable_phacal_scan()
+        ant = int(max(0, min(int(antenna), scan.layout.nsolant - 1)))
+        state = ensure_phacal_solve_state(scan)
+        if not state.undo_ant(ant):
+            raise CalWidgetV2Error("No phacal manual correction is available to undo for this antenna.")
+        _solve_phacal_against_anchor(scan, refcal)
+        if scan.raw:
+            scan.raw.pop("overview_payload_cache", None)
+            scan.raw.pop("residual_diagnostics_cache", None)
+        scan.saved_to_sql = False
+        self.selected_ant = ant
+        self.status_message = "Undid the last phacal manual correction for antenna {0:d}.".format(ant + 1)
+
+    def reset_phacal_solve(self, antenna: int) -> None:
+        """Reset one phacal antenna back to the automatic multiband solve."""
+
+        _scan_id, scan, refcal = self._editable_phacal_scan()
+        ant = int(max(0, min(int(antenna), scan.layout.nsolant - 1)))
+        state = ensure_phacal_solve_state(scan)
+        state.snapshot_ant(ant)
+        state.applied_delay_ns[ant, :] = 0.0
+        state.applied_offset_rad[ant, :] = 0.0
+        _solve_phacal_against_anchor(scan, refcal)
+        if scan.raw:
+            scan.raw.pop("overview_payload_cache", None)
+            scan.raw.pop("residual_diagnostics_cache", None)
+        scan.saved_to_sql = False
+        self.selected_ant = ant
+        self.status_message = "Reset phacal manual corrections for antenna {0:d}.".format(ant + 1)
+
+    def set_phacal_manual_antenna_flag(self, antenna: int, flagged: bool) -> None:
+        """Update one phacal antenna's internal-only keep/skip state."""
+
+        _scan_id, scan, _refcal = self._editable_phacal_scan()
+        ant = int(max(0, min(int(antenna), scan.layout.nsolant - 1)))
+        state = ensure_phacal_solve_state(scan)
+        state.manual_skip_override[ant] = bool(flagged)
+        if scan.raw:
+            scan.raw.pop("overview_payload_cache", None)
+            scan.raw.pop("residual_diagnostics_cache", None)
+        self.selected_ant = ant
+        self.status_message = (
+            "Skipped phacal diagnostics for antenna {0:d}.".format(ant + 1)
+            if flagged
+            else "Restored phacal diagnostics for antenna {0:d}.".format(ant + 1)
+        )
+
+    def _preview_scan_pair(self) -> tuple[ScanAnalysis, Optional[ScanAnalysis]]:
+        """Return deep-copied scan/refcal objects for preview-only section recompute."""
+
+        current = self._current_result()
+        if current is None:
+            raise CalWidgetV2Error("Select an analyzed scan before previewing masked diagnostics.")
+        scan = deepcopy(current)
+        refcal = None
+        if scan.scan_kind == "phacal":
+            ref_id = scan.applied_ref_id if scan.applied_ref_id is not None else self.ref_scan_id
+            if ref_id is None:
+                raise CalWidgetV2Error("Active anchor refcal is required for phacal preview.")
+            refcal = deepcopy(self._ensure_refcal_analysis(int(ref_id)))
+        if scan.raw:
+            scan.raw.pop("overview_payload_cache", None)
+            scan.raw.pop("residual_diagnostics_cache", None)
+        if refcal is not None and refcal.raw:
+            refcal.raw.pop("overview_payload_cache", None)
+            refcal.raw.pop("residual_diagnostics_cache", None)
+        return scan, refcal
+
+    def preview_inband_mask_section(self, section_id: str, targets: List[InbandMaskTarget]) -> Dict[str, Dict]:
+        """Preview one kept-band-masked section without mutating session state."""
+
+        scan, refcal = self._preview_scan_pair()
+        if scan.delay_solution is None:
+            raise CalWidgetV2Error("No in-band solution is available for preview.")
+        changed_ants = set()
+        for target in targets:
+            ant = int(max(0, min(int(target.antenna), scan.layout.nsolant - 1)))
+            pol = int(max(0, min(int(target.polarization), 1)))
+            ranges = [(int(item.start_band), int(item.end_band)) for item in target.kept_ranges]
+            scan.delay_solution.set_kept_band_ranges(ant, pol, ranges)
+            changed_ants.add(ant)
+        sparse_antennas = sorted(changed_ants) if changed_ants else None
+        if scan.scan_kind == "phacal":
+            if refcal is None:
+                raise CalWidgetV2Error("Active anchor refcal is required for phacal preview.")
+            _solve_phacal_against_anchor(scan, refcal)
+            if section_id == "inband_relative_phase":
+                return {"inband_relative_phase": phacal_multiband_residual_payload(scan, refcal, antenna_indices=sparse_antennas)}
+            if section_id == "inband_fit":
+                return {"inband_fit": phacal_anchor_phase_payload(scan, refcal, antenna_indices=sparse_antennas)}
+            raise CalWidgetV2Error("Unsupported kept-mask preview section {0}.".format(section_id))
+        refresh_refcal_solution(scan, antenna_indices=sparse_antennas, invalidate_legacy_summary=False)
+        if section_id == "inband_fit":
+            return {"inband_fit": inband_fit_payload(scan)}
+        if section_id == "inband_relative_phase":
+            return {"inband_relative_phase": inband_relative_phase_payload(scan)}
+        raise CalWidgetV2Error("Unsupported kept-mask preview section {0}.".format(section_id))
+
+    def preview_residual_mask_section(self, targets: List[InbandMaskTarget]) -> Dict[str, Dict]:
+        """Preview the residual panel with staged residual masks only."""
+
+        scan, refcal = self._preview_scan_pair()
+        if scan.delay_solution is None:
+            raise CalWidgetV2Error("No in-band solution is available for residual preview.")
+        sparse_antennas = []
+        for target in targets:
+            ant = int(max(0, min(int(target.antenna), scan.layout.nsolant - 1)))
+            pol = int(max(0, min(int(target.polarization), 1)))
+            ranges = [(int(item.start_band), int(item.end_band)) for item in target.kept_ranges]
+            scan.delay_solution.set_residual_kept_band_ranges(ant, pol, ranges)
+            sparse_antennas.append(ant)
+        sparse_antennas = sorted(set(sparse_antennas)) or None
+        if scan.scan_kind == "phacal":
+            return {
+                "inband_residual_phase_band": phacal_per_band_residual_payload(scan, refcal, antenna_indices=sparse_antennas)
+            }
+        return {"inband_residual_phase_band": inband_residual_phase_band_payload(scan)}
+
+    def apply_residual_multiband_fit(self, antenna: int) -> List[int]:
+        """Apply the residual-panel multiband fit for one selected antenna."""
+
+        current = self._current_result()
+        if current is not None and current.scan_kind == "phacal":
+            _scan_id, scan, refcal = self._editable_phacal_scan()
+            ant = int(max(0, min(int(antenna), scan.layout.nsolant - 1)))
+            disabled = _effective_disabled_antennas(scan)
+            if ant < disabled.size and disabled[ant]:
+                raise CalWidgetV2Error("Selected phacal antenna is flagged or has no usable data.")
+            meta = phacal_delay_editor_meta(scan, refcal, ant)
+            if all(
+                abs(float(meta.get(key, 0.0) or 0.0)) <= 0.0
+                for key in (
+                    "x_suggested_delay_ns",
+                    "y_suggested_delay_ns",
+                    "x_suggested_offset_rad",
+                    "y_suggested_offset_rad",
+                )
+            ):
+                raise CalWidgetV2Error("Selected phacal antenna has no multiband suggestion to apply.")
+            self.apply_phacal_suggestion(ant)
+            self.residual_panel_history.append(
+                {"kind": "multiband", "scan_kind": "phacal", "scan_id": int(scan.scan_id), "antenna": int(ant)}
+            )
+            return [int(ant)]
+        _ref_id, refcal = self._editable_inband_refcal()
+        ant = int(max(0, min(int(antenna), refcal.layout.nsolant - 1)))
+        disabled = _effective_disabled_antennas(refcal)
+        if ant < disabled.size and disabled[ant]:
+            raise CalWidgetV2Error("Selected antenna is flagged or has no usable data.")
+        meta = relative_delay_editor_meta(refcal, ant)
+        if all(
+            abs(float(meta.get(key, 0.0) or 0.0)) <= 0.0
+            for key in ("x_suggested_relative_delay_ns", "y_suggested_relative_delay_ns")
+        ):
+            raise CalWidgetV2Error("Selected antenna has no multiband suggestion to apply.")
+        self.apply_relative_delay_suggestion(ant)
+        self.residual_panel_history.append(
+            {"kind": "multiband", "scan_kind": "refcal", "scan_id": int(refcal.scan_id), "antenna": int(ant)}
+        )
+        return [int(ant)]
 
     def select_antenna_band(self, antenna: Optional[int] = None, band: Optional[int] = None) -> None:
         """Update the selected antenna and/or band."""
@@ -770,6 +1028,60 @@ class WidgetSession:
         :rtype: list[int]
         """
 
+        current = self._current_result()
+        if current is not None and current.scan_kind == "phacal":
+            _scan_id, scan, refcal = self._editable_phacal_scan()
+            state = ensure_phacal_solve_state(scan)
+            if targets and scan.delay_solution is not None:
+                for target in targets:
+                    ant = int(max(0, min(int(target.antenna), scan.layout.nsolant - 1)))
+                    pol = int(max(0, min(int(target.polarization), 1)))
+                    ranges = [(int(item.start_band), int(item.end_band)) for item in target.kept_ranges]
+                    scan.delay_solution.set_residual_kept_band_ranges(ant, pol, ranges)
+            disabled_antennas = _effective_disabled_antennas(scan)
+            suggestions = phacal_residual_inband_suggestions(scan, refcal)
+            updated_ants = []
+            before_delay = np.asarray(state.applied_delay_ns, dtype=float).copy()
+            effective_delay = np.asarray(state.auto_delay_ns + state.applied_delay_ns, dtype=float)
+            for ant in range(scan.layout.nsolant):
+                if ant < disabled_antennas.size and disabled_antennas[ant]:
+                    continue
+                if np.allclose(effective_delay[ant], 0.0, atol=0.0):
+                    continue
+                ant_changed = False
+                for pol in range(2):
+                    suggestion = (
+                        float(suggestions[ant, pol])
+                        if suggestions.shape == (scan.layout.nsolant, 2) and np.isfinite(suggestions[ant, pol])
+                        else 0.0
+                    )
+                    if abs(suggestion) <= 0.0:
+                        continue
+                    state.applied_delay_ns[ant, pol] = float(state.applied_delay_ns[ant, pol] + suggestion)
+                    ant_changed = True
+                if ant_changed:
+                    updated_ants.append(int(ant))
+            if updated_ants:
+                self.residual_panel_history.append(
+                    {
+                        "kind": "inband_global",
+                        "scan_kind": "phacal",
+                        "scan_id": int(scan.scan_id),
+                        "antennas": [int(ant) for ant in updated_ants],
+                        "applied_delay_ns": before_delay,
+                    }
+                )
+            _solve_phacal_against_anchor(scan, refcal)
+            if scan.raw:
+                scan.raw.pop("overview_payload_cache", None)
+                scan.raw.pop("residual_diagnostics_cache", None)
+            scan.saved_to_sql = False
+            if updated_ants:
+                self.status_message = "Applied in-band residual fit for eligible phacal antennas."
+            else:
+                self.status_message = "No phacal in-band residual correction was applied."
+            return updated_ants
+
         ref_id, refcal = self._editable_inband_refcal()
         if targets:
             for target in targets:
@@ -783,16 +1095,41 @@ class WidgetSession:
         residual_mask_update_payloads(refcal)
         disabled_antennas = _effective_disabled_antennas(refcal)
         updated_ants = []
+        before_active = np.asarray(refcal.delay_solution.active_ns, dtype=float).copy()
         for ant in range(refcal.layout.nsolant):
             if ant < disabled_antennas.size and disabled_antennas[ant]:
                 continue
             meta = relative_delay_editor_meta(refcal, ant)
+            effective_relative = np.asarray(
+                [
+                    float(meta.get("x_effective_relative_delay_ns", 0.0) or 0.0),
+                    float(meta.get("y_effective_relative_delay_ns", 0.0) or 0.0),
+                ],
+                dtype=float,
+            )
+            if np.allclose(effective_relative, 0.0, atol=0.0):
+                continue
             x_suggest = float(meta.get("x_suggested_residual_inband_delay_ns", 0.0) or 0.0)
             y_suggest = float(meta.get("y_suggested_residual_inband_delay_ns", 0.0) or 0.0)
-            refcal.delay_solution.active_ns[ant, 0] = float(refcal.delay_solution.active_ns[ant, 0] + x_suggest)
-            refcal.delay_solution.active_ns[ant, 1] = float(refcal.delay_solution.active_ns[ant, 1] + y_suggest)
-            updated_ants.append(int(ant))
+            ant_changed = False
+            if abs(x_suggest) > 0.0:
+                refcal.delay_solution.active_ns[ant, 0] = float(refcal.delay_solution.active_ns[ant, 0] + x_suggest)
+                ant_changed = True
+            if abs(y_suggest) > 0.0:
+                refcal.delay_solution.active_ns[ant, 1] = float(refcal.delay_solution.active_ns[ant, 1] + y_suggest)
+                ant_changed = True
+            if ant_changed:
+                updated_ants.append(int(ant))
         if updated_ants:
+            self.residual_panel_history.append(
+                {
+                    "kind": "inband_global",
+                    "scan_kind": "refcal",
+                    "scan_id": int(refcal.scan_id),
+                    "antennas": [int(ant) for ant in updated_ants],
+                    "active_ns": before_active,
+                }
+            )
             refresh_refcal_solution(
                 refcal,
                 antenna_indices=updated_ants,
@@ -809,6 +1146,46 @@ class WidgetSession:
         else:
             self.status_message = "No residual in-band correction was applied because all antennas are flagged."
         return updated_ants
+
+    def undo_residual_panel_action(self) -> List[int]:
+        """Undo the most recent residual-panel apply action."""
+
+        if not self.residual_panel_history:
+            raise CalWidgetV2Error("No residual-panel action is available to undo.")
+        action = self.residual_panel_history.pop()
+        kind = str(action.get("kind", ""))
+        scan_kind = str(action.get("scan_kind", ""))
+        antenna = int(action.get("antenna", self.selected_ant))
+        if kind == "multiband":
+            if scan_kind == "phacal":
+                self.undo_phacal_solve(antenna)
+            else:
+                self.undo_relative_delay(antenna)
+            return [antenna]
+        if kind == "inband_global" and scan_kind == "phacal":
+            _scan_id, scan, refcal = self._editable_phacal_scan()
+            state = ensure_phacal_solve_state(scan)
+            state.applied_delay_ns[:, :] = np.asarray(action.get("applied_delay_ns", state.applied_delay_ns), dtype=float)
+            _solve_phacal_against_anchor(scan, refcal)
+            if scan.raw:
+                scan.raw.pop("overview_payload_cache", None)
+                scan.raw.pop("residual_diagnostics_cache", None)
+            self.status_message = "Undid the last phacal in-band residual apply action."
+            return [int(ant) for ant in action.get("antennas", [])]
+        if kind == "inband_global":
+            ref_id, refcal = self._editable_inband_refcal()
+            refcal.delay_solution.active_ns[:, :] = np.asarray(action.get("active_ns", refcal.delay_solution.active_ns), dtype=float)
+            changed = [int(ant) for ant in action.get("antennas", [])]
+            refresh_refcal_solution(
+                refcal,
+                antenna_indices=changed or None,
+                invalidate_legacy_summary=False,
+            )
+            refcal.saved_to_sql = False
+            self._invalidate_dependent_phacals(ref_id)
+            self.status_message = "Undid the last in-band residual apply action."
+            return changed
+        raise CalWidgetV2Error("Residual-panel undo does not recognize the last action.")
 
     def undo_relative_delay(self, antenna: int) -> None:
         """Undo the last applied relative-delay edit for one antenna.
@@ -933,6 +1310,26 @@ class WidgetSession:
         """
 
         if not targets:
+            return
+        current = self._current_result()
+        if current is not None and current.scan_kind == "phacal":
+            _scan_id, scan, refcal = self._editable_phacal_scan()
+            last_ant = self.selected_ant
+            changed_ants = set()
+            for target in targets:
+                ant = int(max(0, min(int(target.antenna), scan.layout.nsolant - 1)))
+                pol = int(max(0, min(int(target.polarization), 1)))
+                ranges = [(int(item.start_band), int(item.end_band)) for item in target.kept_ranges]
+                scan.delay_solution.set_kept_band_ranges(ant, pol, ranges)
+                changed_ants.add(ant)
+                last_ant = ant
+            _solve_phacal_against_anchor(scan, refcal)
+            if scan.raw:
+                scan.raw.pop("overview_payload_cache", None)
+                scan.raw.pop("residual_diagnostics_cache", None)
+            scan.saved_to_sql = False
+            self.selected_ant = last_ant
+            self.status_message = "Applied {0:d} staged phasecal masks.".format(len(targets))
             return
         ref_id, refcal = self._editable_inband_refcal()
         last_ant = self.selected_ant
@@ -1184,6 +1581,7 @@ class WidgetSession:
                 "sidecar_path": current.sidecar_path,
             }
         ref_meta = None
+        phacal_meta = None
         ref_scan_id = self.ref_scan_id
         refcal = None
         if ref_scan_id is not None:
@@ -1215,6 +1613,36 @@ class WidgetSession:
                 "y_window": None if refcal.delay_solution is None else list(refcal.delay_solution.band_window(self.selected_ant, 1)),
                 **editor_meta,
             }
+        if current is not None and current.scan_kind == "phacal":
+            phacal_ref_id = current.applied_ref_id if current.applied_ref_id is not None else ref_scan_id
+            phacal_ref = None
+            phacal_ref_entry = None
+            if phacal_ref_id is not None:
+                try:
+                    phacal_ref = self._ensure_refcal_analysis(int(phacal_ref_id))
+                except CalWidgetV2Error:
+                    phacal_ref = None
+                try:
+                    phacal_ref_entry = self._entry(int(phacal_ref_id))
+                except CalWidgetV2Error:
+                    phacal_ref_entry = None
+            editor_meta = phacal_delay_editor_meta(current, phacal_ref, self.selected_ant)
+            phacal_entry = None
+            try:
+                phacal_entry = self._entry(current.scan_id)
+            except CalWidgetV2Error:
+                phacal_entry = None
+            phacal_meta = {
+                "scan_id": int(current.scan_id),
+                "timestamp_iso": current.timestamp.iso[:19],
+                "scan_time": phacal_entry["scan_time"] if phacal_entry else current.t_bg.iso[11:19],
+                "source": current.source,
+                "anchor_scan_id": None if phacal_ref_id is None else int(phacal_ref_id),
+                "anchor_scan_time": None if phacal_ref is None else (phacal_ref_entry["scan_time"] if phacal_ref_entry else phacal_ref.t_bg.iso[11:19]),
+                "secondary_anchor_scan_id": None,
+                "secondary_anchor_scan_time": None,
+                **editor_meta,
+            }
         return {
             "session_id": self.session_id,
             "date": None if self.day is None else self.day["date"],
@@ -1230,6 +1658,8 @@ class WidgetSession:
             "heatmap_meta": heatmap_plot_meta(current),
             "current_scan": current_meta,
             "active_refcal": ref_meta,
+            "active_phacal": phacal_meta,
+            "residual_panel_undo_available": bool(self.residual_panel_history),
             "scan_metadata_warnings": sorted(
                 {
                     str(entry.get("metadata_warning", "")).strip()
@@ -1388,7 +1818,12 @@ def build_app() -> FastAPI:
             session.set_refcal(payload.scan_id)
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        return session.state()
+        response = {"state": session.state()}
+        current = session._current_result()
+        if current is not None and current.scan_kind == "phacal":
+            scan, refcal = _overview_context(session)
+            response["overview"] = overview_payloads(scan, refcal=refcal, use_lobe=session.use_lobe)
+        return response
 
     @app.post("/api/refcal/combine")
     def combine_refcal(payload: CombineRequest) -> Dict:
@@ -1429,10 +1864,15 @@ def build_app() -> FastAPI:
             touched_ants = session.add_time_flag(payload.start_jd, payload.end_jd, payload.scope)
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        scan = session._current_result()
+        scan, refcal = _overview_context(session)
         return {
             "state": session.state(),
-            "overview_updates": time_flag_update_payloads(scan, use_lobe=session.use_lobe, antenna_indices=touched_ants),
+            "overview_updates": time_flag_update_payloads(
+                scan,
+                use_lobe=session.use_lobe,
+                antenna_indices=touched_ants,
+                refcal=refcal,
+            ),
             "heatmap": heatmap_payload(
                 scan,
                 session.selected_ant,
@@ -1451,10 +1891,15 @@ def build_app() -> FastAPI:
             touched_ants = session.add_time_flags(payload.intervals)
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        scan = session._current_result()
+        scan, refcal = _overview_context(session)
         return {
             "state": session.state(),
-            "overview_updates": time_flag_update_payloads(scan, use_lobe=session.use_lobe, antenna_indices=touched_ants),
+            "overview_updates": time_flag_update_payloads(
+                scan,
+                use_lobe=session.use_lobe,
+                antenna_indices=touched_ants,
+                refcal=refcal,
+            ),
             "heatmap": heatmap_payload(
                 scan,
                 session.selected_ant,
@@ -1473,10 +1918,15 @@ def build_app() -> FastAPI:
             touched_ants = session.delete_time_flag(payload.group_id)
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        scan = session._current_result()
+        scan, refcal = _overview_context(session)
         return {
             "state": session.state(),
-            "overview_updates": time_flag_update_payloads(scan, use_lobe=session.use_lobe, antenna_indices=touched_ants),
+            "overview_updates": time_flag_update_payloads(
+                scan,
+                use_lobe=session.use_lobe,
+                antenna_indices=touched_ants,
+                refcal=refcal,
+            ),
             "heatmap": heatmap_payload(
                 scan,
                 session.selected_ant,
@@ -1518,7 +1968,29 @@ def build_app() -> FastAPI:
         scan, _refcal = _overview_context(session)
         return {
             "state": session.state(),
-            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna, refcal=_refcal),
+            "updated_antenna": int(max(0, payload.antenna)),
+        }
+
+    @app.post("/api/phacal/solve/update")
+    def update_phacal_solve(payload: UpdatePhacalSolveRequest) -> Dict:
+        """Apply one phacal manual delay/offset edit."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.update_phacal_solve(
+                payload.antenna,
+                payload.x_delay_ns,
+                payload.y_delay_ns,
+                payload.x_offset_rad,
+                payload.y_offset_rad,
+            )
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        scan, _refcal = _overview_context(session)
+        return {
+            "state": session.state(),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna, refcal=_refcal),
             "updated_antenna": int(max(0, payload.antenna)),
         }
 
@@ -1534,7 +2006,23 @@ def build_app() -> FastAPI:
         scan, _refcal = _overview_context(session)
         return {
             "state": session.state(),
-            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna, refcal=_refcal),
+            "updated_antenna": int(max(0, payload.antenna)),
+        }
+
+    @app.post("/api/phacal/solve/apply-suggestion")
+    def apply_phacal_suggestion(payload: RelativeDelayAntennaRequest) -> Dict:
+        """Apply one phacal antenna's current suggested correction."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.apply_phacal_suggestion(payload.antenna)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        scan, _refcal = _overview_context(session)
+        return {
+            "state": session.state(),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna, refcal=_refcal),
             "updated_antenna": int(max(0, payload.antenna)),
         }
 
@@ -1548,13 +2036,20 @@ def build_app() -> FastAPI:
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         scan, _refcal = _overview_context(session)
-        return {
-            "state": session.state(),
-            "overview_updates": residual_inband_apply_payloads(
+        if scan is not None and scan.scan_kind == "phacal":
+            overview_updates = {
+                "inband_relative_phase": phacal_multiband_residual_payload(scan, _refcal, antenna_indices=updated_antennas),
+                "inband_residual_phase_band": phacal_per_band_residual_payload(scan, _refcal, antenna_indices=updated_antennas),
+            }
+        else:
+            overview_updates = residual_inband_apply_payloads(
                 scan,
                 use_lobe=session.use_lobe,
                 antenna_indices=updated_antennas,
-            ),
+            )
+        return {
+            "state": session.state(),
+            "overview_updates": overview_updates,
         }
 
     @app.post("/api/inband/residual-threshold")
@@ -1584,7 +2079,39 @@ def build_app() -> FastAPI:
         scan, _refcal = _overview_context(session)
         return {
             "state": session.state(),
-            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna, refcal=_refcal),
+            "updated_antenna": int(max(0, payload.antenna)),
+        }
+
+    @app.post("/api/phacal/solve/undo")
+    def undo_phacal_solve(payload: RelativeDelayAntennaRequest) -> Dict:
+        """Undo the last phacal manual edit for one antenna."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.undo_phacal_solve(payload.antenna)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        scan, _refcal = _overview_context(session)
+        return {
+            "state": session.state(),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna, refcal=_refcal),
+            "updated_antenna": int(max(0, payload.antenna)),
+        }
+
+    @app.post("/api/phacal/solve/reset")
+    def reset_phacal_solve(payload: RelativeDelayAntennaRequest) -> Dict:
+        """Reset one phacal antenna back to its automatic solve."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.reset_phacal_solve(payload.antenna)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        scan, _refcal = _overview_context(session)
+        return {
+            "state": session.state(),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna, refcal=_refcal),
             "updated_antenna": int(max(0, payload.antenna)),
         }
 
@@ -1600,13 +2127,29 @@ def build_app() -> FastAPI:
         scan, _refcal = _overview_context(session)
         return {
             "state": session.state(),
-            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna, refcal=_refcal),
             "heatmap": heatmap_payload(
                 session._current_result(),
                 session.selected_ant,
                 session.selected_band,
                 scan_label=_current_scan_label(session),
             ),
+            "updated_antenna": int(max(0, payload.antenna)),
+        }
+
+    @app.post("/api/phacal/antenna-flag")
+    def set_phacal_antenna_flag(payload: ManualAntennaFlagRequest) -> Dict:
+        """Update one phacal antenna's internal-only keep/skip state."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.set_phacal_manual_antenna_flag(payload.antenna, payload.flagged)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        scan, _refcal = _overview_context(session)
+        return {
+            "state": session.state(),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna, refcal=_refcal),
             "updated_antenna": int(max(0, payload.antenna)),
         }
 
@@ -1684,7 +2227,74 @@ def build_app() -> FastAPI:
             "overview_updates": inband_window_update_payloads(
                 scan,
                 antenna_indices=[int(target.antenna) for target in payload.targets],
+                refcal=_refcal,
             ),
+        }
+
+    @app.post("/api/inband/mask/preview")
+    def preview_inband_mask(payload: SectionMaskPreviewRequest) -> Dict:
+        """Preview one kept-band-masked section without committing state."""
+
+        session = _get_session(payload.session_id)
+        try:
+            overview_updates = session.preview_inband_mask_section(payload.section_id, payload.targets)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"overview_updates": overview_updates}
+
+    @app.post("/api/inband/residual-mask/preview")
+    def preview_residual_mask(payload: SectionMaskPreviewRequest) -> Dict:
+        """Preview the residual panel with staged residual masks only."""
+
+        session = _get_session(payload.session_id)
+        try:
+            overview_updates = session.preview_residual_mask_section(payload.targets)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"overview_updates": overview_updates}
+
+    @app.post("/api/residual-panel/apply-multiband-fit")
+    def apply_residual_panel_multiband_fit(payload: RelativeDelayAntennaRequest) -> Dict:
+        """Apply the residual-panel multiband fit for the selected antenna."""
+
+        session = _get_session(payload.session_id)
+        try:
+            updated_antennas = session.apply_residual_multiband_fit(payload.antenna)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        scan, _refcal = _overview_context(session)
+        return {
+            "state": session.state(),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna, refcal=_refcal),
+            "updated_antenna": int(max(0, payload.antenna)),
+            "updated_antennas": updated_antennas,
+        }
+
+    @app.post("/api/residual-panel/undo")
+    def undo_residual_panel_action(payload: SessionRequest) -> Dict:
+        """Undo the last residual-panel apply action."""
+
+        session = _get_session(payload.session_id)
+        try:
+            updated_antennas = session.undo_residual_panel_action()
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        scan, _refcal = _overview_context(session)
+        if scan is not None and scan.scan_kind == "phacal":
+            overview_updates = (
+                relative_delay_update_payloads(scan, antenna=updated_antennas[0], refcal=_refcal)
+                if len(updated_antennas) == 1
+                else relative_delay_update_payloads(scan, refcal=_refcal)
+            )
+        else:
+            overview_updates = residual_inband_apply_payloads(
+                scan,
+                use_lobe=session.use_lobe,
+                antenna_indices=updated_antennas or None,
+            )
+        return {
+            "state": session.state(),
+            "overview_updates": overview_updates,
         }
 
     @app.post("/api/inband/reset")
@@ -1719,7 +2329,7 @@ def build_app() -> FastAPI:
         scan, _refcal = _overview_context(session)
         return {
             "state": session.state(),
-            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna, refcal=_refcal),
             "updated_antenna": None if payload.antenna is None else int(max(0, payload.antenna)),
         }
 
