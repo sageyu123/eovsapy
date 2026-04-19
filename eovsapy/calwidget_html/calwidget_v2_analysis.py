@@ -2866,7 +2866,75 @@ def _flatten_per_band_slopes(
     return corrected, per_band_delay_ns
 
 
-def _solve_phacal_against_anchor(phacal: ScanAnalysis, refcal: ScanAnalysis) -> None:
+def _phacal_apply_inband_correction_to_vis(
+    scan: "ScanAnalysis",
+    ant_i: int,
+    pol_i: int,
+    vis: np.ndarray,
+) -> np.ndarray:
+    """Rotate ``vis`` per band by the persistent in-band correction (I button).
+
+    Applies the cumulative per-band delay stored in
+    ``state.phacal_applied_inband_correction_ns[ant, pol, :]`` to ``vis`` as a
+    per-band centered rotation
+    ``exp(−2πi · (f − f_mid_band) · τ_band)``. Centering on the band-mean
+    frequency preserves the band-mean complex sample, so the multiband slope
+    across band centers is unchanged — only within-band slope is removed.
+
+    Used by both the display layer (``_phacal_base_vis``) and the solver
+    (``_solve_phacal_against_anchor``) so that the visibility the user sees
+    and the visibility the solver fits are identical.
+
+    Returns the original ``vis`` unchanged when no corrections are present
+    or shapes do not line up.
+    """
+
+    state = ensure_phacal_solve_state(scan)
+    correction = state.phacal_applied_inband_correction_ns
+    if (
+        scan.delay_solution is None
+        or correction.ndim != 3
+        or correction.shape[0] <= ant_i
+        or correction.shape[1] <= pol_i
+        or correction.shape[2] == 0
+        or not scan.raw
+        or "channel_band" not in scan.raw
+        or "channel_freq_ghz" not in scan.raw
+    ):
+        return vis
+    band_id = np.asarray(scan.raw["channel_band"], dtype=int)
+    band_values = np.asarray(scan.delay_solution.band_values, dtype=int)
+    f = np.asarray(scan.raw["channel_freq_ghz"], dtype=float)
+    if band_values.size != correction.shape[2] or band_id.shape != vis.shape:
+        return vis
+    rotated = np.asarray(vis, dtype=np.complex128).copy()
+    any_applied = False
+    for band_idx, band_value in enumerate(band_values):
+        tau = float(correction[ant_i, pol_i, band_idx])
+        if not np.isfinite(tau) or tau == 0.0:
+            continue
+        idx = np.where(band_id == int(band_value))[0]
+        if idx.size == 0:
+            continue
+        f_band = f[idx]
+        finite_f = f_band[np.isfinite(f_band)]
+        if finite_f.size == 0:
+            continue
+        fmid = float(np.mean(finite_f))
+        phasor = np.exp(-1j * 2.0 * np.pi * (f_band - fmid) * tau)
+        rotated[idx] = rotated[idx] * phasor
+        any_applied = True
+    return rotated if any_applied else np.asarray(vis, dtype=np.complex128)
+
+
+def _solve_phacal_against_anchor(
+    phacal: ScanAnalysis,
+    refcal: ScanAnalysis,
+    *,
+    seed_ant: Optional[int] = None,
+    seed_delay_ns: float = 0.0,
+    seed_offset_rad: float = 0.0,
+) -> None:
     """Solve one phacal against the tuned anchor refcal on fine channels.
 
     The saved phacal model uses one shared multiband delay baseline per
@@ -2874,11 +2942,32 @@ def _solve_phacal_against_anchor(phacal: ScanAnalysis, refcal: ScanAnalysis) -> 
     one constant phase offset per polarization. Any manual phacal skip state is
     internal to the browser and does not alter the saved SQL flag arrays.
 
+    When ``seed_ant`` is given, the coherence search for that antenna is run
+    with a narrow ±1 ns grid centered on ``seed_delay_ns`` (obtained by
+    rotating the per-pol visibility by ``exp(-2πi·f·seed_delay_ns)`` before
+    the search and adding ``seed_delay_ns`` back to the result). This lets the
+    frontend seed the fit from a user gesture (Shift+click two points in the
+    Anchor-Ref. Phase plot) without losing the final per-pol offset fit, which
+    still comes from the un-seeded ``base_vis``. ``seed_offset_rad`` is
+    accepted for API symmetry but is not used in the fit: the coherence search
+    is offset-blind and the final per-pol offset is always the best fit to the
+    data (``angle(mean(base_rot))`` at the shared delay).
+
     :param phacal: Phasecal analysis to update.
     :type phacal: ScanAnalysis
     :param refcal: Anchor refcal analysis used as the model reference.
     :type refcal: ScanAnalysis
+    :param seed_ant: Antenna index to seed, or ``None`` for a full re-solve.
+    :type seed_ant: int | None
+    :param seed_delay_ns: Seed multiband delay in ns (both pols).
+    :type seed_delay_ns: float
+    :param seed_offset_rad: Seed phase offset in rad (accepted, not used).
+    :type seed_offset_rad: float
     """
+
+    _ = float(seed_offset_rad)  # accepted for API symmetry; not used
+    seed_ant_i = int(seed_ant) if seed_ant is not None else -1
+    seed_delay_s = float(seed_delay_ns) * 1e-9
 
     state = ensure_phacal_solve_state(phacal)
     _zero_phacal_saved_solution(phacal)
@@ -3017,18 +3106,37 @@ def _solve_phacal_against_anchor(phacal: ScanAnalysis, refcal: ScanAnalysis) -> 
                     state.phacal_inband_delay_ns[ant, pol] = (
                         float(np.nanmean(finite_delays)) if finite_delays.size else 0.0
                     )
+            # Apply any persistent per-band corrections from the I button so the
+            # solver fits the same visibility the display shows. No-op when
+            # state.phacal_applied_inband_correction_ns[ant, pol, :] is all zero.
+            vis = _phacal_apply_inband_correction_to_vis(phacal, ant, pol, vis)
             base_vis.append(vis)
             base_masks.append(valid)
 
         delay_estimates_ns: List[float] = []
         delay_weights: List[float] = []
+        seed_this_ant = (ant == seed_ant_i)
         for pol in range(2):
             valid = np.asarray(base_masks[pol], dtype=bool)
             if np.count_nonzero(valid) < 3:
                 continue
-            solved = solve_residual_delay_phi0(freq_hz[valid], np.asarray(base_vis[pol][valid], dtype=np.complex128))
+            vis_for_solve = np.asarray(base_vis[pol][valid], dtype=np.complex128)
+            if seed_this_ant:
+                # Narrow-grid coherence search centered on the user's gesture.
+                # Rotate by the seed delay before solving; add it back below.
+                vis_for_solve = vis_for_solve * np.exp(
+                    -1j * 2.0 * np.pi * freq_hz[valid] * seed_delay_s
+                )
+                solved = solve_residual_delay_phi0(
+                    freq_hz[valid], vis_for_solve, dly_max_s=1e-9
+                )
+            else:
+                solved = solve_residual_delay_phi0(freq_hz[valid], vis_for_solve)
             if np.isfinite(solved["dly_res_s"]):
-                delay_estimates_ns.append(float(solved["dly_res_s"]) * 1e9)
+                d_ns = float(solved["dly_res_s"]) * 1e9
+                if seed_this_ant:
+                    d_ns += float(seed_delay_ns)
+                delay_estimates_ns.append(d_ns)
                 delay_weights.append(float(np.count_nonzero(valid)))
         shared_delay_ns = 0.0
         if delay_weights:

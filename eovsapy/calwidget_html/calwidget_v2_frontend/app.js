@@ -1397,6 +1397,7 @@
 
   function MiniPanelPlot(props) {
     const [dragState, setDragState] = useState(null);
+    const [slopeState, setSlopeState] = useState(null);
     const [showHint, setShowHint] = useState(false);
     const [hintPos, setHintPos] = useState({ x: 0, y: 0 });
     const hintTimerRef = useRef(null);
@@ -1534,6 +1535,33 @@
       return { x: x0, width: Math.max(x1 - x0, 1.5) };
     }
     function beginPointerDrag(event) {
+      if (event.shiftKey && props.onSlopeGesture) {
+        // Shift+click slope gesture (Anchor-Ref. Phase, phacal only). Takes
+        // precedence over drag-to-mask / zoom for this panel while Shift is
+        // held. Two clicks commit a (delay, offset) seed to the parent.
+        const xValue = xValueFromClientX(event);
+        const yValue = yValueFromClientY(event);
+        if (!Number.isFinite(xValue) || !Number.isFinite(yValue)) {
+          return;
+        }
+        event.stopPropagation();
+        if (event.preventDefault) {
+          event.preventDefault();
+        }
+        if (slopeState && slopeState.point1) {
+          const point1 = slopeState.point1;
+          const point2 = { x: xValue, y: yValue };
+          setSlopeState(null);
+          props.onSlopeGesture(point1, point2);
+        } else {
+          setSlopeState({ point1: { x: xValue, y: yValue }, cursor: { x: xValue, y: yValue } });
+        }
+        return;
+      }
+      if (slopeState) {
+        // A non-Shift click cancels a staged first point.
+        setSlopeState(null);
+      }
       if (interactionMode === "bandselect") {
         if (!props.onBandWindowSelect || !bandEdges.length) {
           return;
@@ -1581,6 +1609,18 @@
       }
     }
     function movePointerDrag(event) {
+      if (slopeState && slopeState.point1) {
+        const xValue = xValueFromClientX(event);
+        const yValue = yValueFromClientY(event);
+        if (Number.isFinite(xValue) && Number.isFinite(yValue)) {
+          setSlopeState(function (current) {
+            if (!current || !current.point1) {
+              return current;
+            }
+            return Object.assign({}, current, { cursor: { x: xValue, y: yValue } });
+          });
+        }
+      }
       if (!dragState) {
         return;
       }
@@ -1858,8 +1898,29 @@
             ${panel.disabled
               ? html`<rect x=${margin.left} y=${margin.top} width=${plotWidth} height=${plotHeight} fill="rgba(120, 126, 132, 0.24)" />`
               : null}
+            ${slopeState && slopeState.point1
+              ? html`
+                  <line
+                    x1=${xMap(slopeState.point1.x)}
+                    y1=${yMap(slopeState.point1.y)}
+                    x2=${xMap(slopeState.cursor.x)}
+                    y2=${yMap(slopeState.cursor.y)}
+                    stroke="#ff7f00"
+                    strokeWidth="1.4"
+                    strokeDasharray="4 3"
+                  />
+                  <circle
+                    cx=${xMap(slopeState.point1.x)}
+                    cy=${yMap(slopeState.point1.y)}
+                    r="3.2"
+                    fill="none"
+                    stroke="#ff7f00"
+                    strokeWidth="1.5"
+                  />
+                `
+              : null}
           </g>
-          ${interactionMode
+          ${interactionMode || props.onSlopeGesture
             ? html`<rect
                 x=${margin.left}
                 y=${margin.top}
@@ -2051,6 +2112,11 @@
                           onDoubleClick=${props.onPanelDoubleClick
                             ? function () {
                                 props.onPanelDoubleClick(rowIdx, panelIdx, displayPanel);
+                              }
+                            : null}
+                          onSlopeGesture=${props.onSlopeGesture
+                            ? function (point1, point2) {
+                                props.onSlopeGesture(rowIdx, panelIdx, point1, point2, displayPanel);
                               }
                             : null}
                         />`;
@@ -4796,6 +4862,55 @@
       );
     }
 
+    function applyPhacalSlopeSeed(antennaIndex, seedDelayNs, seedOffsetRad) {
+      runAction(
+        function () {
+          return postJsonWithOverviewPatch(
+            "/api/phacal/solve/seed-from-slope",
+            {
+              session_id: sessionId,
+              antenna: antennaIndex,
+              seed_delay_ns: seedDelayNs,
+              seed_offset_rad: seedOffsetRad,
+            },
+            antennaIndex
+          );
+        },
+        { progressKind: "relative_delay", successMessage: "Phasecal seeded from slope" }
+      );
+    }
+
+    function handlePhacalAnchorSlopeGesture(rowIdx, panelIdx, point1, point2, _panel) {
+      // Gated to Anchor-Ref. Phase XX/YY rows only. Row 2 is the Y-X display
+      // and is not a valid seed target for a multiband delay fit.
+      if (Number(rowIdx) !== 0 && Number(rowIdx) !== 1) {
+        return;
+      }
+      const plotData = overviewData ? overviewData.inband_fit : null;
+      const controls = (plotData && plotData.column_controls) || [];
+      const control = controls[Number(panelIdx)];
+      if (!control) {
+        return;
+      }
+      const antenna = Number(control.antenna);
+      const fa = Number(point1.x);
+      const fb = Number(point2.x);
+      if (!Number.isFinite(fa) || !Number.isFinite(fb) || Math.abs(fb - fa) < 1e-6) {
+        return;
+      }
+      // Wrap the phase delta into (-π, π] before dividing — two clicks that
+      // span a 2π jump would otherwise give a nonsense slope.
+      const dphiRaw = Number(point2.y) - Number(point1.y);
+      const dphi = Math.atan2(Math.sin(dphiRaw), Math.cos(dphiRaw));
+      const seedDelayNs = dphi / (2.0 * Math.PI * (fb - fa));
+      const offsetRaw = Number(point1.y) - 2.0 * Math.PI * fa * seedDelayNs;
+      const seedOffsetRad = Math.atan2(Math.sin(offsetRaw), Math.cos(offsetRaw));
+      if (!Number.isFinite(seedDelayNs) || !Number.isFinite(seedOffsetRad)) {
+        return;
+      }
+      applyPhacalSlopeSeed(antenna, seedDelayNs, seedOffsetRad);
+    }
+
     function applyRelativeDelaySuggestion() {
       const antennaIndex = Math.max(0, parseInt(relativeDelayDraft.ant || "1", 10) - 1);
       const isPhacal = state && state.current_scan && state.current_scan.kind === "phacal";
@@ -5255,7 +5370,7 @@
       compareData: compareData,
       isPhacalScan: isPhacalScan,
     });
-    function residualColumnActionRenderer(control) {
+    function residualColumnActionRenderer(control, sectionId) {
       if (!overviewData || !overviewData.inband_residual_phase_band) {
         return null;
       }
@@ -5274,69 +5389,99 @@
       const fitKinds = (overviewData.inband_residual_phase_band && overviewData.inband_residual_phase_band.multiband_fit_kinds) || [];
       const currentKind = String(fitKinds[antennaIndex] || "linear");
       const fitKindDisabled = !!(busy || isPhacalScan || control.flagged || control.auto_flagged || !hasData || antennaIndex === 0);
+      // Per-(section, scan-kind) control gating:
+      //   Refcal Per-Band Res. Phase    -> fit-kind + I + M
+      //     (residual panel is where the user fits the multiband through
+      //      residuals; M applies the suggested multiband to the model.)
+      //   Phacal Per-Band Res. Phase    -> I only
+      //     (phacal does not fit a multiband through residuals; M and the
+      //      fit-kind dropdown are meaningless here.)
+      //   Phacal Anchor-Ref. Phase      -> M only
+      //     (this section plots the multiband model line; M moves it. The
+      //      fit-kind dropdown is inert for phacal so it's hidden too.
+      //      I has no per-band visualization here, so it's hidden.)
+      //   Refcal Anchor-Ref. Phase      -> n/a (dispatch never wires it).
+      const isRefcalResidual = sectionId === "inband_residual_phase_band" && !isPhacalScan;
+      const isPhacalResidual = sectionId === "inband_residual_phase_band" && isPhacalScan;
+      const isPhacalAnchor = sectionId === "inband_fit" && isPhacalScan;
+      const showFitKind = isRefcalResidual;
+      const showI = isRefcalResidual || isPhacalResidual;
+      const showM = isRefcalResidual || isPhacalAnchor;
       return html`
-        <select
-          className="panel-grid-column-fit-kind"
-          value=${currentKind}
-          disabled=${fitKindDisabled}
-          title=${antennaIndex === 0
-            ? "Ant 1 uses the dedicated multiband-shape fit; cannot change kind here."
-            : "Multiband fit model for " + control.label}
-          onPointerDown=${function (event) {
-            event.stopPropagation();
-          }}
-          onChange=${function (event) {
-            const next = String(event.target.value);
-            if (next === currentKind) {
-              return;
-            }
-            setMultibandFitKind(antennaIndex, next);
-          }}
-        >
-          <option value="linear">Linear</option>
-          <option value="poly2">Poly2</option>
-          <option value="poly3">Poly3</option>
-        </select>
-        <button
-          type="button"
-          className="panel-grid-column-action panel-grid-column-action-blue"
-          title=${"Apply per-band in-band residual correction to " + control.label + " (flattens within-band residual slopes; preserves multiband)"}
-          aria-label=${"Apply per-band in-band residual correction to " + control.label}
-          disabled=${!!(busy || control.flagged || control.auto_flagged || !hasData)}
-          onPointerDown=${function (event) {
-            event.preventDefault();
-            event.stopPropagation();
-          }}
-          onClick=${function (event) {
-            event.preventDefault();
-            event.stopPropagation();
-            if (!(busy || control.flagged || control.auto_flagged || !hasData)) {
-              applyResidualInbandFit(antennaIndex);
-            }
-          }}
-        >
-          <span className="panel-grid-column-action-glyph" aria-hidden="true">I</span>
-        </button>
-        <button
-          type="button"
-          className="panel-grid-column-action panel-grid-column-action-red"
-          title=${"Apply auto-suggested multiband delay to " + control.label + " (adds suggested → applied for this antenna)"}
-          aria-label=${"Apply auto-suggested multiband delay to " + control.label}
-          disabled=${disabled}
-          onPointerDown=${function (event) {
-            event.preventDefault();
-            event.stopPropagation();
-          }}
-          onClick=${function (event) {
-            event.preventDefault();
-            event.stopPropagation();
-            if (!disabled) {
-              applyResidualMultibandFit(antennaIndex);
-            }
-          }}
-        >
-          <span className="panel-grid-column-action-glyph" aria-hidden="true">M</span>
-        </button>
+        ${showFitKind
+          ? html`
+              <select
+                className="panel-grid-column-fit-kind"
+                value=${currentKind}
+                disabled=${fitKindDisabled}
+                title=${antennaIndex === 0
+                  ? "Ant 1 uses the dedicated multiband-shape fit; cannot change kind here."
+                  : "Multiband fit model for " + control.label}
+                onPointerDown=${function (event) {
+                  event.stopPropagation();
+                }}
+                onChange=${function (event) {
+                  const next = String(event.target.value);
+                  if (next === currentKind) {
+                    return;
+                  }
+                  setMultibandFitKind(antennaIndex, next);
+                }}
+              >
+                <option value="linear">Linear</option>
+                <option value="poly2">Poly2</option>
+                <option value="poly3">Poly3</option>
+              </select>
+            `
+          : null}
+        ${showI
+          ? html`
+              <button
+                type="button"
+                className="panel-grid-column-action panel-grid-column-action-blue"
+                title=${"Apply per-band in-band residual correction to " + control.label + " (flattens within-band residual slopes; preserves multiband)"}
+                aria-label=${"Apply per-band in-band residual correction to " + control.label}
+                disabled=${!!(busy || control.flagged || control.auto_flagged || !hasData)}
+                onPointerDown=${function (event) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }}
+                onClick=${function (event) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  if (!(busy || control.flagged || control.auto_flagged || !hasData)) {
+                    applyResidualInbandFit(antennaIndex);
+                  }
+                }}
+              >
+                <span className="panel-grid-column-action-glyph" aria-hidden="true">I</span>
+              </button>
+            `
+          : null}
+        ${showM
+          ? html`
+              <button
+                type="button"
+                className="panel-grid-column-action panel-grid-column-action-red"
+                title=${"Apply auto-suggested multiband delay to " + control.label + " (adds suggested → applied for this antenna)"}
+                aria-label=${"Apply auto-suggested multiband delay to " + control.label}
+                disabled=${disabled}
+                onPointerDown=${function (event) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }}
+                onClick=${function (event) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  if (!disabled) {
+                    applyResidualMultibandFit(antennaIndex);
+                  }
+                }}
+              >
+                <span className="panel-grid-column-action-glyph" aria-hidden="true">M</span>
+              </button>
+            `
+          : null}
       `;
     }
     function canEditKeptMaskSection(sectionId) {
@@ -6673,7 +6818,10 @@
                         : null}
                       columnActionRenderer=${section.id === "inband_residual_phase_band"
                         || (isPhacalScan && section.id === "inband_fit")
-                        ? residualColumnActionRenderer
+                        ? function (control) { return residualColumnActionRenderer(control, section.id); }
+                        : null}
+                      onSlopeGesture=${isPhacalScan && section.id === "inband_fit"
+                        ? handlePhacalAnchorSlopeGesture
                         : null}
                     />
                   </${PlotCard}>

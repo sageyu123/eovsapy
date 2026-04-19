@@ -181,6 +181,14 @@ class RelativeDelayAntennaRequest(SessionRequest):
     antenna: int
 
 
+class PhacalSeedFromSlopeRequest(SessionRequest):
+    """Seed the phacal solver for one antenna from a Shift+click slope gesture."""
+
+    antenna: int
+    seed_delay_ns: float
+    seed_offset_rad: float
+
+
 class PhacalFallbackRequest(SessionRequest):
     """Toggle one phacal antenna's temporary fallback path."""
 
@@ -819,6 +827,42 @@ class WidgetSession:
         scan.saved_to_sql = False
         self.selected_ant = ant
         self.status_message = "Applied the phacal suggested correction for antenna {0:d}.".format(ant + 1)
+
+    def seed_phacal_from_slope(
+        self,
+        antenna: int,
+        seed_delay_ns: float,
+        seed_offset_rad: float,
+    ) -> None:
+        """Re-solve one phacal antenna with a user-supplied slope as the seed.
+
+        Used by the Anchor-Ref. Phase Shift+click gesture: the two clicked
+        points give ``(seed_delay_ns, seed_offset_rad)``; the solver runs a
+        narrow ±1 ns coherence search centered on the seed for both pols.
+        ``applied_delay_ns`` and per-band I-corrections are untouched so M,
+        Apply Manual, and Reset continue to compose naturally.
+        """
+
+        _scan_id, scan, refcal = self._editable_phacal_scan()
+        ant = int(max(0, min(int(antenna), scan.layout.nsolant - 1)))
+        state = ensure_phacal_solve_state(scan)
+        state.snapshot_ant(ant)
+        _solve_phacal_against_anchor(
+            scan,
+            refcal,
+            seed_ant=ant,
+            seed_delay_ns=float(seed_delay_ns),
+            seed_offset_rad=float(seed_offset_rad),
+        )
+        if scan.raw:
+            scan.raw.pop("overview_payload_cache", None)
+            scan.raw.pop("residual_diagnostics_cache", None)
+            scan.raw.pop("preview_solve_cache", None)
+        scan.saved_to_sql = False
+        self.selected_ant = ant
+        self.status_message = (
+            "Seeded phacal solve from gesture for antenna {0:d}.".format(ant + 1)
+        )
 
     def undo_phacal_solve(self, antenna: int) -> None:
         """Undo the last applied phacal manual correction for one antenna."""
@@ -2614,6 +2658,26 @@ def build_app() -> FastAPI:
         session = _get_session(payload.session_id)
         try:
             session.apply_phacal_suggestion(payload.antenna)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        scan, _refcal = _overview_context(session)
+        return {
+            "state": session.state(),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna, refcal=_refcal),
+            "updated_antenna": int(max(0, payload.antenna)),
+        }
+
+    @app.post("/api/phacal/solve/seed-from-slope")
+    def seed_phacal_from_slope(payload: PhacalSeedFromSlopeRequest) -> Dict:
+        """Seed the phacal solver from a Shift+click slope gesture."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.seed_phacal_from_slope(
+                payload.antenna,
+                payload.seed_delay_ns,
+                payload.seed_offset_rad,
+            )
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         scan, _refcal = _overview_context(session)

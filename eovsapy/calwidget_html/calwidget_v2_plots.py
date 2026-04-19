@@ -20,6 +20,7 @@ from eovsapy.util import Time, lin_phase_fit, lobe
 
 from .calwidget_v2_analysis import (
     ScanAnalysis,
+    _phacal_apply_inband_correction_to_vis,
     combined_channel_vis_with_time_flags,
     ensure_phacal_solve_state,
     ensure_time_flag_groups,
@@ -1834,6 +1835,19 @@ def _fit_joint_xy_relative_model(
         base_model_y_phase = _eval_shared_phase_model(freq_ghz, fit_pol_y) + auto_dxy_total
         model_x_phase = base_model_x_phase + 2.0 * np.pi * (freq_ghz - pivot_ghz) * float(manual_delay_ns[0])
         model_y_phase = base_model_y_phase + 2.0 * np.pi * (freq_ghz - pivot_ghz) * float(manual_delay_ns[1])
+        # TEMP DIAGNOSTIC (ant 6, poly2/poly3) — remove after root cause identified.
+        if ant == 5:
+            import sys
+            print(
+                "[POLY2DIAG-fit] ant={ant} kind={kind} pivot={piv:.6f} auto_dxy_total={dxy:.6f} "
+                "manual_delay_ns={mdn} coeffs_x={cx} coeffs_y={cy}".format(
+                    ant=ant, kind=fit_kind, piv=pivot_ghz, dxy=float(auto_dxy_total),
+                    mdn=np.asarray(manual_delay_ns, dtype=float).tolist(),
+                    cx=np.asarray(joint["coeffs_x"], dtype=float).tolist(),
+                    cy=np.asarray(joint["coeffs_y"], dtype=float).tolist(),
+                ),
+                file=sys.stderr, flush=True,
+            )
     else:
         valid_any = np.isfinite(freq_ghz)
         pivot_ghz = float(np.nanmean(freq_ghz[valid_any])) if np.any(valid_any) else 0.0
@@ -2150,6 +2164,21 @@ def _compute_inband_diagnostic_antenna(scan: ScanAnalysis, ant: int, context: di
     raw_avg = np.asarray(context["raw_avg"], dtype=np.complex128)
     corrected_avg = np.asarray(context["corrected_avg"], dtype=np.complex128)
 
+    # TEMP DIAGNOSTIC (ant 6) — remove after root cause identified.
+    if ant_i == 5:
+        import sys
+        ds = scan.delay_solution
+        print(
+            "[POLY2DIAG-state] ant={ant} fit_kind={kind} active_ns={act} relative_ns={rel} "
+            "ant1_manual_dxy_corr_rad={dxy}".format(
+                ant=ant_i,
+                kind=ds.get_multiband_fit_kind(ant_i),
+                act=np.asarray(ds.active_ns[ant_i], dtype=float).tolist(),
+                rel=np.asarray(ds.relative_ns[ant_i], dtype=float).tolist(),
+                dxy=float(getattr(ds, "ant1_manual_dxy_corr_rad", 0.0)),
+            ),
+            file=sys.stderr, flush=True,
+        )
     joint_fit = _fit_joint_xy_relative_model(
         ant_i,
         band_id,
@@ -4143,52 +4172,6 @@ def _phacal_base_vis(
         )
     vis = _phacal_apply_inband_correction_to_vis(scan, ant_i, pol_i, vis)
     return vis, valid
-
-
-def _phacal_apply_inband_correction_to_vis(
-    scan: ScanAnalysis,
-    ant_i: int,
-    pol_i: int,
-    vis: np.ndarray,
-) -> np.ndarray:
-    """Rotate ``vis`` per band by the persistent in-band correction (I button)."""
-
-    state = ensure_phacal_solve_state(scan)
-    correction = state.phacal_applied_inband_correction_ns
-    if (
-        scan.delay_solution is None
-        or correction.ndim != 3
-        or correction.shape[0] <= ant_i
-        or correction.shape[1] <= pol_i
-        or correction.shape[2] == 0
-        or not scan.raw
-        or "channel_band" not in scan.raw
-        or "channel_freq_ghz" not in scan.raw
-    ):
-        return vis
-    band_id = np.asarray(scan.raw["channel_band"], dtype=int)
-    band_values = np.asarray(scan.delay_solution.band_values, dtype=int)
-    f = np.asarray(scan.raw["channel_freq_ghz"], dtype=float)
-    if band_values.size != correction.shape[2] or band_id.shape != vis.shape:
-        return vis
-    rotated = vis.copy()
-    any_applied = False
-    for band_idx, band_value in enumerate(band_values):
-        tau = float(correction[ant_i, pol_i, band_idx])
-        if not np.isfinite(tau) or tau == 0.0:
-            continue
-        idx = np.where(band_id == int(band_value))[0]
-        if idx.size == 0:
-            continue
-        f_band = f[idx]
-        finite_f = f_band[np.isfinite(f_band)]
-        if finite_f.size == 0:
-            continue
-        fmid = float(np.mean(finite_f))
-        phasor = np.exp(-1j * 2.0 * np.pi * (f_band - fmid) * tau)
-        rotated[idx] = rotated[idx] * phasor
-        any_applied = True
-    return rotated if any_applied else vis
 
 
 def _phacal_effective_model_phase(scan: ScanAnalysis, ant: int, pol: int, freq_ghz: np.ndarray) -> np.ndarray:
