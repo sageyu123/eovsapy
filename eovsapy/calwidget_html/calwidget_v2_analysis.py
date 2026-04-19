@@ -72,11 +72,18 @@ class DelaySolution:
     band_values: np.ndarray
     band_centers_ghz: np.ndarray
     kept_band_mask: np.ndarray
+    xy_kept_band_mask: np.ndarray
     residual_kept_band_mask: np.ndarray
     residual_auto_band_mask: np.ndarray
     residual_mask_initialized: np.ndarray
+    ant1_multiband_dip_center_ghz: float
+    ant1_multiband_dip_width_ghz: float
+    ant1_multiband_dip_depth_rad: float
+    ant1_multiband_lowfreq_weight_power: float
+    ant1_manual_dxy_corr_rad: float
     manual_ant_flag_override: np.ndarray
     manual_ant_keep_override: np.ndarray
+    multiband_fit_kind: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=object))
 
     def reset_all(self) -> None:
         """Reset all active delays to the fitted solution."""
@@ -84,6 +91,8 @@ class DelaySolution:
         self.active_ns[:] = self.fitted_ns
         if self.kept_band_mask.size:
             self.kept_band_mask[:] = True
+        if self.xy_kept_band_mask.size:
+            self.xy_kept_band_mask[:] = True
 
     def reset_ant(self, ant: int) -> None:
         """Reset one antenna's active delays to the fitted solution."""
@@ -91,6 +100,8 @@ class DelaySolution:
         self.active_ns[ant, :] = self.fitted_ns[ant, :]
         if self.kept_band_mask.size:
             self.kept_band_mask[ant, :] = True
+        if self.xy_kept_band_mask.size:
+            self.xy_kept_band_mask[ant, :] = True
 
     def reset_relative_all(self) -> None:
         """Reset all display-only relative-delay overrides."""
@@ -202,6 +213,86 @@ class DelaySolution:
             previous = current
         ranges.append((start, previous))
         return ranges
+
+    def included_xy_band_mask(self, ant: int) -> np.ndarray:
+        """Return the active included-band mask for the delta (Y-X) row of one antenna.
+
+        :param ant: Zero-based antenna index.
+        :type ant: int
+        :returns: Boolean mask over ``band_values``.
+        :rtype: np.ndarray
+        """
+
+        if self.band_values.size == 0:
+            return np.zeros(0, dtype=bool)
+        mask = np.asarray(self.xy_kept_band_mask[int(ant)], dtype=bool)
+        if mask.shape[0] != self.band_values.size:
+            return np.ones(self.band_values.shape, dtype=bool)
+        return mask.copy()
+
+    def xy_kept_band_ranges(self, ant: int) -> List[Tuple[int, int]]:
+        """Return contiguous kept-band ranges for the delta (Y-X) row of one antenna."""
+
+        mask = self.included_xy_band_mask(ant)
+        if mask.size == 0 or not np.any(mask):
+            return []
+        bands = self.band_values[mask].astype(int)
+        ranges: List[Tuple[int, int]] = []
+        start = int(bands[0])
+        previous = int(bands[0])
+        for value in bands[1:]:
+            current = int(value)
+            if current != previous + 1:
+                ranges.append((start, previous))
+                start = current
+            previous = current
+        ranges.append((start, previous))
+        return ranges
+
+    def set_xy_kept_band_ranges(self, ant: int, ranges: Sequence[Tuple[int, int]]) -> None:
+        """Set the delta (Y-X) row's kept-band mask for one antenna from final contiguous ranges.
+
+        :param ant: Zero-based antenna index.
+        :type ant: int
+        :param ranges: Contiguous inclusive ``(start_band, end_band)`` pairs.
+        :type ranges: sequence of (int, int)
+        """
+
+        ant_i = int(ant)
+        if self.band_values.size == 0:
+            return
+        next_mask = np.zeros(self.band_values.shape, dtype=bool)
+        for start_band, end_band in ranges:
+            lo = int(min(start_band, end_band))
+            hi = int(max(start_band, end_band))
+            next_mask |= (self.band_values >= lo) & (self.band_values <= hi)
+        self.xy_kept_band_mask[ant_i] = next_mask
+
+    def get_multiband_fit_kind(self, ant: int) -> str:
+        """Return the per-antenna multiband fit kind, defaulting to ``"linear"``."""
+
+        ant_i = int(ant)
+        valid = {"linear", "poly2", "poly3"}
+        if (
+            self.multiband_fit_kind.size == 0
+            or ant_i < 0
+            or ant_i >= self.multiband_fit_kind.size
+        ):
+            return "linear"
+        kind = str(self.multiband_fit_kind[ant_i])
+        return kind if kind in valid else "linear"
+
+    def set_multiband_fit_kind(self, ant: int, kind: str) -> None:
+        """Set the per-antenna multiband fit kind to ``linear``, ``poly2``, or ``poly3``."""
+
+        ant_i = int(ant)
+        valid = {"linear", "poly2", "poly3"}
+        next_kind = str(kind) if str(kind) in valid else "linear"
+        if self.multiband_fit_kind.size == 0:
+            return
+        if ant_i < 0 or ant_i >= self.multiband_fit_kind.size:
+            return
+        self.multiband_fit_kind[ant_i] = next_kind
 
     def residual_kept_band_ranges(self, ant: int, pol: int) -> List[Tuple[int, int]]:
         """Return contiguous residual kept-band ranges for one target."""
@@ -384,6 +475,40 @@ class DelaySolution:
         self.residual_kept_band_mask[int(ant), int(pol)] = mask
         self.residual_mask_initialized[int(ant), int(pol)] = True
 
+    def set_ant1_multiband_shape(
+        self,
+        dip_center_ghz: float,
+        dip_width_ghz: float,
+        dip_depth_rad: float,
+        lowfreq_weight_power: float,
+    ) -> None:
+        """Store committed Ant 1 multiband-shape tuning values.
+
+        :param dip_center_ghz: Dip center in GHz.
+        :type dip_center_ghz: float
+        :param dip_width_ghz: Dip width in GHz.
+        :type dip_width_ghz: float
+        :param dip_depth_rad: Positive dip depth in radians.
+        :type dip_depth_rad: float
+        :param lowfreq_weight_power: Low-frequency weighting exponent.
+        :type lowfreq_weight_power: float
+        """
+
+        self.ant1_multiband_dip_center_ghz = float(dip_center_ghz)
+        self.ant1_multiband_dip_width_ghz = max(float(dip_width_ghz), 1.0e-3)
+        self.ant1_multiband_dip_depth_rad = max(float(dip_depth_rad), 0.0)
+        self.ant1_multiband_lowfreq_weight_power = max(float(lowfreq_weight_power), 0.0)
+
+    def set_ant1_manual_dxy_corr(self, manual_dxy_corr_rad: float) -> None:
+        """Store committed Ant 1 manual ``Δ(Y-X)`` correction.
+
+        :param manual_dxy_corr_rad: Additive Ant 1 ``Δ(Y-X)`` correction in
+            radians.
+        :type manual_dxy_corr_rad: float
+        """
+
+        self.ant1_manual_dxy_corr_rad = float(manual_dxy_corr_rad)
+
     def window_signature(self) -> str:
         """Return a compact signature for active window-dependent caches.
 
@@ -394,8 +519,9 @@ class DelaySolution:
         if self.band_values.size == 0:
             return "empty"
         kept = self.kept_band_mask.astype(np.int8).ravel().tolist()
+        xy_kept = self.xy_kept_band_mask.astype(np.int8).ravel().tolist()
         active = np.round(self.active_ns.astype(np.float64), 6).ravel().tolist()
-        return json.dumps({"kept": kept, "active": active}, separators=(",", ":"))
+        return json.dumps({"kept": kept, "xy_kept": xy_kept, "active": active}, separators=(",", ":"))
 
     def relative_signature(self) -> str:
         """Return a compact signature for display-only relative-delay edits.
@@ -407,8 +533,21 @@ class DelaySolution:
         relative = np.round(self.relative_ns.astype(np.float64), 6).ravel().tolist()
         manual = np.asarray(self.manual_ant_flag_override, dtype=np.int8).ravel().tolist()
         manual_keep = np.asarray(self.manual_ant_keep_override, dtype=np.int8).ravel().tolist()
+        fit_kind = [str(kind) for kind in np.atleast_1d(self.multiband_fit_kind).tolist()]
         return json.dumps(
-            {"relative": relative, "manual_ant_flag": manual, "manual_ant_keep": manual_keep},
+            {
+                "relative": relative,
+                "manual_ant_flag": manual,
+                "manual_ant_keep": manual_keep,
+                "ant1_shape": [
+                    round(float(self.ant1_multiband_dip_center_ghz), 6),
+                    round(float(self.ant1_multiband_dip_width_ghz), 6),
+                    round(float(self.ant1_multiband_dip_depth_rad), 6),
+                    round(float(self.ant1_multiband_lowfreq_weight_power), 6),
+                ],
+                "ant1_manual_dxy_corr_rad": round(float(self.ant1_manual_dxy_corr_rad), 6),
+                "multiband_fit_kind": fit_kind,
+            },
             separators=(",", ":"),
         )
 
@@ -470,9 +609,19 @@ class PhacalSolveState:
     prev_offset_rad: np.ndarray
     prev_valid: np.ndarray
     manual_skip_override: np.ndarray
+    manual_anchor_fallback_override: np.ndarray
     fallback_used: np.ndarray
+    donor_patch_used: np.ndarray
     missing_in_phacal: np.ndarray
     missing_in_refcal: np.ndarray
+    ant1_self_reference_used: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=bool))
+    phacal_inband_delay_ns: np.ndarray = field(default_factory=lambda: np.zeros((0, 2), dtype=np.float64))
+    phacal_inband_per_band_delay_ns: np.ndarray = field(default_factory=lambda: np.zeros((0, 2, 0), dtype=np.float64))
+    # User-applied per-band in-band corrections (persistent). Each value is
+    # the cumulative residual delay (ns) applied to a band, rotated about
+    # that band's center frequency so band-averaged phase and the multiband
+    # slope across band centers remain unchanged.
+    phacal_applied_inband_correction_ns: np.ndarray = field(default_factory=lambda: np.zeros((0, 2, 0), dtype=np.float64))
 
     def snapshot_ant(self, ant: int) -> None:
         """Store one-step undo state for one antenna.
@@ -706,6 +855,24 @@ def ensure_phacal_solve_state(scan: ScanAnalysis) -> PhacalSolveState:
         and np.asarray(existing.auto_delay_ns).shape == shape
         and np.asarray(existing.auto_offset_rad).shape == shape
     ):
+        if not hasattr(existing, "manual_anchor_fallback_override"):
+            existing.manual_anchor_fallback_override = np.zeros(ant_shape, dtype=bool)
+        if not hasattr(existing, "donor_patch_used"):
+            existing.donor_patch_used = np.zeros(ant_shape, dtype=bool)
+        if (
+            not hasattr(existing, "ant1_self_reference_used")
+            or np.asarray(existing.ant1_self_reference_used).shape != ant_shape
+        ):
+            existing.ant1_self_reference_used = np.zeros(ant_shape, dtype=bool)
+        if (
+            not hasattr(existing, "phacal_inband_delay_ns")
+            or np.asarray(existing.phacal_inband_delay_ns).shape != shape
+        ):
+            existing.phacal_inband_delay_ns = np.zeros(shape, dtype=np.float64)
+        if not hasattr(existing, "phacal_inband_per_band_delay_ns"):
+            existing.phacal_inband_per_band_delay_ns = np.zeros((scan.layout.nsolant, 2, 0), dtype=np.float64)
+        if not hasattr(existing, "phacal_applied_inband_correction_ns"):
+            existing.phacal_applied_inband_correction_ns = np.zeros((scan.layout.nsolant, 2, 0), dtype=np.float64)
         return existing
     scan.phacal_state = PhacalSolveState(
         auto_delay_ns=np.zeros(shape, dtype=np.float64),
@@ -718,9 +885,15 @@ def ensure_phacal_solve_state(scan: ScanAnalysis) -> PhacalSolveState:
         prev_offset_rad=np.zeros(shape, dtype=np.float64),
         prev_valid=np.zeros(ant_shape, dtype=bool),
         manual_skip_override=np.zeros(ant_shape, dtype=bool),
+        manual_anchor_fallback_override=np.zeros(ant_shape, dtype=bool),
         fallback_used=np.zeros(ant_shape, dtype=bool),
+        donor_patch_used=np.zeros(ant_shape, dtype=bool),
         missing_in_phacal=np.zeros(ant_shape, dtype=bool),
         missing_in_refcal=np.zeros(ant_shape, dtype=bool),
+        ant1_self_reference_used=np.zeros(ant_shape, dtype=bool),
+        phacal_inband_delay_ns=np.zeros(shape, dtype=np.float64),
+        phacal_inband_per_band_delay_ns=np.zeros((scan.layout.nsolant, 2, 0), dtype=np.float64),
+        phacal_applied_inband_correction_ns=np.zeros((scan.layout.nsolant, 2, 0), dtype=np.float64),
     )
     return scan.phacal_state
 
@@ -1834,6 +2007,7 @@ def _fit_uniform_inband_delay(
     delay_flag = np.ones((layout.nsolant, 2), dtype=np.float64)
     band_centers_ghz = np.array([np.nanmean(freq_ghz[band_id == band]) for band in band_values], dtype=np.float64)
     kept_band_mask = np.ones((layout.nsolant, 2, nbands_used), dtype=bool)
+    xy_kept_band_mask = np.ones((layout.nsolant, nbands_used), dtype=bool)
     residual_kept_band_mask = np.ones((layout.nsolant, 2, nbands_used), dtype=bool)
     residual_auto_band_mask = np.ones((layout.nsolant, 2, nbands_used), dtype=bool)
     residual_mask_initialized = np.zeros((layout.nsolant, 2), dtype=bool)
@@ -1873,11 +2047,18 @@ def _fit_uniform_inband_delay(
         band_values=band_values,
         band_centers_ghz=band_centers_ghz,
         kept_band_mask=kept_band_mask,
+        xy_kept_band_mask=xy_kept_band_mask,
         residual_kept_band_mask=residual_kept_band_mask,
         residual_auto_band_mask=residual_auto_band_mask,
         residual_mask_initialized=residual_mask_initialized,
+        ant1_multiband_dip_center_ghz=np.nan,
+        ant1_multiband_dip_width_ghz=np.nan,
+        ant1_multiband_dip_depth_rad=np.nan,
+        ant1_multiband_lowfreq_weight_power=0.5,
+        ant1_manual_dxy_corr_rad=0.0,
         manual_ant_flag_override=np.zeros(layout.nsolant, dtype=bool),
         manual_ant_keep_override=np.zeros(layout.nsolant, dtype=bool),
+        multiband_fit_kind=np.array(["linear"] * layout.nsolant, dtype=object),
     )
 
 
@@ -2415,6 +2596,159 @@ def _zero_phacal_saved_solution(phacal: ScanAnalysis) -> None:
     phacal.mbd_flag = np.zeros((phacal.layout.nant, 2), dtype=np.float64)
 
 
+def _refcal_avg_for_phacal_anchor(refcal: ScanAnalysis) -> np.ndarray:
+    """Return time-averaged fine-channel refcal visibilities for phacal anchoring.
+
+    :param refcal: Anchor refcal analysis.
+    :type refcal: ScanAnalysis
+    :returns: ``(nsolant, 2, nchan)`` complex visibility array.
+    :rtype: np.ndarray
+    """
+
+    return _safe_complex_nanmean(refcal.corrected_channel_vis[: refcal.layout.nsolant, :2], axis=3)
+
+
+def _per_pol_transport_terms(
+    canonical_avg: np.ndarray,
+    secondary_avg: np.ndarray,
+    freq_hz: np.ndarray,
+    refcal: ScanAnalysis,
+    secondary_refcal: ScanAnalysis,
+    pol: int,
+) -> Tuple[float, float, bool]:
+    """Estimate common donor-to-canonical transport for one polarization.
+
+    :param canonical_avg: Canonical refcal time-averaged fine-channel visibilities.
+    :type canonical_avg: np.ndarray
+    :param secondary_avg: Secondary refcal time-averaged fine-channel visibilities.
+    :type secondary_avg: np.ndarray
+    :param freq_hz: Fine-channel frequencies in Hz.
+    :type freq_hz: np.ndarray
+    :param refcal: Canonical refcal.
+    :type refcal: ScanAnalysis
+    :param secondary_refcal: Secondary refcal.
+    :type secondary_refcal: ScanAnalysis
+    :param pol: Zero-based polarization index.
+    :type pol: int
+    :returns: Transport delay in ns, phase offset in rad, and whether the
+        estimate is robust enough to use.
+    :rtype: tuple[float, float, bool]
+    """
+
+    del secondary_refcal
+    delays_ns: List[float] = []
+    phi0_rad: List[float] = []
+    for ant in range(refcal.layout.nsolant):
+        canonical_vis = np.asarray(canonical_avg[ant, pol], dtype=np.complex128)
+        secondary_vis = np.asarray(secondary_avg[ant, pol], dtype=np.complex128)
+        if not np.any(_valid_complex_mask(canonical_vis)) or not np.any(_valid_complex_mask(secondary_vis)):
+            continue
+        if ant < refcal.flags.shape[0] and pol < refcal.flags.shape[1] and np.all(np.asarray(refcal.flags[ant, pol], dtype=int) != 0):
+            continue
+        valid = _valid_complex_mask(canonical_vis) & _valid_complex_mask(secondary_vis)
+        if np.count_nonzero(valid) < 4:
+            continue
+        ratio = np.divide(
+            secondary_vis[valid],
+            canonical_vis[valid],
+            out=np.full(np.count_nonzero(valid), np.nan + 0j, dtype=np.complex128),
+            where=np.abs(canonical_vis[valid]) > 0.0,
+        )
+        solved = solve_residual_delay_phi0(np.asarray(freq_hz[valid], dtype=np.float64), np.asarray(ratio, dtype=np.complex128))
+        if np.isfinite(solved["dly_res_s"]):
+            delays_ns.append(float(solved["dly_res_s"]) * 1e9)
+        if np.isfinite(solved["phi0_rad"]):
+            phi0_rad.append(float(solved["phi0_rad"]))
+    if len(delays_ns) < 2 or len(phi0_rad) < 2:
+        return 0.0, 0.0, False
+    return (
+        float(np.nanmedian(np.asarray(delays_ns, dtype=np.float64))),
+        float(np.angle(np.nanmean(np.exp(1j * np.asarray(phi0_rad, dtype=np.float64))))),
+        True,
+    )
+
+
+def _build_phacal_anchor_reference(
+    refcal: ScanAnalysis,
+    secondary_refcal: Optional[ScanAnalysis],
+    donor_patch_antennas: Optional[Sequence[int]] = None,
+) -> Dict[str, Any]:
+    """Build the effective anchor reference series used for one phacal solve.
+
+    :param refcal: Canonical refcal.
+    :type refcal: ScanAnalysis
+    :param secondary_refcal: Optional secondary refcal of the same feed.
+    :type secondary_refcal: ScanAnalysis | None
+    :returns: Effective anchor-reference arrays plus donor-patch provenance.
+    :rtype: dict[str, Any]
+    """
+
+    canonical_avg = _refcal_avg_for_phacal_anchor(refcal)
+    anchor_ref_avg = np.asarray(canonical_avg, dtype=np.complex128).copy()
+    nsolant = refcal.layout.nsolant
+    donor_patch_set = {
+        int(ant)
+        for ant in (donor_patch_antennas or [])
+        if 0 <= int(ant) < int(nsolant)
+    }
+    donor_patch_used = np.zeros(nsolant, dtype=bool)
+    patch_method = np.asarray(["none"] * nsolant, dtype=object)
+    donor_transport_delay_ns_by_pol = np.zeros(2, dtype=np.float64)
+    donor_transport_phase_offset_rad_by_pol = np.zeros(2, dtype=np.float64)
+    if (
+        secondary_refcal is None
+        or not secondary_refcal.raw
+        or scan_feed_kind(secondary_refcal) != scan_feed_kind(refcal)
+        or not donor_patch_set
+    ):
+        return {
+            "anchor_ref_avg": anchor_ref_avg,
+            "donor_patch_used": donor_patch_used,
+            "patch_method": patch_method.tolist(),
+            "patched_antennas": [],
+            "donor_transport_delay_ns_by_pol": donor_transport_delay_ns_by_pol,
+            "donor_transport_phase_offset_rad_by_pol": donor_transport_phase_offset_rad_by_pol,
+        }
+    secondary_avg = _refcal_avg_for_phacal_anchor(secondary_refcal)
+    freq_hz = np.asarray(refcal.raw["channel_freq_ghz"], dtype=np.float64) * 1e9
+    transport_terms = [_per_pol_transport_terms(canonical_avg, secondary_avg, freq_hz, refcal, secondary_refcal, pol) for pol in range(2)]
+    for pol in range(2):
+        donor_transport_delay_ns_by_pol[pol] = float(transport_terms[pol][0])
+        donor_transport_phase_offset_rad_by_pol[pol] = float(transport_terms[pol][1])
+    for ant in range(nsolant):
+        if ant not in donor_patch_set:
+            continue
+        donor_mode = "none"
+        patched_any_pol = False
+        for pol in range(2):
+            canonical_vis = np.asarray(canonical_avg[ant, pol], dtype=np.complex128)
+            secondary_vis = np.asarray(secondary_avg[ant, pol], dtype=np.complex128)
+            canonical_valid = np.any(_valid_complex_mask(canonical_vis))
+            secondary_valid = np.any(_valid_complex_mask(secondary_vis))
+            if not secondary_valid:
+                continue
+            donor_vis = np.asarray(secondary_vis, dtype=np.complex128).copy()
+            delay_ns, phi0_rad, robust = transport_terms[pol]
+            if robust:
+                donor_vis *= np.exp(-1j * (2.0 * np.pi * freq_hz * delay_ns * 1e-9 + phi0_rad))
+                donor_mode = "transported"
+            elif donor_mode == "none":
+                donor_mode = "direct"
+            anchor_ref_avg[ant, pol] = donor_vis
+            patched_any_pol = True
+        if patched_any_pol:
+            donor_patch_used[ant] = True
+            patch_method[ant] = donor_mode
+    return {
+        "anchor_ref_avg": anchor_ref_avg,
+        "donor_patch_used": donor_patch_used,
+        "patch_method": patch_method.tolist(),
+        "patched_antennas": [int(ant) for ant in np.where(donor_patch_used)[0].tolist()],
+        "donor_transport_delay_ns_by_pol": donor_transport_delay_ns_by_pol,
+        "donor_transport_phase_offset_rad_by_pol": donor_transport_phase_offset_rad_by_pol,
+    }
+
+
 def sync_phacal_saved_products(phacal: ScanAnalysis, refcal: ScanAnalysis) -> None:
     """Sync saved phacal delay/offset arrays from current phacal editor state.
 
@@ -2442,6 +2776,96 @@ def sync_phacal_saved_products(phacal: ScanAnalysis, refcal: ScanAnalysis) -> No
             phacal.offsets[ant, pol] = float(state.auto_offset_rad[ant, pol] + state.applied_offset_rad[ant, pol])
 
 
+def _flatten_per_band_slopes(
+    vis: np.ndarray,
+    freq_ghz: np.ndarray,
+    channel_band: np.ndarray,
+    valid: np.ndarray,
+) -> Tuple[np.ndarray, Dict[int, float]]:
+    """Remove per-band slope deviations while preserving the multiband delay.
+
+    Each band's within-band slope ``τ_k`` contains two contributions: the
+    shared multiband delay ``τ_multi`` common to all bands, and a per-band
+    wiggle ``w_k = τ_k − τ_multi`` specific to that band. If all of ``τ_k``
+    were removed from the band (full flattening), ``τ_multi`` would be lost
+    and the downstream multiband coherence search could not recover it. This
+    helper instead removes only ``w_k`` from each band — i.e., rotates the
+    band's channels by ``exp(−2πi·(f−fmid)·w_k)`` — so each band's slope
+    becomes exactly ``τ_multi`` and the multiband signal remains intact.
+
+    ``τ_multi`` is estimated as the weighted mean of the per-band slopes,
+    which is unbiased for zero-mean wiggles. The remaining slope in every
+    band after correction equals ``τ_multi``.
+
+    Mirrors the per-band fit used by :func:`_fit_uniform_inband_delay` and
+    the rotation used by :func:`_apply_uniform_delay`, but operates on a
+    single antenna/pol's per-channel time-averaged visibility.
+
+    :param vis: Per-channel complex visibility with shape ``(nchan,)``.
+    :type vis: np.ndarray
+    :param freq_ghz: Per-channel frequency in GHz with shape ``(nchan,)``.
+    :type freq_ghz: np.ndarray
+    :param channel_band: Per-channel band id with shape ``(nchan,)``.
+    :type channel_band: np.ndarray
+    :param valid: Per-channel validity mask with shape ``(nchan,)``.
+    :type valid: np.ndarray
+    :returns: ``(corrected_vis, per_band_delay_ns)``. ``per_band_delay_ns``
+        is a dict mapping band id to the fit slope in ns (the ``τ_k``
+        before any correction).
+    :rtype: tuple[np.ndarray, dict[int, float]]
+    """
+
+    corrected = np.asarray(vis, dtype=np.complex128).copy()
+    band_values = np.unique(channel_band[channel_band > 0])
+    per_band_delay_ns: Dict[int, float] = {}
+    band_channel_counts: Dict[int, int] = {}
+    finite_phase = np.isfinite(corrected.real) & np.isfinite(corrected.imag) & (np.abs(corrected) > 0.0)
+    valid_full = np.asarray(valid, dtype=bool) & finite_phase
+    for band_value in band_values:
+        all_band_idx = np.where(channel_band == band_value)[0]
+        fit_idx = all_band_idx[valid_full[all_band_idx]]
+        if fit_idx.size < 3:
+            per_band_delay_ns[int(band_value)] = float("nan")
+            band_channel_counts[int(band_value)] = 0
+            continue
+        try:
+            pfit = lin_phase_fit(freq_ghz[fit_idx], np.angle(corrected[fit_idx]))
+        except Exception:
+            per_band_delay_ns[int(band_value)] = float("nan")
+            band_channel_counts[int(band_value)] = 0
+            continue
+        tau_ns = float(pfit[1] / (2.0 * np.pi))
+        if not np.isfinite(tau_ns):
+            per_band_delay_ns[int(band_value)] = float("nan")
+            band_channel_counts[int(band_value)] = 0
+            continue
+        per_band_delay_ns[int(band_value)] = tau_ns
+        band_channel_counts[int(band_value)] = int(fit_idx.size)
+    # Weighted mean across bands gives the multiband delay estimate. The
+    # wiggle for each band is its slope minus this common τ.
+    valid_taus = np.array(
+        [per_band_delay_ns[int(b)] for b in band_values if np.isfinite(per_band_delay_ns[int(b)])],
+        dtype=float,
+    )
+    valid_weights = np.array(
+        [band_channel_counts[int(b)] for b in band_values if np.isfinite(per_band_delay_ns[int(b)])],
+        dtype=float,
+    )
+    if valid_taus.size == 0 or valid_weights.sum() <= 0:
+        return corrected, per_band_delay_ns
+    tau_multi = float(np.nansum(valid_taus * valid_weights) / np.nansum(valid_weights))
+    for band_value in band_values:
+        tau_k = per_band_delay_ns[int(band_value)]
+        if not np.isfinite(tau_k):
+            continue
+        wiggle_k = tau_k - tau_multi
+        all_band_idx = np.where(channel_band == band_value)[0]
+        fmid = float(np.nanmean(freq_ghz[all_band_idx]))
+        phase_corr = 2.0 * np.pi * (freq_ghz[all_band_idx] - fmid) * wiggle_k
+        corrected[all_band_idx] = corrected[all_band_idx] * np.exp(-1j * phase_corr)
+    return corrected, per_band_delay_ns
+
+
 def _solve_phacal_against_anchor(phacal: ScanAnalysis, refcal: ScanAnalysis) -> None:
     """Solve one phacal against the tuned anchor refcal on fine channels.
 
@@ -2464,7 +2888,49 @@ def _solve_phacal_against_anchor(phacal: ScanAnalysis, refcal: ScanAnalysis) -> 
     freq_hz = freq_ghz * 1e9
     channel_band = np.asarray(phacal.raw.get("channel_band", np.zeros(freq_ghz.shape, dtype=int)), dtype=int)
     phacal_avg = _safe_complex_nanmean(phacal.corrected_channel_vis[: phacal.layout.nsolant, :2], axis=3)
-    ref_avg = _safe_complex_nanmean(refcal.corrected_channel_vis[: refcal.layout.nsolant, :2], axis=3)
+    ref_avg = np.asarray(
+        phacal.raw.get("anchor_ref_avg", _refcal_avg_for_phacal_anchor(refcal)),
+        dtype=np.complex128,
+    )
+    donor_patch_used = np.asarray(phacal.raw.get("donor_patch_used", np.zeros(phacal.layout.nsolant, dtype=bool)), dtype=bool)
+    state.ant1_self_reference_used[:] = False
+    # Per-band in-band delays for fallback antennas: re-derived each solve
+    # from the phacal-self-referenced data (refcal-style procedure). For
+    # non-fallback antennas the entries remain NaN. The shape may need to
+    # grow to match the current band count if the session changed scans.
+    band_values_chan = np.unique(channel_band[channel_band > 0])
+    nbands_chan = int(band_values_chan.size)
+    nsolant = phacal.layout.nsolant
+    if state.phacal_inband_per_band_delay_ns.shape != (nsolant, 2, nbands_chan):
+        state.phacal_inband_per_band_delay_ns = np.full((nsolant, 2, nbands_chan), np.nan, dtype=np.float64)
+    else:
+        state.phacal_inband_per_band_delay_ns[:] = np.nan
+    if state.phacal_inband_delay_ns.shape != (nsolant, 2):
+        state.phacal_inband_delay_ns = np.zeros((nsolant, 2), dtype=np.float64)
+    else:
+        state.phacal_inband_delay_ns[:] = 0.0
+    ant1_ph_vis_by_pol: List[Optional[np.ndarray]] = [None, None]
+    ant1_ph_valid_by_pol: List[Optional[np.ndarray]] = [None, None]
+    ant1_self_ref_available = False
+    if phacal.layout.nsolant > 0:
+        ant1_ph_x = np.asarray(phacal_avg[0, 0], dtype=np.complex128)
+        ant1_ph_y = np.asarray(phacal_avg[0, 1], dtype=np.complex128)
+        ant1_ref_x = np.asarray(ref_avg[0, 0], dtype=np.complex128)
+        ant1_ref_y = np.asarray(ref_avg[0, 1], dtype=np.complex128)
+        ant1_ph_valid_x = _valid_complex_mask(ant1_ph_x)
+        ant1_ph_valid_y = _valid_complex_mask(ant1_ph_y)
+        ant1_ref_valid_x = _valid_complex_mask(ant1_ref_x)
+        ant1_ref_valid_y = _valid_complex_mask(ant1_ref_y)
+        ant1_missing_phacal = not (np.any(ant1_ph_valid_x) and np.any(ant1_ph_valid_y))
+        ant1_missing_refcal = not (np.any(ant1_ref_valid_x) and np.any(ant1_ref_valid_y))
+        ant1_in_fallback = bool(
+            (not ant1_missing_phacal)
+            and (ant1_missing_refcal or state.manual_anchor_fallback_override[0])
+        )
+        ant1_self_ref_available = (not ant1_missing_phacal) and (not ant1_in_fallback)
+        if ant1_self_ref_available:
+            ant1_ph_vis_by_pol = [ant1_ph_x, ant1_ph_y]
+            ant1_ph_valid_by_pol = [ant1_ph_valid_x, ant1_ph_valid_y]
     for ant in range(phacal.layout.nsolant):
         ph_x = np.asarray(phacal_avg[ant, 0], dtype=np.complex128)
         ph_y = np.asarray(phacal_avg[ant, 1], dtype=np.complex128)
@@ -2478,7 +2944,10 @@ def _solve_phacal_against_anchor(phacal: ScanAnalysis, refcal: ScanAnalysis) -> 
         missing_in_refcal = not (np.any(ref_valid_x) and np.any(ref_valid_y))
         state.missing_in_phacal[ant] = bool(missing_in_phacal)
         state.missing_in_refcal[ant] = bool((not missing_in_phacal) and missing_in_refcal)
-        state.fallback_used[ant] = bool((not missing_in_phacal) and missing_in_refcal)
+        state.donor_patch_used[ant] = bool(ant < donor_patch_used.size and donor_patch_used[ant])
+        state.fallback_used[ant] = bool((not missing_in_phacal) and (missing_in_refcal or state.manual_anchor_fallback_override[ant]))
+        use_ant1_self_ref = bool(state.fallback_used[ant] and ant != 0 and ant1_self_ref_available)
+        state.ant1_self_reference_used[ant] = use_ant1_self_ref
         if missing_in_phacal:
             state.auto_delay_ns[ant, :] = 0.0
             state.auto_offset_rad[ant, :] = 0.0
@@ -2509,7 +2978,17 @@ def _solve_phacal_against_anchor(phacal: ScanAnalysis, refcal: ScanAnalysis) -> 
                 if kept_bands.size
                 else np.zeros(channel_band.shape, dtype=bool)
             )
-            if missing_in_refcal:
+            if use_ant1_self_ref:
+                ant1_ph = ant1_ph_vis_by_pol[pol]
+                ant1_valid = ant1_ph_valid_by_pol[pol]
+                valid = np.asarray(ph_valid & ant1_valid & keep_channels, dtype=bool)
+                vis = np.divide(
+                    np.asarray(ph_vis, dtype=np.complex128),
+                    np.asarray(ant1_ph, dtype=np.complex128),
+                    out=np.full(ph_vis.shape, np.nan + 0j, dtype=np.complex128),
+                    where=valid,
+                )
+            elif state.fallback_used[ant]:
                 vis = np.asarray(ph_vis, dtype=np.complex128)
                 valid = np.asarray(ph_valid & keep_channels, dtype=bool)
             else:
@@ -2520,6 +2999,24 @@ def _solve_phacal_against_anchor(phacal: ScanAnalysis, refcal: ScanAnalysis) -> 
                     out=np.full(ph_vis.shape, np.nan + 0j, dtype=np.complex128),
                     where=valid,
                 )
+            if state.fallback_used[ant]:
+                # Refcal's per-band in-band delay correction was bad/missing
+                # for this antenna. Derive it now from the phacal-self-
+                # referenced data and rotate each band to flatten its slope
+                # before the multiband coherence search runs.
+                vis, per_band_delays = _flatten_per_band_slopes(
+                    vis, freq_ghz, channel_band, valid,
+                )
+                if state.phacal_inband_per_band_delay_ns.shape == (nsolant, 2, nbands_chan):
+                    for band_idx, band_value in enumerate(band_values_chan):
+                        state.phacal_inband_per_band_delay_ns[ant, pol, band_idx] = (
+                            per_band_delays.get(int(band_value), float("nan"))
+                        )
+                    finite_delays = state.phacal_inband_per_band_delay_ns[ant, pol]
+                    finite_delays = finite_delays[np.isfinite(finite_delays)]
+                    state.phacal_inband_delay_ns[ant, pol] = (
+                        float(np.nanmean(finite_delays)) if finite_delays.size else 0.0
+                    )
             base_vis.append(vis)
             base_masks.append(valid)
 
@@ -2629,14 +3126,17 @@ def _phase_diff(phacal: ScanAnalysis, refcal: ScanAnalysis) -> None:
             x = x[finite]
             y = y[finite]
             sigma_fit = sigma_fit[finite]
-            fit, _pcov = curve_fit(
-                mbdfunc0,
-                x,
-                y,
-                p0=[0.0],
-                sigma=sigma_fit,
-                absolute_sigma=False,
-            )
+            try:
+                fit, _pcov = curve_fit(
+                    mbdfunc0,
+                    np.asarray(x, dtype=np.float64),
+                    np.asarray(y, dtype=np.float64),
+                    p0=[0.0],
+                    sigma=np.asarray(sigma_fit, dtype=np.float64),
+                    absolute_sigma=False,
+                )
+            except (ValueError, FloatingPointError):
+                continue
             slopes[ant, pol] = fit[0] + t0
     phacal.mbd = slopes
     phacal.mbd_flag = flag
@@ -2648,6 +3148,8 @@ def _phase_diff(phacal: ScanAnalysis, refcal: ScanAnalysis) -> None:
 def analyze_phacal_input(
     file_or_npz: str,
     refcal: ScanAnalysis,
+    secondary_refcal: Optional[ScanAnalysis] = None,
+    donor_patch_antennas: Optional[Sequence[int]] = None,
     scan_id: int = -1,
     navg: int = 3,
     quackint: float = 120.0,
@@ -2716,6 +3218,27 @@ def analyze_phacal_input(
         phacal.delay_solution.manual_ant_flag_override[:] = False
         phacal.delay_solution.manual_ant_keep_override[:] = False
     _phase_diff(phacal, refcal)
+    anchor_reference = _build_phacal_anchor_reference(
+        refcal,
+        secondary_refcal,
+        donor_patch_antennas=donor_patch_antennas,
+    )
+    phacal.raw["anchor_ref_avg"] = np.asarray(anchor_reference["anchor_ref_avg"], dtype=np.complex128)
+    phacal.raw["donor_patch_used"] = np.asarray(anchor_reference["donor_patch_used"], dtype=bool)
+    phacal.scan_meta.update(
+        {
+            "canonical_refcal_scan_id": int(refcal.scan_id),
+            "canonical_refcal_time": refcal.timestamp.iso[:19],
+            "secondary_refcal_scan_id": None if secondary_refcal is None else int(secondary_refcal.scan_id),
+            "secondary_refcal_time": None if secondary_refcal is None else secondary_refcal.timestamp.iso[:19],
+            "patched_from_secondary": bool(np.any(anchor_reference["donor_patch_used"])),
+            "drift_adjusted_to_canonical": bool(np.any(np.asarray(anchor_reference["patch_method"], dtype=object) == "transported")),
+            "patched_antennas": list(anchor_reference["patched_antennas"]),
+            "patch_method": list(anchor_reference["patch_method"]),
+            "donor_transport_delay_ns_by_pol": np.asarray(anchor_reference["donor_transport_delay_ns_by_pol"], dtype=np.float64).tolist(),
+            "donor_transport_phase_offset_rad_by_pol": np.asarray(anchor_reference["donor_transport_phase_offset_rad_by_pol"], dtype=np.float64).tolist(),
+        }
+    )
     _solve_phacal_against_anchor(phacal, refcal)
     return phacal
 
@@ -2835,11 +3358,21 @@ def write_sidecar(scan: ScanAnalysis) -> str:
         "band_values": scan.delay_solution.band_values,
         "band_centers_ghz": scan.delay_solution.band_centers_ghz,
         "kept_band_mask": scan.delay_solution.kept_band_mask.astype(np.uint8),
+        "xy_kept_band_mask": scan.delay_solution.xy_kept_band_mask.astype(np.uint8),
         "residual_kept_band_mask": scan.delay_solution.residual_kept_band_mask.astype(np.uint8),
         "residual_auto_band_mask": scan.delay_solution.residual_auto_band_mask.astype(np.uint8),
         "residual_mask_initialized": scan.delay_solution.residual_mask_initialized.astype(np.uint8),
+        "ant1_multiband_dip_center_ghz": np.asarray(scan.delay_solution.ant1_multiband_dip_center_ghz, dtype=np.float64),
+        "ant1_multiband_dip_width_ghz": np.asarray(scan.delay_solution.ant1_multiband_dip_width_ghz, dtype=np.float64),
+        "ant1_multiband_dip_depth_rad": np.asarray(scan.delay_solution.ant1_multiband_dip_depth_rad, dtype=np.float64),
+        "ant1_multiband_lowfreq_weight_power": np.asarray(scan.delay_solution.ant1_multiband_lowfreq_weight_power, dtype=np.float64),
+        "ant1_manual_dxy_corr_rad": np.asarray(scan.delay_solution.ant1_manual_dxy_corr_rad, dtype=np.float64),
         "manual_ant_flag_override": np.asarray(scan.delay_solution.manual_ant_flag_override, dtype=np.uint8),
         "manual_ant_keep_override": np.asarray(scan.delay_solution.manual_ant_keep_override, dtype=np.uint8),
+        "multiband_fit_kind": np.asarray(
+            [str(kind) for kind in np.atleast_1d(scan.delay_solution.multiband_fit_kind)],
+            dtype=str,
+        ),
         "active_band_start": active_band_start,
         "active_band_end": active_band_end,
         "fghz_band": scan.fghz_band,
@@ -2871,6 +3404,20 @@ def find_sidecar_by_timestamp(timestamp: Time, root: Optional[Path] = None) -> O
     return str(matches[0])
 
 
+def _load_multiband_fit_kind(raw: Any, nsolant: int) -> np.ndarray:
+    """Load per-antenna multiband fit-kind labels from a sidecar payload."""
+
+    valid = {"linear", "poly2", "poly3"}
+    out = np.array(["linear"] * int(nsolant), dtype=object)
+    if raw is None:
+        return out
+    arr = np.atleast_1d(np.asarray(raw))
+    for idx in range(min(arr.size, int(nsolant))):
+        kind = str(arr[idx])
+        out[idx] = kind if kind in valid else "linear"
+    return out
+
+
 def attach_sidecar_delay(scan: ScanAnalysis, sidecar: Dict[str, Any]) -> None:
     """Attach saved delay metadata to a scan."""
 
@@ -2897,6 +3444,12 @@ def attach_sidecar_delay(scan: ScanAnalysis, sidecar: Dict[str, Any]) -> None:
     kept_band_mask = np.asarray(kept_band_mask, dtype=bool)
     if kept_band_mask.shape != (nsolant, 2, band_values.size):
         kept_band_mask = np.ones((nsolant, 2, band_values.size), dtype=bool)
+    xy_kept_band_mask = np.asarray(
+        sidecar.get("xy_kept_band_mask", np.ones((nsolant, band_values.size), dtype=np.uint8)),
+        dtype=bool,
+    )
+    if xy_kept_band_mask.shape != (nsolant, band_values.size):
+        xy_kept_band_mask = np.ones((nsolant, band_values.size), dtype=bool)
     residual_kept_band_mask = np.asarray(
         sidecar.get("residual_kept_band_mask", np.ones((nsolant, 2, band_values.size), dtype=np.uint8)),
         dtype=bool,
@@ -2931,9 +3484,15 @@ def attach_sidecar_delay(scan: ScanAnalysis, sidecar: Dict[str, Any]) -> None:
         band_values=band_values,
         band_centers_ghz=np.asarray(sidecar["band_centers_ghz"], dtype=np.float64),
         kept_band_mask=kept_band_mask,
+        xy_kept_band_mask=xy_kept_band_mask,
         residual_kept_band_mask=residual_kept_band_mask,
         residual_auto_band_mask=residual_auto_band_mask,
         residual_mask_initialized=residual_mask_initialized,
+        ant1_multiband_dip_center_ghz=float(sidecar.get("ant1_multiband_dip_center_ghz", np.nan)),
+        ant1_multiband_dip_width_ghz=float(sidecar.get("ant1_multiband_dip_width_ghz", np.nan)),
+        ant1_multiband_dip_depth_rad=float(sidecar.get("ant1_multiband_dip_depth_rad", np.nan)),
+        ant1_multiband_lowfreq_weight_power=float(sidecar.get("ant1_multiband_lowfreq_weight_power", 0.5)),
+        ant1_manual_dxy_corr_rad=float(sidecar.get("ant1_manual_dxy_corr_rad", 0.0)),
         manual_ant_flag_override=np.asarray(
             sidecar.get("manual_ant_flag_override", np.zeros(nsolant, dtype=np.uint8)),
             dtype=bool,
@@ -2942,6 +3501,7 @@ def attach_sidecar_delay(scan: ScanAnalysis, sidecar: Dict[str, Any]) -> None:
             sidecar.get("manual_ant_keep_override", np.zeros(nsolant, dtype=np.uint8)),
             dtype=bool,
         ),
+        multiband_fit_kind=_load_multiband_fit_kind(sidecar.get("multiband_fit_kind"), nsolant),
     )
     scan.delay_solution = delay_solution
     scan.sidecar_path = scan.sidecar_path or ""

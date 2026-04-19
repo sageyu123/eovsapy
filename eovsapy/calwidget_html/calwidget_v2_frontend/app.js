@@ -18,6 +18,13 @@
       panelHeight: 116,
     },
     {
+      id: "phacal_phase_compare",
+      label: "Refcal vs Phacal Phase",
+      showLegend: false,
+      panelHeight: 116,
+      phacalOnly: true,
+    },
+    {
       id: "inband_fit",
       label: "Inband Fit",
       showLegend: true,
@@ -28,6 +35,7 @@
       label: "Relative Phase + Fit",
       showLegend: true,
       panelHeight: 138,
+      refcalOnly: true,
     },
     {
       id: "inband_residual_phase_band",
@@ -222,6 +230,10 @@
     return trimZeros(value.toFixed(3));
   }
 
+  function formatEditorValue(value) {
+    return Number.isFinite(Number(value)) ? formatNumber(Number(value)) : "";
+  }
+
   function jdToDate(jd) {
     if (!Number.isFinite(jd)) {
       return null;
@@ -246,6 +258,14 @@
 
   function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
+  }
+
+  function parseOptionalFloat(value) {
+    if (value === null || value === undefined || value === "") {
+      return null;
+    }
+    const parsed = parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : null;
   }
 
   function hexToRgb(hex) {
@@ -364,6 +384,117 @@
       next = next.replace(item[0], item[1]);
     });
     return next;
+  }
+
+  function workflowGuideState(options) {
+    const state = options && options.state ? options.state : null;
+    const checkedScans = options && Array.isArray(options.checkedScans) ? options.checkedScans : [];
+    const compareData = options ? options.compareData : null;
+    const isPhacalScan = !!(options && options.isPhacalScan);
+    const activeRef = state && state.active_refcal ? state.active_refcal : null;
+    const activePhacal = state && state.active_phacal ? state.active_phacal : null;
+    const scans = state && Array.isArray(state.scans) ? state.scans : [];
+    const sameFeedPair =
+      checkedScans.length === 2 &&
+      String(checkedScans[0].feed_kind || "") === String(checkedScans[1].feed_kind || "");
+    const analyzedSecondaryNotUsed =
+      !!activeRef &&
+      scans.some(function (scan) {
+        return (
+          intOrNull(scan.scan_id) !== intOrNull(activeRef.scan_id) &&
+          (!!scan.analyzed || String(scan.status || "").indexOf("refcal") >= 0) &&
+          String(scan.feed_kind || "") === String(activeRef.feed_kind || "") &&
+          intOrNull(scan.scan_id) !== intOrNull(state.secondary_ref_scan_id)
+        );
+      });
+
+    if (!state) {
+      return {
+        title: "Load a day",
+        next: "Pick a date and wait for the scan list to load.",
+        steps: [
+          "Choose a candidate refcal scan first.",
+          "If you have morning and evening refcals of the same feed, you will analyze them separately before comparing them.",
+        ],
+      };
+    }
+
+    if (compareData) {
+      return {
+        title: "Compare 2 same-feed refcals",
+        next: "Choose the cleaner scan as Canonical. Set the other as Secondary only if it helps donor antennas or drift transport.",
+        steps: [
+          "Compare Sum X & Y Phase first. Prefer the scan with fewer missing antennas and fewer obvious bad columns.",
+          "Then compare Inband Fit and Relative Phase + Fit. The better canonical anchor is the one with cleaner in-band structure and more usable antennas after tuning.",
+          "Set Secondary only if it helps donor antennas or drift. Otherwise leave it unset; it contributes nothing.",
+          "After Canonical and optional Secondary are chosen, close compare and tune the canonical refcal before analyzing any phacal.",
+        ],
+      };
+    }
+
+    if (!activeRef) {
+      return {
+        title: "Start with a refcal",
+        next: sameFeedPair
+          ? "Analyze the two selected same-feed refcals one by one. Then click Compare 2 Anchors."
+          : "Select one refcal candidate and click Analyze Refcal. If it looks good, click Set Refcal.",
+        steps: [
+          "One-anchor path: analyze one refcal, inspect it, then Set Refcal when you trust it.",
+          "Two-anchor same-feed path: analyze morning and evening separately, multi-select the two rows, click Compare 2 Anchors, then choose Canonical and optional Secondary.",
+          "HI and LO are handled independently. The LO/HI Combine 2 Refcals path is only for true feed-pair combination, not for morning/evening comparison.",
+        ],
+      };
+    }
+
+    if (isPhacalScan && activePhacal) {
+      return {
+        title: "Solve phacal against the anchor",
+        next: "Read Refcal vs Phacal Phase first, then fix obvious slope failures directly in Anchor-Ref. Phase with masking and refit.",
+        steps: [
+          "If Refcal phase is bad but Phacal phase is good for one antenna, use Temp Fallback for that antenna only.",
+          "Anchor-Ref. Phase is the primary solve surface. Mask bad frequencies there, Preview, then Commit when the slope looks right.",
+          "Use the residual panels only after the multiband solve looks reasonable. They are advanced QA, not the first solve step.",
+          "When the phacal solve is acceptable, Save SQL. Save NPZ whenever you want a bundle of the current derived products.",
+        ],
+        note: activePhacal.secondary_anchor_scan_id
+          ? "Secondary anchor is active as donor/drift support only. The canonical anchor remains the model source."
+          : analyzedSecondaryNotUsed
+            ? "Another same-feed refcal has been analyzed, but it is not part of the solution because you did not set it as Secondary."
+            : "If you later want donor/drift support, set a same-feed secondary refcal and re-analyze the phacal.",
+      };
+    }
+
+    if (isPhacalScan && !activePhacal) {
+      return {
+        title: "Analyze the selected phacal",
+        next: "Keep the current Canonical refcal, then click Analyze Phacal on the selected phacal row.",
+        steps: [
+          "Do not move to phacal until the canonical refcal looks trustworthy.",
+          "If you have a second same-feed refcal that helps missing antennas or drift, set it as Secondary before analyzing the phacal.",
+          "After Analyze Phacal, start with Refcal vs Phacal Phase, then move to Anchor-Ref. Phase.",
+        ],
+      };
+    }
+
+    return {
+      title: "Tune the canonical refcal",
+      next: "Inspect the canonical refcal in order: Sum X & Y Phase, Inband Fit, Relative Phase + Fit, then Per-Band Residual Phase. When it is stable, move to phacals.",
+      steps: [
+        "If you have two same-feed refcals, analyze both separately first. Use Compare 2 Anchors to choose Canonical and optional Secondary.",
+        "Canonical is the real anchor. Secondary is donor/drift support only, mainly for missing or unusable antennas in the canonical anchor.",
+        "Tune gross in-band delay first, then multiband relative phase, then residual cleanup.",
+        "Once you are satisfied with the refcal, select a phacal row and click Analyze Phacal.",
+      ],
+      note: state.secondary_ref_scan_id !== null
+        ? "Secondary anchor is already set. It will be used only for donor patching and drift transport where applicable."
+        : analyzedSecondaryNotUsed
+          ? "A second same-feed refcal has been analyzed, but it is not part of the solution until you explicitly set it as Secondary."
+          : "If one morning/evening same-feed refcal has better donor antennas than the canonical anchor, set it as Secondary before moving to phacal.",
+    };
+  }
+
+  function intOrNull(value) {
+    return value === null || value === undefined ? null : Number(value);
   }
 
   function sameKeptRanges(left, right) {
@@ -621,6 +752,22 @@
     const nextPanel = Object.assign({}, panel, { kept_ranges: nextRanges });
     if (panel && typeof panel.annotation === "string" && panel.annotation.indexOf("| kept ") >= 0) {
       nextPanel.annotation = panel.annotation.replace(/\| kept .*/, "| kept " + formatKeptRangesLabel(nextRanges, bandEdges));
+    }
+    if (panel && Array.isArray(panel.series)) {
+      const keptMask = bandMaskFromRanges(nextRanges, bandEdges);
+      const keptBandSet = new Set();
+      (bandEdges || []).forEach(function (edge, idx) {
+        if (keptMask[idx]) {
+          keptBandSet.add(Number(edge.band));
+        }
+      });
+      nextPanel.series = panel.series.map(function (series) {
+        if (!series || series.role !== "data" || series.band === undefined) {
+          return series;
+        }
+        const inKept = keptBandSet.has(Number(series.band));
+        return Object.assign({}, series, { opacity: inKept ? 0.95 : 0.18 });
+      });
     }
     return nextPanel;
   }
@@ -1251,6 +1398,9 @@
   function MiniPanelPlot(props) {
     const [dragState, setDragState] = useState(null);
     const [showHint, setShowHint] = useState(false);
+    const [hintPos, setHintPos] = useState({ x: 0, y: 0 });
+    const hintTimerRef = useRef(null);
+    const containerRef = useRef(null);
     const clipIdRef = useRef("mini-clip-" + Math.random().toString(36).slice(2));
     const panel = props.panel || {};
     const xLimits = props.xLimits || [0, 1];
@@ -1527,8 +1677,29 @@
             height: Math.max(Math.abs(yMap(dragState.currentY) - yMap(dragState.startY)), 1.5),
           }
         : null;
+    function startHintTimer(event) {
+      if (!hintText) return;
+      const rect = containerRef.current && containerRef.current.getBoundingClientRect();
+      if (rect) {
+        setHintPos({ x: event.clientX - rect.left, y: event.clientY - rect.top });
+      }
+      if (hintTimerRef.current) {
+        clearTimeout(hintTimerRef.current);
+      }
+      hintTimerRef.current = setTimeout(function () {
+        setShowHint(true);
+      }, 600);
+    }
+    function clearHintTimer() {
+      if (hintTimerRef.current) {
+        clearTimeout(hintTimerRef.current);
+        hintTimerRef.current = null;
+      }
+      setShowHint(false);
+    }
     return html`
       <div
+        ref=${containerRef}
         className=${"mini-plot-shell"
           + (interactionMode ? " interactive" : props.onDoubleClick ? " interactive" : "")
           + (panel.disabled ? " disabled" : "")}
@@ -1543,16 +1714,30 @@
           }
         }}
         title=${null}
-        onMouseEnter=${function () {
-          if (hintText) {
-            setShowHint(true);
+        onMouseEnter=${startHintTimer}
+        onMouseMove=${function (event) {
+          if (!hintText) return;
+          const rect = containerRef.current && containerRef.current.getBoundingClientRect();
+          if (rect) {
+            setHintPos({ x: event.clientX - rect.left, y: event.clientY - rect.top });
+          }
+          if (!showHint) {
+            // While the hover delay is running, restart the timer so the
+            // tooltip appears at the cursor's current position rather than
+            // where the mouse first entered.
+            if (hintTimerRef.current) {
+              clearTimeout(hintTimerRef.current);
+            }
+            hintTimerRef.current = setTimeout(function () {
+              setShowHint(true);
+            }, 600);
           }
         }}
-        onMouseLeave=${function () {
-          setShowHint(false);
-        }}
+        onMouseLeave=${clearHintTimer}
       >
-        ${showHint && hintText ? html`<div className="mini-plot-hint">${hintText}</div>` : null}
+        ${showHint && hintText
+          ? html`<div className="mini-plot-hint" style=${{ left: (hintPos.x + 14) + "px", top: (hintPos.y + 18) + "px" }}>${hintText}</div>`
+          : null}
         <svg viewBox=${"0 0 " + width + " " + height} className="mini-plot" preserveAspectRatio="xMidYMid meet" role="img" aria-label=${panel.title || "panel"}>
           <defs>
             <clipPath id=${clipIdRef.current}>
@@ -1934,6 +2119,186 @@
     `;
   }
 
+  function AnchorCompareView(props) {
+    const data = props.data;
+    if (!data) {
+      return null;
+    }
+    if (data.message) {
+      return html`
+        <section className="plot-card anchor-compare-card">
+          <div className="plot-card-body">
+            <div className="plot-placeholder">${data.message}</div>
+          </div>
+        </section>
+      `;
+    }
+    function sectionPanelHeight(sectionId) {
+      if (sectionId === "sum_pha") {
+        return 116;
+      }
+      return 138;
+    }
+    function summaryBlock(summary) {
+      const scanId = Number(summary.scan_id);
+      const isCanonical = props.canonicalId === scanId;
+      const isSecondary = props.secondaryId === scanId;
+      return html`
+        <div className=${"anchor-compare-summary" + (isCanonical ? " canonical" : "") + (isSecondary ? " secondary" : "")}>
+          <div className="anchor-compare-summary-title">
+            <strong>${(summary.scan_time || "") + " · " + String(summary.feed_kind || "").toUpperCase()}</strong>
+            <span>${summary.source || ""}</span>
+          </div>
+          <div className="tiny">
+            ${"Kept " + summary.kept_antennas + " / " + summary.total_antennas + " · Flagged " + summary.flagged_antennas}
+          </div>
+          <div className="anchor-compare-summary-actions">
+            <button
+              type="button"
+              className=${isCanonical ? "btn-dark-fill" : "btn-outline-blue"}
+              disabled=${props.busy || isCanonical}
+              onClick=${function () {
+                props.onSetCanonical(scanId);
+              }}
+            >
+              ${isCanonical ? "Canonical" : "Set Canonical"}
+            </button>
+            <button
+              type="button"
+              className=${isSecondary ? "btn-dark-fill" : "btn-outline-blue"}
+              disabled=${props.busy || isCanonical}
+              onClick=${function () {
+                if (isSecondary) {
+                  props.onClearSecondary();
+                } else {
+                  props.onSetSecondary(scanId);
+                }
+              }}
+            >
+              ${isSecondary ? "Clear Secondary" : "Set Secondary"}
+            </button>
+          </div>
+        </div>
+      `;
+    }
+    function donorPatchBlock() {
+      const donor = data.donor_patch || null;
+      if (!donor) {
+        return null;
+      }
+      return html`
+        <div className="anchor-donor-block">
+          <div className="anchor-donor-header">
+            <strong>Donor Patch</strong>
+            <span className="tiny">
+              ${donor.enabled
+                ? "Secondary stays inert until you explicitly apply donor antennas."
+                : "Set Canonical and Secondary to enable donor patching."}
+            </span>
+          </div>
+          <div className="anchor-donor-candidates">
+            ${(donor.candidates || []).map(function (candidate) {
+              const disabled = props.busy || !donor.enabled || !candidate.can_patch;
+              const className =
+                "anchor-donor-chip"
+                + (candidate.recommended ? " recommended" : "")
+                + (candidate.staged ? " staged" : "")
+                + (candidate.applied ? " applied" : "")
+                + (disabled ? " disabled" : "");
+              return html`
+                <button
+                  type="button"
+                  key=${candidate.antenna}
+                  className=${className}
+                  disabled=${disabled}
+                  title=${candidate.reason || ""}
+                  onClick=${function () {
+                    props.onToggleDonorPatch(candidate.antenna, !candidate.staged);
+                  }}
+                >
+                  <span>${candidate.label}</span>
+                  <span className="tiny">${candidate.reason}</span>
+                </button>
+              `;
+            })}
+          </div>
+          <div className="anchor-donor-actions">
+            <button
+              type="button"
+              className="btn-outline-blue"
+              disabled=${props.busy || !donor.enabled}
+              onClick=${props.onApplyDonorPatch}
+            >
+              Apply Donor Patch
+            </button>
+            ${(donor.applied_antennas || []).length
+              ? html`<span className="tiny">${"Applied: " + donor.applied_antennas.map(function (ant) {
+                  return "Ant " + String(Number(ant) + 1);
+                }).join(", ")}</span>`
+              : null}
+          </div>
+        </div>
+      `;
+    }
+    return html`
+      <section className="plot-card anchor-compare-card">
+        <div className="plot-card-header">
+          <div className="plot-card-title-row">
+            <h2>${abbreviateWallLabel(data.title || "Compare 2 Anchors")}</h2>
+            <span className="plot-card-meta">${String(data.feed_kind || "").toUpperCase() + " same-feed compare"}</span>
+            <div className="plot-card-inline-controls">
+              <button
+                type="button"
+                className="btn-outline-blue"
+                disabled=${props.busy}
+                onClick=${props.onClearCompare}
+              >
+                Close Compare
+              </button>
+            </div>
+          </div>
+        </div>
+        <div className="plot-card-body">
+          <div className="anchor-compare-summary-row">
+            ${summaryBlock(data.left || {})}
+            ${summaryBlock(data.right || {})}
+          </div>
+          ${donorPatchBlock()}
+          <div className="anchor-compare-sections">
+            ${(data.sections || []).map(function (section) {
+              return html`
+                <div key=${section.id} className="anchor-compare-section-row">
+                  <${PlotCard}
+                    title=${(section.left && section.left.title) || section.title}
+                    legend=${section.left && section.left.legend}
+                  >
+                    <${PanelGridPlot}
+                      data=${section.left}
+                      hideLegend=${true}
+                      busy=${props.busy}
+                      panelHeight=${sectionPanelHeight(section.id)}
+                    />
+                  </${PlotCard}>
+                  <${PlotCard}
+                    title=${(section.right && section.right.title) || section.title}
+                    legend=${section.right && section.right.legend}
+                  >
+                    <${PanelGridPlot}
+                      data=${section.right}
+                      hideLegend=${true}
+                      busy=${props.busy}
+                      panelHeight=${sectionPanelHeight(section.id)}
+                    />
+                  </${PlotCard}>
+                </div>
+              `;
+            })}
+          </div>
+        </div>
+      </section>
+    `;
+  }
+
   function InbandWindowControls(props) {
     return html`
       <div className="inband-window-controls">
@@ -1957,7 +2322,7 @@
             })}
           </div>
         </div>
-        <div className="inband-scope-group">
+        ${!props.hidePol ? html`<div className="inband-scope-group">
           <span className="tiny">Polarizations</span>
           <div className="scope-pills" role="group" aria-label="Inband polarization scope">
             ${INBAND_SCOPE_OPTIONS.map(function (item) {
@@ -1976,11 +2341,12 @@
               `;
             })}
           </div>
-        </div>
+        </div>` : null}
         <button
           type="button"
           className="btn-outline-blue"
           disabled=${props.busy || !props.hasPending}
+          title="Commit the staged in-band mask using the antenna/pol scope above"
           onClick=${function () {
             props.onApply();
           }}
@@ -3034,18 +3400,34 @@
     const [timeFlagScope, setTimeFlagScope] = useState("selected");
     const [inbandAntennaScope, setInbandAntennaScope] = useState("selected");
     const [inbandPolScope, setInbandPolScope] = useState("selected");
+    const [phacalMaskMode, setPhacalMaskMode] = useState("shared_xy");
     const [delayDraft, setDelayDraft] = useState({ ant: 1, x: "", y: "" });
     const [relativeDelayDraft, setRelativeDelayDraft] = useState({ ant: 1, x: "", y: "", xoff: "", yoff: "" });
+    const [residualPatchDraft, setResidualPatchDraft] = useState({
+      ant: 1,
+      xBlue: "",
+      yBlue: "",
+      xRed: "",
+      yRed: "",
+    });
+    const [ant1DxyDraft, setAnt1DxyDraft] = useState("");
+    const [phacalEditorAdvanced, setPhacalEditorAdvanced] = useState(true);
+    const [controlRailCollapsed, setControlRailCollapsed] = useState(false);
+    const [controlRailWidthPx, setControlRailWidthPx] = useState(315);
+    const [lastExpandedControlRailWidthPx, setLastExpandedControlRailWidthPx] = useState(315);
     const [yxThresholdDraft, setYxThresholdDraft] = useState(String(1.5));
     const [residualThresholdDraft, setResidualThresholdDraft] = useState(String(1.0));
     const [timeHistoryData, setTimeHistoryData] = useState(null);
     const [heatmapData, setHeatmapData] = useState(null);
     const [overviewData, setOverviewData] = useState(null);
+    const [compareData, setCompareData] = useState(null);
     const [stagedTimeIntervals, setStagedTimeIntervals] = useState([]);
     const [stagedInbandPanels, setStagedInbandPanels] = useState({});
     const [stagedInbandMasks, setStagedInbandMasks] = useState({});
     const [stagedResidualPanels, setStagedResidualPanels] = useState({});
     const [stagedResidualMasks, setStagedResidualMasks] = useState({});
+    const [stagedRelPhasePanels, setStagedRelPhasePanels] = useState({});
+    const [stagedRelPhaseMasks, setStagedRelPhaseMasks] = useState({});
     const [heatmapLoadedRevision, setHeatmapLoadedRevision] = useState(-1);
     const [timeHistoryLoadedRevision, setTimeHistoryLoadedRevision] = useState(-1);
     const [overviewLoadedRevision, setOverviewLoadedRevision] = useState(-1);
@@ -3065,8 +3447,11 @@
     });
     const progressTimerRef = useRef(null);
     const finishTimerRef = useRef(null);
+    const ant1DxyPreviewSeqRef = useRef(0);
+    const ant1DxyPreviewActiveRef = useRef(false);
     const shellRef = useRef(null);
     const toolbarRef = useRef(null);
+    const controlRailDragRef = useRef(null);
 
     function clearActivityTimers() {
       if (progressTimerRef.current) {
@@ -3176,6 +3561,36 @@
 
     useEffect(
       function () {
+        function handlePointerMove(event) {
+          if (!controlRailDragRef.current) {
+            return;
+          }
+          const nextWidth = clamp(controlRailDragRef.current.startWidth + (event.clientX - controlRailDragRef.current.startX), 260, 520);
+          setControlRailWidthPx(nextWidth);
+          setLastExpandedControlRailWidthPx(nextWidth);
+        }
+        function handlePointerUp() {
+          if (!controlRailDragRef.current) {
+            return;
+          }
+          controlRailDragRef.current = null;
+          if (typeof document !== "undefined") {
+            document.body.style.cursor = "";
+            document.body.style.userSelect = "";
+          }
+        }
+        window.addEventListener("pointermove", handlePointerMove);
+        window.addEventListener("pointerup", handlePointerUp);
+        return function () {
+          window.removeEventListener("pointermove", handlePointerMove);
+          window.removeEventListener("pointerup", handlePointerUp);
+        };
+      },
+      []
+    );
+
+    useEffect(
+      function () {
         setInbandResidualInspector(null);
         setStagedTimeIntervals([]);
         setStagedInbandPanels({});
@@ -3185,6 +3600,33 @@
       },
       [dataRevision]
     );
+
+    function startControlRailResize(event) {
+      if (controlRailCollapsed) {
+        return;
+      }
+      controlRailDragRef.current = {
+        startX: event.clientX,
+        startWidth: controlRailWidthPx,
+      };
+      if (typeof document !== "undefined") {
+        document.body.style.cursor = "col-resize";
+        document.body.style.userSelect = "none";
+      }
+      event.preventDefault();
+    }
+
+    function toggleControlRailCollapsed() {
+      setControlRailCollapsed(function (current) {
+        if (current) {
+          const nextWidth = clamp(lastExpandedControlRailWidthPx || 315, 260, 520);
+          setControlRailWidthPx(nextWidth);
+          return false;
+        }
+        setLastExpandedControlRailWidthPx(controlRailWidthPx);
+        return true;
+      });
+    }
 
     function syncDraft(nextState) {
       const selectedAnt = nextState ? nextState.selected_ant : 0;
@@ -3223,6 +3665,25 @@
             ? String(Number(activePhacal.y_applied_offset_rad).toFixed(3))
             : "",
       });
+      setResidualPatchDraft({
+        ant: selectedAnt + 1,
+        xBlue:
+          active && active.x_residual_inband_suggest_ns !== null && active.x_residual_inband_suggest_ns !== undefined
+            ? String(Number(active.x_residual_inband_suggest_ns).toFixed(3))
+            : "",
+        yBlue:
+          active && active.y_residual_inband_suggest_ns !== null && active.y_residual_inband_suggest_ns !== undefined
+            ? String(Number(active.y_residual_inband_suggest_ns).toFixed(3))
+            : "",
+        xRed:
+          active && active.x_suggested_relative_delay_ns !== null && active.x_suggested_relative_delay_ns !== undefined
+            ? String(Number(active.x_suggested_relative_delay_ns).toFixed(3))
+            : "",
+        yRed:
+          active && active.y_suggested_relative_delay_ns !== null && active.y_suggested_relative_delay_ns !== undefined
+            ? String(Number(active.y_suggested_relative_delay_ns).toFixed(3))
+            : "",
+      });
       setYxThresholdDraft(
         active && active.yx_residual_threshold_rad !== null && active.yx_residual_threshold_rad !== undefined
           ? String(Number(active.yx_residual_threshold_rad).toFixed(2))
@@ -3232,6 +3693,11 @@
         active && active.residual_band_threshold_rad !== null && active.residual_band_threshold_rad !== undefined
           ? String(Number(active.residual_band_threshold_rad).toFixed(2))
           : String(1.0)
+      );
+      setAnt1DxyDraft(
+        active && active.ant1_manual_dxy_corr_rad !== null && active.ant1_manual_dxy_corr_rad !== undefined
+          ? String(Number(active.ant1_manual_dxy_corr_rad).toFixed(3))
+          : String(0.0)
       );
     }
 
@@ -3400,6 +3866,31 @@
 
     useEffect(
       function () {
+        if (!sessionId || !(state && state.compare_ref_scan_ids && state.compare_ref_scan_ids.length === 2)) {
+          setCompareData(null);
+          return;
+        }
+        let cancelled = false;
+        jsonFetch("/api/plot/refcal-compare?session_id=" + encodeURIComponent(sessionId))
+          .then(function (data) {
+            if (!cancelled) {
+              setCompareData(data);
+            }
+          })
+          .catch(function (err) {
+            if (!cancelled) {
+              setCompareData({ message: err.message || String(err) });
+            }
+          });
+        return function () {
+          cancelled = true;
+        };
+      },
+      [sessionId, dataRevision, state && state.compare_ref_scan_ids ? state.compare_ref_scan_ids.join(",") : ""]
+    );
+
+    useEffect(
+      function () {
         if (!sessionId) {
           return;
         }
@@ -3446,6 +3937,7 @@
               setOverviewData({
                 sum_amp: { message: err.message || String(err), title: "Sum Amp" },
                 sum_pha: { message: err.message || String(err), title: "Sum Pha" },
+                phacal_phase_compare: { message: err.message || String(err), title: "Refcal vs Phacal Phase" },
                 inband_fit: { message: err.message || String(err), title: "Inband Fit" },
                 inband_residual_phase_band: { message: err.message || String(err), title: "Per-Band Residual Phase" },
                 inband_relative_phase: { message: err.message || String(err), title: "Relative Phase + Fit" },
@@ -3759,10 +4251,16 @@
 
     function targetInbandRows(sourcePol) {
       const sourceRow = Number(sourcePol);
+      if (isPhacalScan && sourceRow === 2) {
+        return [];
+      }
       if (sourceRow === 2) {
         return [0, 1];
       }
       const pol = clamp(sourceRow, 0, 1);
+      if (isPhacalScan) {
+        return phacalMaskMode === "per_pol" ? [pol] : [0, 1];
+      }
       return inbandPolScope === "all" ? [0, 1] : [pol];
     }
 
@@ -3770,7 +4268,7 @@
       const panelIdx = Math.max(0, Number(sourceAntenna));
       const baseSection = (
         overviewData &&
-        (isPhacalScan ? overviewData.inband_relative_phase : (overviewData.inband_fit || overviewData.inband_relative_phase))
+        (isPhacalScan ? overviewData.inband_fit : (overviewData.inband_fit || overviewData.inband_relative_phase))
       ) || null;
       const targets = [];
       targetInbandRows(sourcePol).forEach(function (rowIdx) {
@@ -3787,7 +4285,7 @@
     }
 
     function editableInbandSectionIds() {
-      return isPhacalScan ? ["inband_relative_phase"] : ["inband_fit", "inband_relative_phase"];
+      return ["inband_fit"];
     }
 
     function stageInbandSelection(startBand, endBand, sourcePol, sourceAntenna, mode) {
@@ -3840,30 +4338,197 @@
         return false;
       }
       const sectionIds = editableInbandSectionIds();
-      const rowTargets = targetInbandRows(rowIdx);
+      const rowTargets = isPhacalScan && Number(rowIdx) === 2 ? [0, 1] : targetInbandRows(rowIdx);
+      const nextOverrides = {};
+      const clearPanelKeys = [];
+      const nextMasks = {};
+      const clearMaskKeys = [];
+      sectionIds.forEach(function (sectionId) {
+        const section = overviewData[sectionId];
+        const bandEdges = section && section.band_edges ? section.band_edges : [];
+        rowTargets.forEach(function (maskRowIdx) {
+          const row = section && section.panels && section.panels[maskRowIdx] ? section.panels[maskRowIdx] : [];
+          const originalPanel = row[panelIdx];
+          if (!originalPanel || !bandEdges.length) {
+            return;
+          }
+          const fullRanges = defaultKeptRanges(bandEdges);
+          const panelKey = panelSelectionKey(sectionId, maskRowIdx, panelIdx);
+          const maskKey = targetMaskKey(maskRowIdx, panelIdx);
+          if (sameKeptRanges(fullRanges, originalPanel.kept_ranges)) {
+            clearPanelKeys.push(panelKey);
+            clearMaskKeys.push(maskKey);
+            return;
+          }
+          nextOverrides[panelKey] = optimisticPanelUpdate(originalPanel, fullRanges, bandEdges);
+          nextMasks[maskKey] = {
+            antenna: panelIdx,
+            polarization: maskRowIdx,
+            kept_ranges: fullRanges,
+          };
+        });
+      });
+      if (!clearPanelKeys.length && !Object.keys(nextOverrides).length) {
+        return false;
+      }
       setStagedInbandPanels(function (current) {
         const next = Object.assign({}, current);
-        rowTargets.forEach(function (maskRowIdx) {
-          sectionIds.forEach(function (sectionId) {
-            delete next[panelSelectionKey(sectionId, maskRowIdx, panelIdx)];
-          });
+        clearPanelKeys.forEach(function (key) {
+          delete next[key];
         });
-        return next;
+        return Object.assign(next, nextOverrides);
       });
       setStagedInbandMasks(function (current) {
         const next = Object.assign({}, current);
-        rowTargets.forEach(function (maskRowIdx) {
-          delete next[targetMaskKey(maskRowIdx, panelIdx)];
+        clearMaskKeys.forEach(function (key) {
+          delete next[key];
         });
-        return next;
+        return Object.assign(next, nextMasks);
       });
-      setInteractionMessage("Mask reset for this antenna/polarization.");
+      setInteractionMessage("Mask cleared. Click Apply Mask to apply.");
       return true;
     }
 
     function clearStagedInbandSelection() {
       setStagedInbandPanels({});
       setStagedInbandMasks({});
+    }
+
+    function clearStagedRelPhaseSelection() {
+      setStagedRelPhasePanels({});
+      setStagedRelPhaseMasks({});
+    }
+
+    function panelWithStagedRelPhaseSelection(rowIdx, panelIdx, panel) {
+      const override = stagedRelPhasePanels[panelSelectionKey("inband_relative_phase", rowIdx, panelIdx)];
+      return override ? Object.assign({}, panel, override) : panel;
+    }
+
+    function stageRelPhaseSelection(startBand, endBand, sourcePol, sourceAntenna, mode) {
+      if (!overviewData) {
+        return false;
+      }
+      const section = overviewData.inband_relative_phase;
+      const bandEdges = section && section.band_edges ? section.band_edges : [];
+      const sourceRow = Number(sourcePol);
+      const panelIdx = Math.max(0, Number(sourceAntenna));
+      const antTargets = inbandAntennaScope === "all"
+        ? (section && section.panels && section.panels[Math.min(sourceRow, 2)] ? section.panels[Math.min(sourceRow, 2)].map(function (_p, idx) { return idx; }) : [panelIdx])
+        : [panelIdx];
+      const nextOverrides = {};
+      const nextMasks = {};
+      antTargets.forEach(function (antIdx) {
+        const rowsToUpdate = sourceRow === 2 ? [2] : [sourceRow];
+        rowsToUpdate.forEach(function (rowIdx) {
+          const row = section && section.panels && section.panels[rowIdx] ? section.panels[rowIdx] : [];
+          const originalPanel = row[antIdx];
+          if (!originalPanel || !bandEdges.length) {
+            return;
+          }
+          const key = panelSelectionKey("inband_relative_phase", rowIdx, antIdx);
+          const currentPanel = stagedRelPhasePanels[key]
+            ? Object.assign({}, originalPanel, stagedRelPhasePanels[key])
+            : originalPanel;
+          const nextRanges = updateKeptRanges(currentPanel.kept_ranges, bandEdges, startBand, endBand, mode);
+          if (sameKeptRanges(nextRanges, originalPanel.kept_ranges)) {
+            return;
+          }
+          nextOverrides[key] = optimisticPanelUpdate(currentPanel, nextRanges, bandEdges);
+          nextMasks[panelSelectionKey("inband_relative_phase", rowIdx, antIdx)] = {
+            antenna: antIdx,
+            polarization: rowIdx,
+            kept_ranges: nextRanges,
+          };
+        });
+      });
+      const keys = Object.keys(nextOverrides);
+      if (keys.length) {
+        setStagedRelPhasePanels(function (current) {
+          return Object.assign({}, current, nextOverrides);
+        });
+        setStagedRelPhaseMasks(function (current) {
+          return Object.assign({}, current, nextMasks);
+        });
+        setInteractionMessage("Rel. Phase mask staged. Click Apply Mask to apply.");
+      }
+      return keys.length > 0;
+    }
+
+    function stageRelPhaseMaskClear(rowIdx, panelIdx) {
+      if (!overviewData) {
+        return false;
+      }
+      const section = overviewData.inband_relative_phase;
+      const bandEdges = section && section.band_edges ? section.band_edges : [];
+      const row = section && section.panels && section.panels[rowIdx] ? section.panels[rowIdx] : [];
+      const originalPanel = row[panelIdx];
+      if (!originalPanel || !bandEdges.length) {
+        return false;
+      }
+      const fullRanges = defaultKeptRanges(bandEdges);
+      const panelKey = panelSelectionKey("inband_relative_phase", rowIdx, panelIdx);
+      if (sameKeptRanges(fullRanges, originalPanel.kept_ranges)) {
+        setStagedRelPhasePanels(function (current) {
+          const next = Object.assign({}, current);
+          delete next[panelKey];
+          return next;
+        });
+        setStagedRelPhaseMasks(function (current) {
+          const next = Object.assign({}, current);
+          delete next[panelKey];
+          return next;
+        });
+        return false;
+      }
+      setStagedRelPhasePanels(function (current) {
+        return Object.assign({}, current, {
+          [panelKey]: optimisticPanelUpdate(originalPanel, fullRanges, bandEdges),
+        });
+      });
+      setStagedRelPhaseMasks(function (current) {
+        return Object.assign({}, current, {
+          [panelKey]: {
+            antenna: panelIdx,
+            polarization: rowIdx,
+            kept_ranges: fullRanges,
+          },
+        });
+      });
+      setInteractionMessage("Rel. Phase mask cleared. Click Apply Mask to apply.");
+      return true;
+    }
+
+    function applyRelPhaseInbandWindow() {
+      const targets = Object.values(stagedRelPhaseMasks);
+      if (busy || !targets.length) {
+        return;
+      }
+      setInteractionMessage("");
+      runAction(
+        function () {
+          return jsonFetch("/api/inband/mask/batch", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              session_id: sessionId,
+              targets: targets,
+            }),
+          }).then(function (next) {
+            const nextState = next && next.state ? next.state : next;
+            setState(nextState);
+            setInteractionMessage("");
+            syncDraft(nextState);
+            if (next && next.overview_updates) {
+              setOverviewData(function (current) {
+                return mergeOverviewAntennaUpdates(current, next.overview_updates, null);
+              });
+            }
+            clearStagedRelPhaseSelection();
+            return next;
+          });
+        },
+        { progressKind: "inband_mask", successMessage: "Rel. Phase mask applied" }
+      );
     }
 
     function clearStagedResidualSelection() {
@@ -3901,7 +4566,7 @@
           },
         });
       });
-      setInteractionMessage("Residual mask staged. Click Apply In-Band Res. Fit to apply.");
+      setInteractionMessage("Residual mask staged. Click Apply In-Band (All Ants) to apply.");
       return true;
     }
 
@@ -3935,7 +4600,7 @@
           },
         });
       });
-      setInteractionMessage("Residual mask reset to the auto mask. Click Apply In-Band Res. Fit to apply.");
+      setInteractionMessage("Residual mask reset to the auto mask. Click Apply In-Band (All Ants) to apply.");
       return true;
     }
 
@@ -3945,7 +4610,7 @@
     }
 
     function panelWithStagedInbandSelection(sectionId, rowIdx, panelIdx, panel) {
-      if (sectionId === "inband_relative_phase" && rowIdx === 2) {
+      if (isPhacalScan && sectionId === "inband_fit" && rowIdx === 2) {
         const section = overviewData && overviewData[sectionId] ? overviewData[sectionId] : null;
         const bandEdges = section && section.band_edges ? section.band_edges : [];
         const xKey = panelSelectionKey(sectionId, 0, panelIdx);
@@ -3972,7 +4637,8 @@
       if (busy) {
         return;
       }
-      stageInbandSelection(startBand, endBand, sourcePol, sourceAntenna, mode);
+      const nextMode = isPhacalScan ? "exclude" : mode;
+      stageInbandSelection(startBand, endBand, sourcePol, sourceAntenna, nextMode);
     }
 
     function applyStagedInbandWindow() {
@@ -4009,21 +4675,31 @@
     }
 
     function previewStagedInbandSection(sectionId) {
-      const targets = Object.values(stagedInbandMasks);
+      const isRelPhase = sectionId === "inband_relative_phase";
+      const targets = Object.values(isRelPhase ? stagedRelPhaseMasks : stagedInbandMasks);
       if (busy || !sessionId || !targets.length) {
         return;
       }
       setInteractionMessage("");
-      runAction(function () {
-        return previewOverviewSection("/api/inband/mask/preview", {
-          session_id: sessionId,
-          section_id: sectionId,
-          targets: targets,
-        }).then(function (next) {
-          setInteractionMessage("Preview refreshed.");
-          return next;
-        });
-      });
+      const successMessage = isRelPhase ? "Rel. Phase preview refreshed" : "Inband Fit preview refreshed";
+      runAction(
+        function () {
+          return previewOverviewSection("/api/inband/mask/preview", {
+            session_id: sessionId,
+            section_id: sectionId,
+            targets: targets,
+          }).then(function (next) {
+            if (isRelPhase) {
+              setStagedRelPhasePanels({});
+            } else {
+              setStagedInbandPanels({});
+            }
+            setInteractionMessage("Preview refreshed.");
+            return next;
+          });
+        },
+        { progressKind: "relative_delay", successMessage: successMessage }
+      );
     }
 
     function applyDelayEditorUpdate() {
@@ -4092,6 +4768,8 @@
               y_delay_ns: relativeDelayDraft.y === "" ? null : parseFloat(relativeDelayDraft.y),
               x_offset_rad: isPhacal && relativeDelayDraft.xoff !== "" ? parseFloat(relativeDelayDraft.xoff) : null,
               y_offset_rad: isPhacal && relativeDelayDraft.yoff !== "" ? parseFloat(relativeDelayDraft.yoff) : null,
+              ant1_manual_dxy_corr_rad:
+                !isPhacal && antennaIndex === 0 && ant1DxyDraftValue !== null ? Number(ant1DxyDraftValue) : null,
             },
             antennaIndex
           );
@@ -4136,16 +4814,173 @@
       );
     }
 
-    function applyResidualInbandFit() {
+    function applyResidualPatch(color) {
+      const antennaIndex = Math.max(0, parseInt(delayDraft.ant || "1", 10) - 1);
+      const activeRef = state && state.active_refcal ? state.active_refcal : null;
+      if (!activeRef) {
+        return;
+      }
+      if (color === "blue") {
+        const xPatch = parseOptionalFloat(residualPatchDraft.xBlue);
+        const yPatch = parseOptionalFloat(residualPatchDraft.yBlue);
+        const xBase = Number(activeRef.x_effective_inband_delay_ns);
+        const yBase = Number(activeRef.y_effective_inband_delay_ns);
+        runAction(
+          function () {
+            return postJsonWithOverviewPatch(
+              "/api/inband/update",
+              {
+                session_id: sessionId,
+                antenna: antennaIndex,
+                x_delay_ns: Number.isFinite(xPatch) && Number.isFinite(xBase) ? xBase + xPatch : null,
+                y_delay_ns: Number.isFinite(yPatch) && Number.isFinite(yBase) ? yBase + yPatch : null,
+              },
+              antennaIndex
+            );
+          },
+          { progressKind: "active_delay", successMessage: "In-band residual patch applied" }
+        );
+        return;
+      }
+      const xPatch = parseOptionalFloat(residualPatchDraft.xRed);
+      const yPatch = parseOptionalFloat(residualPatchDraft.yRed);
+      const xBase = Number(activeRef.x_applied_relative_delay_ns);
+      const yBase = Number(activeRef.y_applied_relative_delay_ns);
+      runAction(
+        function () {
+          return postJsonWithOverviewPatch(
+            "/api/relative-delay/update",
+            {
+              session_id: sessionId,
+              antenna: antennaIndex,
+              x_delay_ns: Number.isFinite(xPatch) && Number.isFinite(xBase) ? xBase + xPatch : null,
+              y_delay_ns: Number.isFinite(yPatch) && Number.isFinite(yBase) ? yBase + yPatch : null,
+            },
+            antennaIndex
+          );
+        },
+        { progressKind: "relative_delay", successMessage: "Multiband residual patch applied" }
+      );
+    }
+
+    function resetResidualPatchDrafts() {
+      const activeRef = state && state.active_refcal ? state.active_refcal : null;
+      const ant = state ? state.selected_ant + 1 : residualPatchDraft.ant;
+      setResidualPatchDraft({
+        ant: ant,
+        xBlue:
+          activeRef && activeRef.x_residual_inband_suggest_ns !== null && activeRef.x_residual_inband_suggest_ns !== undefined
+            ? String(Number(activeRef.x_residual_inband_suggest_ns).toFixed(3))
+            : "",
+        yBlue:
+          activeRef && activeRef.y_residual_inband_suggest_ns !== null && activeRef.y_residual_inband_suggest_ns !== undefined
+            ? String(Number(activeRef.y_residual_inband_suggest_ns).toFixed(3))
+            : "",
+        xRed:
+          activeRef && activeRef.x_suggested_relative_delay_ns !== null && activeRef.x_suggested_relative_delay_ns !== undefined
+            ? String(Number(activeRef.x_suggested_relative_delay_ns).toFixed(3))
+            : "",
+        yRed:
+          activeRef && activeRef.y_suggested_relative_delay_ns !== null && activeRef.y_suggested_relative_delay_ns !== undefined
+            ? String(Number(activeRef.y_suggested_relative_delay_ns).toFixed(3))
+            : "",
+      });
+    }
+
+    function setSecondaryAnchor(scanId) {
+      runAction(function () {
+        return postJson("/api/refcal/secondary", {
+          session_id: sessionId,
+          scan_id: scanId,
+        });
+      });
+    }
+
+    function clearSecondaryAnchor() {
+      runAction(function () {
+        return postJson("/api/refcal/secondary", {
+          session_id: sessionId,
+          scan_id: null,
+        });
+      });
+    }
+
+    function compareSelectedAnchors() {
+      if (!sessionId || checkedScanIds.length !== 2) {
+        return;
+      }
+      runAction(function () {
+        return postJson("/api/refcal/compare", {
+          session_id: sessionId,
+          scan_ids: checkedScanIds,
+        });
+      });
+    }
+
+    function clearAnchorCompare() {
+      runAction(function () {
+        return postJson("/api/refcal/compare/clear", {
+          session_id: sessionId,
+        });
+      });
+    }
+
+    function toggleDonorPatchCandidate(antennaIndex, selected) {
+      runAction(function () {
+        return postJson("/api/refcal/donor-patch/candidate", {
+          session_id: sessionId,
+          antenna: antennaIndex,
+          selected: selected,
+        });
+      });
+    }
+
+    function applyDonorPatchSelection() {
+      runAction(function () {
+        return postJson("/api/refcal/donor-patch/apply", {
+          session_id: sessionId,
+        });
+      });
+    }
+
+    function togglePhacalAnchorFallback(enabled) {
+      const antennaIndex = Math.max(0, parseInt(relativeDelayDraft.ant || "1", 10) - 1);
+      runAction(
+        function () {
+          return postJsonWithOverviewPatch(
+            "/api/phacal/anchor-fallback",
+            {
+              session_id: sessionId,
+              antenna: antennaIndex,
+              enabled: enabled,
+            },
+            antennaIndex
+          );
+        },
+        { progressKind: "relative_delay", successMessage: enabled ? "Temporary fallback enabled" : "Temporary fallback cleared" }
+      );
+    }
+
+    function applyResidualInbandFit(antennaOverride) {
+      const antennaIndex = (antennaOverride === undefined || antennaOverride === null)
+        ? null
+        : Math.max(0, Number(antennaOverride));
+      const body = {
+        session_id: sessionId,
+        targets: Object.values(stagedResidualMasks),
+      };
+      if (antennaIndex !== null) {
+        body.antenna = antennaIndex;
+      }
+      const message = antennaIndex !== null
+        ? "Residual in-band fit applied to Ant " + (antennaIndex + 1)
+        : "Residual in-band fit applied";
       runAction(
         function () {
           return jsonFetch("/api/inband/apply-residual-fit", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              session_id: sessionId,
-              targets: Object.values(stagedResidualMasks),
-            }),
+            body: JSON.stringify(body),
           }).then(function (next) {
             const nextState = next && next.state ? next.state : next;
             setState(nextState);
@@ -4153,14 +4988,16 @@
             syncDraft(nextState);
             if (next && next.overview_updates) {
               setOverviewData(function (current) {
-                return mergeOverviewAntennaUpdates(current, next.overview_updates, null);
+                return mergeOverviewAntennaUpdates(current, next.overview_updates, antennaIndex);
               });
             }
-            clearStagedResidualSelection();
+            if (antennaIndex === null) {
+              clearStagedResidualSelection();
+            }
             return next;
           });
         },
-        { progressKind: "active_delay", successMessage: "Residual in-band fit applied" }
+        { progressKind: "active_delay", successMessage: message }
       );
     }
 
@@ -4260,6 +5097,26 @@
         });
     }
 
+    function setMultibandFitKind(antennaIndex, kind) {
+      const ant = Math.max(0, Number(antennaIndex) || 0);
+      const allowed = { linear: true, poly2: true, poly3: true };
+      const next = allowed[kind] ? kind : "linear";
+      runAction(
+        function () {
+          return postJsonWithOverviewPatch(
+            "/api/refcal/multiband-fit-kind",
+            {
+              session_id: sessionId,
+              antenna: ant,
+              kind: next,
+            },
+            ant
+          );
+        },
+        { progressKind: "relative_delay", successMessage: "Multiband fit kind set to " + next + " for Ant " + (ant + 1) }
+      );
+    }
+
     function applyYxResidualThreshold() {
       const threshold = parseFloat(yxThresholdDraft);
       if (!Number.isFinite(threshold) || threshold < 0) {
@@ -4331,15 +5188,42 @@
     const canAnalyze = sessionId && selectedScanId() !== null;
     const canRefcal = canAnalyze;
     const canPhacal = canAnalyze && state && state.ref_scan_id !== null;
-    const canCombine = checkedScanIds.length === 2;
+    const checkedScans = state && state.scans
+      ? state.scans.filter(function (scan) {
+          return checkedScanIds.indexOf(scan.scan_id) >= 0;
+        })
+      : [];
+    const canCompareAnchors =
+      checkedScans.length === 2 &&
+      checkedScans.every(function (scan) {
+        return String(scan.status || "").indexOf("refcal") >= 0 || !!scan.analyzed;
+      }) &&
+      String(checkedScans[0].feed_kind || "") === String(checkedScans[1].feed_kind || "");
+    const canCombine =
+      checkedScans.length === 2 &&
+      String(checkedScans[0].feed_kind || "") !== String(checkedScans[1].feed_kind || "");
     const selectedAntLabel = state ? state.selected_ant + 1 : "-";
     const selectedBandLabel = state ? state.selected_band + 1 : "-";
+    const selectedScanEntry =
+      state && state.scans
+        ? state.scans.find(function (scan) {
+            return scan.scan_id === selectedScanId();
+          }) || null
+        : null;
     const currentScanLabel =
       state && state.current_scan
         ? state.current_scan.kind + " " + (state.current_scan.scan_time || state.current_scan.timestamp_iso)
         : "No scan selected";
     const activeRefLabel =
       state && state.active_refcal ? state.active_refcal.scan_time || state.active_refcal.timestamp_iso : "None";
+    const secondaryRefLabel =
+      state && state.secondary_ref_scan_id !== null
+        ? (state.scans || []).filter(function (scan) {
+            return scan.scan_id === state.secondary_ref_scan_id;
+          }).map(function (scan) {
+            return scan.scan_time;
+          })[0] || "Set"
+        : "None";
     const isPhacalScan = !!(state && state.current_scan && state.current_scan.kind === "phacal");
     const activeRelativeRef = isPhacalScan
       ? state && state.active_phacal
@@ -4365,6 +5249,12 @@
     const canApplyResidualFit = !!(state && (state.active_refcal || state.active_phacal));
     const canApplyResidualMultibandFit = !!(activeRelativeRef && hasRelativeSuggestion);
     const canUndoResidualPanel = !!(state && state.residual_panel_undo_available);
+    const workflowGuide = workflowGuideState({
+      state: state,
+      checkedScans: checkedScans,
+      compareData: compareData,
+      isPhacalScan: isPhacalScan,
+    });
     function residualColumnActionRenderer(control) {
       if (!overviewData || !overviewData.inband_residual_phase_band) {
         return null;
@@ -4381,12 +5271,57 @@
         !hasData ||
         !hasSuggestion
       );
+      const fitKinds = (overviewData.inband_residual_phase_band && overviewData.inband_residual_phase_band.multiband_fit_kinds) || [];
+      const currentKind = String(fitKinds[antennaIndex] || "linear");
+      const fitKindDisabled = !!(busy || isPhacalScan || control.flagged || control.auto_flagged || !hasData || antennaIndex === 0);
       return html`
+        <select
+          className="panel-grid-column-fit-kind"
+          value=${currentKind}
+          disabled=${fitKindDisabled}
+          title=${antennaIndex === 0
+            ? "Ant 1 uses the dedicated multiband-shape fit; cannot change kind here."
+            : "Multiband fit model for " + control.label}
+          onPointerDown=${function (event) {
+            event.stopPropagation();
+          }}
+          onChange=${function (event) {
+            const next = String(event.target.value);
+            if (next === currentKind) {
+              return;
+            }
+            setMultibandFitKind(antennaIndex, next);
+          }}
+        >
+          <option value="linear">Linear</option>
+          <option value="poly2">Poly2</option>
+          <option value="poly3">Poly3</option>
+        </select>
+        <button
+          type="button"
+          className="panel-grid-column-action panel-grid-column-action-blue"
+          title=${"Apply per-band in-band residual correction to " + control.label + " (flattens within-band residual slopes; preserves multiband)"}
+          aria-label=${"Apply per-band in-band residual correction to " + control.label}
+          disabled=${!!(busy || control.flagged || control.auto_flagged || !hasData)}
+          onPointerDown=${function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onClick=${function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (!(busy || control.flagged || control.auto_flagged || !hasData)) {
+              applyResidualInbandFit(antennaIndex);
+            }
+          }}
+        >
+          <span className="panel-grid-column-action-glyph" aria-hidden="true">I</span>
+        </button>
         <button
           type="button"
           className="panel-grid-column-action panel-grid-column-action-red"
-          title=${"Apply multiband fit to " + control.label}
-          aria-label=${"Apply multiband fit to " + control.label}
+          title=${"Apply auto-suggested multiband delay to " + control.label + " (adds suggested → applied for this antenna)"}
+          aria-label=${"Apply auto-suggested multiband delay to " + control.label}
           disabled=${disabled}
           onPointerDown=${function (event) {
             event.preventDefault();
@@ -4405,7 +5340,7 @@
       `;
     }
     function canEditKeptMaskSection(sectionId) {
-      return isPhacalScan ? sectionId === "inband_relative_phase" : sectionId === "inband_fit" || sectionId === "inband_relative_phase";
+      return isPhacalScan ? sectionId === "inband_fit" : sectionId === "inband_fit" || sectionId === "inband_relative_phase";
     }
     function canEditResidualMaskSection(sectionId) {
       return sectionId === "inband_residual_phase_band";
@@ -4458,6 +5393,608 @@
             }, new Map()).values()
           )
         : [];
+    const activeRefMeta = state && state.active_refcal ? state.active_refcal : null;
+    const activePhacalMeta = state && state.active_phacal ? state.active_phacal : null;
+    const selectedAntennaText = "Ant " + selectedAntLabel;
+    const controlRailWidth = controlRailCollapsed ? 28 : clamp(controlRailWidthPx, 260, 520);
+    const bluePatchDraftReady =
+      parseOptionalFloat(residualPatchDraft.xBlue) !== null || parseOptionalFloat(residualPatchDraft.yBlue) !== null;
+    const redPatchDraftReady =
+      parseOptionalFloat(residualPatchDraft.xRed) !== null || parseOptionalFloat(residualPatchDraft.yRed) !== null;
+    const ant1CommittedDxy =
+      activeRefMeta && activeRefMeta.ant1_manual_dxy_corr_rad !== null && activeRefMeta.ant1_manual_dxy_corr_rad !== undefined
+        ? Number(activeRefMeta.ant1_manual_dxy_corr_rad)
+        : null;
+    const ant1AutoDxy =
+      activeRefMeta && activeRefMeta.ant1_auto_dxy_rad !== null && activeRefMeta.ant1_auto_dxy_rad !== undefined
+        ? Number(activeRefMeta.ant1_auto_dxy_rad)
+        : null;
+    const isRefcalScan = !!(state && state.current_scan && state.current_scan.kind === "refcal");
+    const ant1DxyVisible = !!(isRefcalScan && activeRefMeta && activeRefMeta.is_reference_antenna);
+    const ant1DxyDraftValue =
+      ant1CommittedDxy !== null
+        ? (parseOptionalFloat(ant1DxyDraft) !== null ? parseOptionalFloat(ant1DxyDraft) : ant1CommittedDxy)
+        : null;
+    const ant1EffectiveDxy =
+      ant1AutoDxy !== null && ant1DxyDraftValue !== null
+        ? ant1AutoDxy + ant1DxyDraftValue
+        : activeRefMeta && activeRefMeta.ant1_effective_dxy_rad !== null && activeRefMeta.ant1_effective_dxy_rad !== undefined
+          ? Number(activeRefMeta.ant1_effective_dxy_rad)
+          : null;
+    const ant1DxyDirty = !!(
+      ant1CommittedDxy !== null &&
+      ant1DxyDraftValue !== null &&
+      Math.abs(Number(ant1DxyDraftValue) - Number(ant1CommittedDxy)) > 1e-9
+    );
+
+    function resetAnt1DxyDraft() {
+      if (ant1CommittedDxy === null) {
+        return;
+      }
+      setAnt1DxyDraft(formatEditorValue(ant1CommittedDxy));
+    }
+
+    useEffect(
+      function () {
+        if (!sessionId || !activeRefMeta || ant1CommittedDxy === null || busy) {
+          return;
+        }
+        const shouldPreview = !!(ant1DxyVisible && ant1DxyDraftValue !== null && ant1DxyDirty);
+        if (!shouldPreview && !ant1DxyPreviewActiveRef.current) {
+          return;
+        }
+        const target = shouldPreview ? ant1DxyDraftValue : ant1CommittedDxy;
+        if (target === null) {
+          return;
+        }
+        let cancelled = false;
+        const requestSeq = ant1DxyPreviewSeqRef.current + 1;
+        ant1DxyPreviewSeqRef.current = requestSeq;
+        const timer = window.setTimeout(function () {
+          jsonFetch("/api/relative-delay/ant1-dxy/preview", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              session_id: sessionId,
+              manual_dxy_corr_rad: Number(target),
+            }),
+          })
+            .then(function (next) {
+              if (cancelled || ant1DxyPreviewSeqRef.current !== requestSeq) {
+                return;
+              }
+              if (next && next.overview_updates) {
+                setOverviewData(function (current) {
+                  return mergeOverviewAntennaUpdates(current, next.overview_updates, 0);
+                });
+              }
+              ant1DxyPreviewActiveRef.current = shouldPreview;
+            })
+            .catch(function (err) {
+              if (cancelled || ant1DxyPreviewSeqRef.current !== requestSeq) {
+                return;
+              }
+              setError(err.message || String(err));
+            });
+        }, 180);
+        return function () {
+          cancelled = true;
+          window.clearTimeout(timer);
+        };
+      },
+      [
+        sessionId,
+        busy,
+        ant1DxyVisible,
+        ant1DxyDirty,
+        ant1CommittedDxy,
+        ant1DxyDraft,
+      ]
+    );
+
+    function renderDelaySectionHeader(title, source, toneClass) {
+      return html`
+        <div className="delay-control-section-header">
+          <h3>${title}</h3>
+          <span className=${"delay-control-source " + toneClass}>${source}</span>
+        </div>
+      `;
+    }
+
+    function renderRefcalDelayControl() {
+      if (!activeRefMeta) {
+        return html`
+          <div className="delay-empty">
+            <div className="delay-summary">
+              <span>Refcal: None · ${selectedAntennaText}</span>
+            </div>
+            <div className="tiny">Set a refcal to edit selected-antenna in-band and multiband delays.</div>
+          </div>
+        `;
+      }
+      return html`
+        <div className="delay-summary">
+          <span>${"Refcal: " + activeRefLabel + " · " + selectedAntennaText}</span>
+        </div>
+        <div className="delay-control-legend">
+          <span className="delay-control-legend-item blue">Blue = In-Band Delay</span>
+          <span className="delay-control-legend-item red">Red = Multiband Delay</span>
+          <span className="delay-control-legend-item neutral">Residual Patch feeds blue/red</span>
+        </div>
+        <div className="delay-control-note">
+          In-band changes affect corrected data and downstream multiband solve. Multiband changes affect the red fit directly.
+        </div>
+
+        <div className="delay-control-section">
+          ${renderDelaySectionHeader("In-Band Delay", "From In-Band Fit Diag.", "blue")}
+          <div className="delay-grid delay-pair-grid">
+            <div className="delay-pair-row">
+              <label>
+                X Auto In-Band (ns)
+                <input type="text" disabled value=${formatEditorValue(activeRefMeta.x_auto_inband_delay_ns)} />
+              </label>
+              <label>
+                Y Auto In-Band (ns)
+                <input type="text" disabled value=${formatEditorValue(activeRefMeta.y_auto_inband_delay_ns)} />
+              </label>
+            </div>
+            <div className="delay-pair-row">
+              <label>
+                X Res. In-Band Sug. (ns)
+                <input type="text" disabled value=${formatEditorValue(activeRefMeta.x_residual_inband_suggest_ns)} />
+              </label>
+              <label>
+                Y Res. In-Band Sug. (ns)
+                <input type="text" disabled value=${formatEditorValue(activeRefMeta.y_residual_inband_suggest_ns)} />
+              </label>
+            </div>
+            <div className="delay-pair-row">
+              <label>
+                X Manual Eff. In-Band (ns)
+                <input
+                  type="number"
+                  step="0.1"
+                  value=${delayDraft.x}
+                  onChange=${function (event) {
+                    setDelayDraft(Object.assign({}, delayDraft, { x: event.target.value }));
+                  }}
+                />
+              </label>
+              <label>
+                Y Manual Eff. In-Band (ns)
+                <input
+                  type="number"
+                  step="0.1"
+                  value=${delayDraft.y}
+                  onChange=${function (event) {
+                    setDelayDraft(Object.assign({}, delayDraft, { y: event.target.value }));
+                  }}
+                />
+              </label>
+            </div>
+            <div className="delay-pair-row">
+              <label>
+                X Override Δ (ns)
+                <input type="text" disabled value=${formatEditorValue(activeRefMeta.x_inband_override_delta_ns)} />
+              </label>
+              <label>
+                Y Override Δ (ns)
+                <input type="text" disabled value=${formatEditorValue(activeRefMeta.y_inband_override_delta_ns)} />
+              </label>
+            </div>
+            <div className="delay-actions full">
+              <button type="button" className="btn-outline-fit-blue" disabled=${busy} title="Apply the in-band delay/offset values typed above to the selected antenna" onClick=${applyDelayEditorUpdate}>Apply In-Band</button>
+              <button type="button" disabled=${busy} title="Discard manual edits for the selected antenna and restore its committed values" onClick=${resetDelayEditorAntenna}>Reset Ant</button>
+              <button type="button" disabled=${busy} title="Discard manual edits for ALL antennas and restore their committed values" onClick=${resetAllDelayEditor}>Reset All</button>
+            </div>
+          </div>
+        </div>
+
+        <div className="delay-control-section">
+          ${renderDelaySectionHeader("Multiband Delay", "From Rel. Phase + Fit", "red")}
+          <div className="delay-control-note">
+            Ant 1 uses reference-shape tuning plus a manual Δ(Y-X) trim; other antennas use scalar multiband delay only.
+          </div>
+          <div className="delay-grid delay-pair-grid">
+            <div className="delay-pair-row">
+              <label>
+                X Auto Multiband (ns)
+                <input type="text" disabled value=${formatEditorValue(activeRefMeta.x_auto_relative_delay_ns)} />
+              </label>
+              <label>
+                Y Auto Multiband (ns)
+                <input type="text" disabled value=${formatEditorValue(activeRefMeta.y_auto_relative_delay_ns)} />
+              </label>
+            </div>
+            <div className="delay-pair-row">
+              <label>
+                X Res. Multiband Sug. (ns)
+                <input type="text" disabled value=${formatEditorValue(activeRefMeta.x_suggested_relative_delay_ns)} />
+              </label>
+              <label>
+                Y Res. Multiband Sug. (ns)
+                <input type="text" disabled value=${formatEditorValue(activeRefMeta.y_suggested_relative_delay_ns)} />
+              </label>
+            </div>
+            <div className="delay-pair-row">
+              <label>
+                X Manual Multiband Corr. (ns)
+                <input
+                  type="number"
+                  step="0.1"
+                  value=${relativeDelayDraft.x}
+                  onChange=${function (event) {
+                    setRelativeDelayDraft(Object.assign({}, relativeDelayDraft, { x: event.target.value }));
+                  }}
+                />
+              </label>
+              <label>
+                Y Manual Multiband Corr. (ns)
+                <input
+                  type="number"
+                  step="0.1"
+                  value=${relativeDelayDraft.y}
+                  onChange=${function (event) {
+                    setRelativeDelayDraft(Object.assign({}, relativeDelayDraft, { y: event.target.value }));
+                  }}
+                />
+              </label>
+            </div>
+            <div className="delay-pair-row">
+              <label>
+                X Eff. Multiband Fit (ns)
+                <input type="text" disabled value=${formatEditorValue(activeRefMeta.x_effective_relative_delay_ns)} />
+              </label>
+              <label>
+                Y Eff. Multiband Fit (ns)
+                <input type="text" disabled value=${formatEditorValue(activeRefMeta.y_effective_relative_delay_ns)} />
+              </label>
+            </div>
+            ${ant1DxyVisible
+              ? html`
+                  <div className="delay-pair-row">
+                    <label>
+                      Auto Δ(Y-X) [rad]
+                      <input type="text" disabled value=${formatEditorValue(ant1AutoDxy)} />
+                    </label>
+                    <label>
+                      Manual Δ(Y-X) Corr. [rad]
+                      <input
+                        type="number"
+                        step="0.1"
+                        value=${ant1DxyDraft}
+                        onChange=${function (event) {
+                          setAnt1DxyDraft(event.target.value);
+                        }}
+                      />
+                    </label>
+                  </div>
+                  <div className="delay-pair-row">
+                    <label>
+                      Effective Δ(Y-X) [rad]
+                      <input type="text" disabled value=${formatEditorValue(ant1EffectiveDxy)} />
+                    </label>
+                    <div></div>
+                  </div>
+                  <div className="delay-actions full">
+                    <button type="button" disabled=${busy || !ant1DxyDirty} onClick=${resetAnt1DxyDraft}>Reset Δ(Y-X)</button>
+                  </div>
+                `
+              : null}
+            <div className="delay-actions full">
+              <button type="button" className="btn-outline-red" disabled=${busy} title="Apply the manual multiband delay/offset values typed above to the selected antenna" onClick=${applyRelativeDelayEditorUpdate}>Apply Multiband</button>
+              <button type="button" className="btn-outline-red" disabled=${busy || !hasRelativeSuggestion} title="Adopt the auto-suggested multiband delay/offset (suggested → applied) for the selected antenna" onClick=${applyRelativeDelaySuggestion}>Apply Suggestion</button>
+              <button
+                type="button"
+                disabled=${busy || !(activeRefMeta && activeRefMeta.relative_undo_available)}
+                title="Undo the most recent multiband edit on this antenna"
+                onClick=${undoRelativeDelayEditor}
+              >
+                Undo
+              </button>
+              <button type="button" disabled=${busy} title="Reset the multiband delay/offset edits on the selected antenna" onClick=${resetRelativeDelayEditorAntenna}>Reset</button>
+            </div>
+          </div>
+        </div>
+
+        <div className="delay-control-section">
+          ${renderDelaySectionHeader("Residual Patch", "From Per-Band Res. Phase", "mixed")}
+          <div className="delay-grid delay-pair-grid">
+            <div className="delay-pair-row">
+              <label>
+                X Blue Res. Patch (ns)
+                <input
+                  type="number"
+                  step="0.1"
+                  value=${residualPatchDraft.xBlue}
+                  onChange=${function (event) {
+                    setResidualPatchDraft(Object.assign({}, residualPatchDraft, { xBlue: event.target.value }));
+                  }}
+                />
+              </label>
+              <label>
+                Y Blue Res. Patch (ns)
+                <input
+                  type="number"
+                  step="0.1"
+                  value=${residualPatchDraft.yBlue}
+                  onChange=${function (event) {
+                    setResidualPatchDraft(Object.assign({}, residualPatchDraft, { yBlue: event.target.value }));
+                  }}
+                />
+              </label>
+            </div>
+            <div className="delay-pair-row">
+              <label>
+                X Red Res. Patch (ns)
+                <input
+                  type="number"
+                  step="0.1"
+                  value=${residualPatchDraft.xRed}
+                  onChange=${function (event) {
+                    setResidualPatchDraft(Object.assign({}, residualPatchDraft, { xRed: event.target.value }));
+                  }}
+                />
+              </label>
+              <label>
+                Y Red Res. Patch (ns)
+                <input
+                  type="number"
+                  step="0.1"
+                  value=${residualPatchDraft.yRed}
+                  onChange=${function (event) {
+                    setResidualPatchDraft(Object.assign({}, residualPatchDraft, { yRed: event.target.value }));
+                  }}
+                />
+              </label>
+            </div>
+            <div className="delay-actions full">
+              <button type="button" className="btn-outline-fit-blue" disabled=${busy || !bluePatchDraftReady} onClick=${function () { applyResidualPatch("blue"); }}>Apply Blue Patch</button>
+              <button type="button" className="btn-outline-red" disabled=${busy || !redPatchDraftReady} onClick=${function () { applyResidualPatch("red"); }}>Apply Red Patch</button>
+              <button type="button" disabled=${busy} onClick=${resetResidualPatchDrafts}>Reset Patch Drafts</button>
+            </div>
+            <div className="full tiny">
+              Blue patch writes into the effective in-band path. Red patch writes into the multiband correction path.
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderPhacalSolveControl() {
+      if (!activePhacalMeta) {
+        return html`
+          <div className="delay-empty">
+            <div className="delay-summary">
+              <span>Phacal: None · ${selectedAntennaText}</span>
+            </div>
+            <div className="tiny">Analyze a phacal against an anchor refcal to edit the selected-antenna solve.</div>
+          </div>
+        `;
+      }
+      return html`
+        <div className="delay-summary">
+          <span>${"Phacal: " + currentScanLabel + " · " + selectedAntennaText}</span>
+        </div>
+        <div className="delay-control-section">
+          ${renderDelaySectionHeader("Anchor Summary", "Read-only anchor context", "neutral")}
+          <div className="summary-grid">
+            <div>
+              <strong>Canonical</strong>
+              <span>${activePhacalMeta.anchor_scan_time || activeRefLabel}</span>
+            </div>
+            <div>
+              <strong>Secondary</strong>
+              <span>${activePhacalMeta.secondary_anchor_scan_time || "None"}</span>
+            </div>
+            <div>
+              <strong>Fallback</strong>
+              <span>${activePhacalMeta.fallback_in_use ? "Active" : "Off"}</span>
+            </div>
+            <div>
+              <strong>Donor/Patch</strong>
+              <span>${activePhacalMeta.donor_patch_used ? "Active" : "None"}</span>
+            </div>
+          </div>
+        </div>
+
+        <div className="delay-control-section">
+          ${renderDelaySectionHeader("Primary Solve", "Selected-antenna phacal solve", "red")}
+          <div className="delay-grid delay-pair-grid">
+            <div className="delay-pair-row">
+              <label>
+                X Auto Delay (ns)
+                <input type="text" disabled value=${formatEditorValue(activePhacalMeta.x_auto_delay_ns)} />
+              </label>
+              <label>
+                Y Auto Delay (ns)
+                <input type="text" disabled value=${formatEditorValue(activePhacalMeta.y_auto_delay_ns)} />
+              </label>
+            </div>
+            <div className="delay-pair-row">
+              <label>
+                X Auto Offset (rad)
+                <input type="text" disabled value=${formatEditorValue(activePhacalMeta.x_auto_offset_rad)} />
+              </label>
+              <label>
+                Y Auto Offset (rad)
+                <input type="text" disabled value=${formatEditorValue(activePhacalMeta.y_auto_offset_rad)} />
+              </label>
+            </div>
+            <div className="delay-pair-row">
+              <label>
+                X Sug. Delay (ns)
+                <input type="text" disabled value=${formatEditorValue(activePhacalMeta.x_suggested_delay_ns)} />
+              </label>
+              <label>
+                Y Sug. Delay (ns)
+                <input type="text" disabled value=${formatEditorValue(activePhacalMeta.y_suggested_delay_ns)} />
+              </label>
+            </div>
+            <div className="delay-pair-row">
+              <label>
+                X Sug. Offset (rad)
+                <input type="text" disabled value=${formatEditorValue(activePhacalMeta.x_suggested_offset_rad)} />
+              </label>
+              <label>
+                Y Sug. Offset (rad)
+                <input type="text" disabled value=${formatEditorValue(activePhacalMeta.y_suggested_offset_rad)} />
+              </label>
+            </div>
+            <div className="delay-pair-row">
+              <label>
+                X Eff. Saved (ns)
+                <input type="text" disabled value=${formatEditorValue(activePhacalMeta.x_effective_delay_ns)} />
+              </label>
+              <label>
+                Y Eff. Saved (ns)
+                <input type="text" disabled value=${formatEditorValue(activePhacalMeta.y_effective_delay_ns)} />
+              </label>
+            </div>
+            <div className="delay-pair-row">
+              <label>
+                X Eff. Offset (rad)
+                <input type="text" disabled value=${formatEditorValue(activePhacalMeta.x_effective_offset_rad)} />
+              </label>
+              <label>
+                Y Eff. Offset (rad)
+                <input type="text" disabled value=${formatEditorValue(activePhacalMeta.y_effective_offset_rad)} />
+              </label>
+            </div>
+            <div className="delay-actions full">
+              <button type="button" className="btn-outline-red" disabled=${busy || !phacalEditorAdvanced} title="Apply the manual delay/offset values typed in Manual Tuning to the selected antenna" onClick=${applyRelativeDelayEditorUpdate}>Apply</button>
+              <button type="button" className="btn-outline-red" disabled=${busy || !hasRelativeSuggestion} title="Adopt the auto-suggested delay/offset (suggested → applied) for the selected antenna" onClick=${applyRelativeDelaySuggestion}>Apply Suggestion</button>
+              <button
+                type="button"
+                disabled=${busy || !(activePhacalMeta && activePhacalMeta.phacal_undo_available)}
+                title="Undo the most recent phasecal edit on this antenna"
+                onClick=${undoRelativeDelayEditor}
+              >
+                Undo
+              </button>
+              <button type="button" disabled=${busy} title="Reset all manual edits on the selected antenna back to the auto-solve values" onClick=${resetRelativeDelayEditorAntenna}>Reset</button>
+              <button
+                type="button"
+                disabled=${busy || activePhacalMeta.missing_in_phacal}
+                title=${activePhacalMeta.manual_anchor_fallback_override
+                  ? "Stop using phasecal data as a temporary anchor for this antenna; revert to the refcal anchor"
+                  : "Use this antenna's own phasecal data as a temporary anchor when its refcal is unusable"}
+                onClick=${function () {
+                  togglePhacalAnchorFallback(!activePhacalMeta.manual_anchor_fallback_override);
+                }}
+              >
+                ${activePhacalMeta.manual_anchor_fallback_override ? "Clear Temp Fallback" : "Use Temp Fallback"}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="delay-control-section">
+          ${renderDelaySectionHeader("Manual Tuning", "Override the auto solve when needed", "neutral")}
+          <div className="delay-actions">
+            <button
+              type="button"
+              disabled=${busy}
+              title=${phacalEditorAdvanced
+                ? "Collapse the Manual Tuning controls"
+                : "Open Manual Tuning to type override values for delay/offset"}
+              onClick=${function () {
+                setPhacalEditorAdvanced(!phacalEditorAdvanced);
+              }}
+            >
+              ${phacalEditorAdvanced ? "Hide Manual Tuning" : "Show Manual Tuning"}
+            </button>
+          </div>
+          ${phacalEditorAdvanced
+            ? html`
+                <div className="delay-grid delay-pair-grid">
+                  <div className="tiny" style=${{ marginBottom: "0.25rem" }}>
+                    Effective Saved = Auto + Applied. Type a manual value to override what the auto solve produced; click <b>Apply Manual</b> to commit it for the selected antenna.
+                  </div>
+                  <div className="delay-pair-row">
+                    <label title="Manual delay added on top of the auto solve. Effective = Auto + Applied.">
+                      X Applied Delay (ns)
+                      <input
+                        type="number"
+                        step="0.1"
+                        value=${relativeDelayDraft.x}
+                        onChange=${function (event) {
+                          setRelativeDelayDraft(Object.assign({}, relativeDelayDraft, { x: event.target.value }));
+                        }}
+                      />
+                    </label>
+                    <label>
+                      Y Applied Delay (ns)
+                      <input
+                        type="number"
+                        step="0.1"
+                        value=${relativeDelayDraft.y}
+                        onChange=${function (event) {
+                          setRelativeDelayDraft(Object.assign({}, relativeDelayDraft, { y: event.target.value }));
+                        }}
+                      />
+                    </label>
+                  </div>
+                  <div className="delay-pair-row">
+                    <label>
+                      X Applied Offset (rad)
+                      <input
+                        type="number"
+                        step="0.1"
+                        value=${relativeDelayDraft.xoff}
+                        onChange=${function (event) {
+                          setRelativeDelayDraft(Object.assign({}, relativeDelayDraft, { xoff: event.target.value }));
+                        }}
+                      />
+                    </label>
+                    <label>
+                      Y Applied Offset (rad)
+                      <input
+                        type="number"
+                        step="0.1"
+                        value=${relativeDelayDraft.yoff}
+                        onChange=${function (event) {
+                          setRelativeDelayDraft(Object.assign({}, relativeDelayDraft, { yoff: event.target.value }));
+                        }}
+                      />
+                    </label>
+                  </div>
+                  <div className="delay-actions">
+                    <button
+                      type="button"
+                      className="btn-outline-red"
+                      disabled=${busy}
+                      title="Apply the manual delay/offset values above to the selected antenna"
+                      onClick=${applyRelativeDelayEditorUpdate}
+                    >
+                      Apply Manual
+                    </button>
+                  </div>
+                </div>
+              `
+            : null}
+          <div className="tiny">
+            ${activePhacalMeta.missing_in_phacal
+              ? "Selected antenna has no usable phacal data. Saved delay/offset remain zero."
+              : activePhacalMeta.missing_in_refcal
+                ? "Selected antenna uses a temporary phacal-derived anchor fallback."
+                : "Anchor-first solve: use Anchor-Ref. Phase first; residual panels are advanced QA only."}
+          </div>
+          <div className="tiny">
+            ${"Kept bands X/Y: "
+              + String(activePhacalMeta.x_kept_band_count || 0)
+              + "/"
+              + String(activePhacalMeta.y_kept_band_count || 0)
+              + " · Kept ch. X/Y: "
+              + String(activePhacalMeta.x_kept_channel_count || 0)
+              + "/"
+              + String(activePhacalMeta.y_kept_channel_count || 0)
+              + " · Mask mode: "
+              + (phacalMaskMode === "per_pol" ? "Per-pol override" : "Shared XY")}
+          </div>
+        </div>
+      `;
+    }
 
     return html`
       <div className="app-shell" ref=${shellRef}>
@@ -4514,6 +6051,10 @@
                   <span>${activeRefLabel}</span>
                 </div>
                 <div>
+                  <strong>Secondary</strong>
+                  <span>${secondaryRefLabel}</span>
+                </div>
+                <div>
                   <strong>Antenna</strong>
                   <span>${selectedAntLabel}</span>
                 </div>
@@ -4559,6 +6100,31 @@
                   }}
                 >
                   Set Refcal
+                </button>
+                <button
+                  type="button"
+                  className="btn-outline-blue"
+                  disabled=${!canRefcal || busy || !state || state.ref_scan_id === null || selectedScanId() === state.ref_scan_id || !selectedScanEntry || String(selectedScanEntry.feed_kind || "") !== String((state.active_refcal && state.active_refcal.feed_kind) || "")}
+                  onClick=${function () {
+                    runAction(function () {
+                      return postJson("/api/refcal/secondary", {
+                        session_id: sessionId,
+                        scan_id: selectedScanId(),
+                      });
+                    });
+                  }}
+                >
+                  Set Secondary
+                </button>
+                <button
+                  type="button"
+                  className="btn-outline-blue"
+                  disabled=${!canCompareAnchors || busy}
+                  onClick=${function () {
+                    compareSelectedAnchors();
+                  }}
+                >
+                  Compare 2 Anchors
                 </button>
                 <button
                   type="button"
@@ -4632,8 +6198,14 @@
               </div>
 
               <section className="toolbar-workflow-box">
-                <h2>Workflow</h2>
-                <p>Set one HI refcal as the canonical anchor, tune in-band and relative-phase fits, then analyze the HI phacals and save SQL/NPZ. Handle LO separately; if a second HI refcal is available, keep it optional and use it only as secondary anchor metadata.</p>
+                <h2>${workflowGuide.title}</h2>
+                <p className="toolbar-workflow-next">${workflowGuide.next}</p>
+                <ol className="toolbar-workflow-steps">
+                  ${(workflowGuide.steps || []).map(function (step, idx) {
+                    return html`<li key=${idx}>${step}</li>`;
+                  })}
+                </ol>
+                ${workflowGuide.note ? html`<p className="toolbar-workflow-note">${workflowGuide.note}</p>` : null}
               </section>
 
               <div className=${"toolbar-status" + (activity ? " toolbar-status-progress" : "") + (activity && activity.error ? " error" : "")}>
@@ -4696,7 +6268,7 @@
                               <td>${String(scan.feed_kind || "unknown").toUpperCase()}</td>
                               <td>${scan.source}</td>
                               <td>${scan.duration_min.toFixed(1)}m</td>
-                              <td>${scan.status}${scan.is_refcal ? " *R" : ""}</td>
+                              <td>${scan.status}${scan.is_refcal ? " *R" : ""}${scan.is_secondary_anchor ? " *S" : ""}</td>
                             </tr>
                           `;
                         })
@@ -4720,434 +6292,177 @@
           </button>
         </section>
 
-        <main className="content-grid" style=${paneMaxHeight ? { "--content-pane-max-height": paneMaxHeight + "px" } : null}>
-          <aside className="control-rail panel">
-            <section className="rail-section heatmap-box">
-              <div className="rail-title-row">
-                <h2>Flag Map</h2>
-                <div className="rail-title-meta">
-                  <span>${"Flag " + selectedCellFlagSum}</span>
-                  <button
-                    type="button"
-                    className="btn-outline-blue"
-                    disabled=${busy || !stagedTimeIntervals.length}
-                    onClick=${applyStagedTimeFlags}
-                  >
-                    Apply Mask
-                  </button>
-                </div>
-              </div>
-              <${HeatmapPlot}
-                data=${heatmapData}
-                selectedAnt=${state ? state.selected_ant : null}
-                selectedBand=${state ? state.selected_band : null}
-                pendingCells=${pendingFlagMapCells}
-                onSelect=${onHeatmapSelect}
-              />
-            </section>
-
-            <section className="rail-section compact-th-box">
-              <div className="rail-title-row">
-                <h2>Time History</h2>
-                <div className="rail-title-meta">
-                  <span>${timeHistoryData && timeHistoryData.title ? String(timeHistoryData.title).replace(", ", " · ") : "Ant " + selectedAntLabel + " · Band " + selectedBandLabel}</span>
-                </div>
-              </div>
-              <${CompactTimeHistoryPlot}
-                data=${timeHistoryData}
-                scope=${timeFlagScope}
-                pendingIntervals=${selectedPendingTimeIntervals}
-                onScopeChange=${setTimeFlagScope}
-                onStageInterval=${stageTimeFlag}
-                onApplyPending=${applyStagedTimeFlags}
-                onDeletePendingInterval=${removeStagedTimeFlag}
-                onDeleteInterval=${deleteTimeFlag}
-                onStatus=${setInteractionMessage}
-                busy=${busy}
-              />
-            </section>
-
-            <section className="rail-section delay-box">
-              <h2>${isPhacalScan ? "Anchor Refcal" : "Anchor Refcal Delay Editor"}</h2>
-              ${state && state.active_refcal
-                ? html`
-                    <div className="delay-summary">
-                      <span>${"Refcal: " + activeRefLabel}; ${"Selected antenna: " + delayDraft.ant}</span>
-                    </div>
-                    ${isPhacalScan
-                      ? html`
-                          <div className="delay-grid delay-pair-grid">
-                            <div className="full tiny">
-                              ${state.active_phacal && state.active_phacal.anchor_scan_id !== null
-                                ? "Anchor scan " + (state.active_phacal.anchor_scan_time || activeRefLabel) + " is read-only in phacal mode."
-                                : "Anchor metadata unavailable."}
-                            </div>
-                          </div>
-                        `
-                      : html`
-                          <div className="delay-grid delay-pair-grid">
-                            <div className="delay-pair-row">
-                              <label>
-                                X Delay (ns)
-                                <input
-                                  type="number"
-                                  step="0.1"
-                                  value=${delayDraft.x}
-                                  onChange=${function (event) {
-                                    setDelayDraft(Object.assign({}, delayDraft, { x: event.target.value }));
-                                  }}
-                                />
-                              </label>
-                              <label>
-                                Y Delay (ns)
-                                <input
-                                  type="number"
-                                  step="0.1"
-                                  value=${delayDraft.y}
-                                  onChange=${function (event) {
-                                    setDelayDraft(Object.assign({}, delayDraft, { y: event.target.value }));
-                                  }}
-                                />
-                              </label>
-                            </div>
-                            <div className="delay-actions full">
-                              <button
-                                type="button"
-                                disabled=${busy}
-                                onClick=${function () {
-                                  applyDelayEditorUpdate();
-                                }}
-                              >
-                                Apply
-                              </button>
-                              <button
-                                type="button"
-                                disabled=${busy}
-                                onClick=${function () {
-                                  resetDelayEditorAntenna();
-                                }}
-                              >
-                                Reset Ant
-                              </button>
-                              <button
-                                type="button"
-                                disabled=${busy}
-                                onClick=${function () {
-                                  resetAllDelayEditor();
-                                }}
-                              >
-                                Reset All
-                              </button>
-                            </div>
-                            <div className="full tiny">
-                              ${state.active_refcal.dirty_inband
-                                ? "Active refcal has unsaved in-band edits."
-                                : "Active refcal matches the fitted in-band solution."}
-                            </div>
-                          </div>
-                        `}
-                  `
+        <main className=${"content-grid" + (controlRailCollapsed ? " control-rail-collapsed" : "")} style=${paneMaxHeight ? { "--content-pane-max-height": paneMaxHeight + "px" } : null}>
+          <aside className="control-rail-shell" style=${{ width: controlRailWidth + "px" }}>
+            <div className=${"control-rail panel" + (controlRailCollapsed ? " collapsed" : "")}>
+              ${controlRailCollapsed
+                ? null
                 : html`
-                    <div className="delay-empty">
-                      <div className="delay-summary">
-                        <span>Refcal: None; ${"Selected antenna: " + delayDraft.ant}</span>
-                      </div>
-                      <div className="tiny">Set a refcal to edit per-antenna X/Y in-band delays.</div>
+                    <div className="control-rail-scroll">
+                      <section className="rail-section heatmap-box">
+                        <div className="rail-title-row">
+                          <h2>Flag Map</h2>
+                          <div className="rail-title-meta">
+                            <span>${"Flag " + selectedCellFlagSum}</span>
+                            <button
+                              type="button"
+                              className="btn-outline-blue"
+                              disabled=${busy || !stagedTimeIntervals.length}
+                              title="Commit the staged time-interval flags shown on the Flag Map"
+                              onClick=${applyStagedTimeFlags}
+                            >
+                              Apply Mask
+                            </button>
+                          </div>
+                        </div>
+                        <${HeatmapPlot}
+                          data=${heatmapData}
+                          selectedAnt=${state ? state.selected_ant : null}
+                          selectedBand=${state ? state.selected_band : null}
+                          pendingCells=${pendingFlagMapCells}
+                          onSelect=${onHeatmapSelect}
+                        />
+                      </section>
+
+                      <section className="rail-section compact-th-box">
+                        <div className="rail-title-row">
+                          <h2>Time History</h2>
+                          <div className="rail-title-meta">
+                            <span>${timeHistoryData && timeHistoryData.title ? String(timeHistoryData.title).replace(", ", " · ") : "Ant " + selectedAntLabel + " · Band " + selectedBandLabel}</span>
+                          </div>
+                        </div>
+                        <${CompactTimeHistoryPlot}
+                          data=${timeHistoryData}
+                          scope=${timeFlagScope}
+                          pendingIntervals=${selectedPendingTimeIntervals}
+                          onScopeChange=${setTimeFlagScope}
+                          onStageInterval=${stageTimeFlag}
+                          onApplyPending=${applyStagedTimeFlags}
+                          onDeletePendingInterval=${removeStagedTimeFlag}
+                          onDeleteInterval=${deleteTimeFlag}
+                          onStatus=${setInteractionMessage}
+                          busy=${busy}
+                        />
+                      </section>
+
+                      <section className="rail-section delay-box delay-control-box">
+                        <div className="rail-title-row">
+                          <h2>${isPhacalScan ? "Phacal Solve Control" : "Delay Control"}</h2>
+                          <div className="rail-title-meta">
+                            <span>${selectedAntennaText}</span>
+                          </div>
+                        </div>
+                        ${isPhacalScan ? renderPhacalSolveControl() : renderRefcalDelayControl()}
+                      </section>
                     </div>
                   `}
-            </section>
-
-            <section className="rail-section delay-box">
-              <h2>${isPhacalScan ? "Phasecal Solve Editor" : "Relative Phase Delay Editor"}</h2>
-              ${isPhacalScan && state && state.active_phacal
-                ? html`
-                    <div className="delay-summary">
-                      <span>
-                        ${"Anchor: " + (state.active_phacal.anchor_scan_time || activeRefLabel)}
-                        ${state.active_phacal.fallback_in_use ? " · fallback active for this antenna" : ""}
-                      </span>
-                    </div>
-                    <div className="delay-grid delay-pair-grid">
-                      <div className="delay-pair-row">
-                        <label>
-                          X Auto Delay (ns)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_phacal.x_auto_delay_ns || 0))} />
-                        </label>
-                        <label>
-                          Y Auto Delay (ns)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_phacal.y_auto_delay_ns || 0))} />
-                        </label>
-                      </div>
-                      <div className="delay-pair-row">
-                        <label>
-                          X Auto Offset (rad)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_phacal.x_auto_offset_rad || 0))} />
-                        </label>
-                        <label>
-                          Y Auto Offset (rad)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_phacal.y_auto_offset_rad || 0))} />
-                        </label>
-                      </div>
-                      <div className="delay-pair-row">
-                        <label>
-                          X Suggested Corr. (ns)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_phacal.x_suggested_delay_ns || 0))} />
-                        </label>
-                        <label>
-                          Y Suggested Corr. (ns)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_phacal.y_suggested_delay_ns || 0))} />
-                        </label>
-                      </div>
-                      <div className="delay-pair-row">
-                        <label>
-                          X Suggested Offset (rad)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_phacal.x_suggested_offset_rad || 0))} />
-                        </label>
-                        <label>
-                          Y Suggested Offset (rad)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_phacal.y_suggested_offset_rad || 0))} />
-                        </label>
-                      </div>
-                      <div className="delay-pair-row">
-                        <label>
-                          X Applied Corr. (ns)
-                          <input
-                            type="number"
-                            step="0.1"
-                            value=${relativeDelayDraft.x}
-                            onChange=${function (event) {
-                              setRelativeDelayDraft(Object.assign({}, relativeDelayDraft, { x: event.target.value }));
-                            }}
-                          />
-                        </label>
-                        <label>
-                          Y Applied Corr. (ns)
-                          <input
-                            type="number"
-                            step="0.1"
-                            value=${relativeDelayDraft.y}
-                            onChange=${function (event) {
-                              setRelativeDelayDraft(Object.assign({}, relativeDelayDraft, { y: event.target.value }));
-                            }}
-                          />
-                        </label>
-                      </div>
-                      <div className="delay-pair-row">
-                        <label>
-                          X Applied Offset (rad)
-                          <input
-                            type="number"
-                            step="0.1"
-                            value=${relativeDelayDraft.xoff}
-                            onChange=${function (event) {
-                              setRelativeDelayDraft(Object.assign({}, relativeDelayDraft, { xoff: event.target.value }));
-                            }}
-                          />
-                        </label>
-                        <label>
-                          Y Applied Offset (rad)
-                          <input
-                            type="number"
-                            step="0.1"
-                            value=${relativeDelayDraft.yoff}
-                            onChange=${function (event) {
-                              setRelativeDelayDraft(Object.assign({}, relativeDelayDraft, { yoff: event.target.value }));
-                            }}
-                          />
-                        </label>
-                      </div>
-                      <div className="delay-pair-row">
-                        <label>
-                          X Effective Saved (ns)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_phacal.x_effective_delay_ns || 0))} />
-                        </label>
-                        <label>
-                          Y Effective Saved (ns)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_phacal.y_effective_delay_ns || 0))} />
-                        </label>
-                      </div>
-                      <div className="delay-pair-row">
-                        <label>
-                          X Effective Offset (rad)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_phacal.x_effective_offset_rad || 0))} />
-                        </label>
-                        <label>
-                          Y Effective Offset (rad)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_phacal.y_effective_offset_rad || 0))} />
-                        </label>
-                      </div>
-                      <div className="delay-actions full">
-                        <button type="button" disabled=${busy} onClick=${applyRelativeDelayEditorUpdate}>Apply</button>
-                        <button type="button" disabled=${busy || !hasRelativeSuggestion} onClick=${applyRelativeDelaySuggestion}>Apply Suggestion</button>
-                        <button
-                          type="button"
-                          disabled=${busy || !(state.active_phacal && state.active_phacal.phacal_undo_available)}
-                          onClick=${undoRelativeDelayEditor}
-                        >
-                          Undo Last
-                        </button>
-                        <button type="button" disabled=${busy} onClick=${resetRelativeDelayEditorAntenna}>Reset Auto</button>
-                      </div>
-                      <div className="full tiny">
-                        ${state.active_phacal.missing_in_phacal
-                          ? "Selected antenna has no usable phacal data. Saved delay/offset remain zero."
-                          : state.active_phacal.missing_in_refcal
-                            ? "Selected antenna uses a temporary phacal-derived anchor fallback."
-                            : "Phacal delay comes from the anchor ratio solve; offsets are fit per polarization."}
-                      </div>
-                    </div>
-                  `
-                : state && state.active_refcal
-                ? html`
-                    <div className="delay-summary">
-                      <span>${"Refcal: " + activeRefLabel}; ${"Selected antenna: " + relativeDelayDraft.ant}</span>
-                    </div>
-                    <div className="delay-grid delay-pair-grid">
-                      <div className="delay-pair-row">
-                        <label>
-                          X Auto Baseline (ns)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_refcal.x_auto_relative_delay_ns || 0))} />
-                        </label>
-                        <label>
-                          Y Auto Baseline (ns)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_refcal.y_auto_relative_delay_ns || 0))} />
-                        </label>
-                      </div>
-                      <div className="delay-pair-row">
-                        <label>
-                          X Suggested Corr. (ns)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_refcal.x_suggested_relative_delay_ns || 0))} />
-                        </label>
-                        <label>
-                          Y Suggested Corr. (ns)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_refcal.y_suggested_relative_delay_ns || 0))} />
-                        </label>
-                      </div>
-                      <div className="delay-pair-row">
-                        <label>
-                          X Applied Corr. (ns)
-                          <input
-                            type="number"
-                            step="0.1"
-                            value=${relativeDelayDraft.x}
-                            onChange=${function (event) {
-                              setRelativeDelayDraft(Object.assign({}, relativeDelayDraft, { x: event.target.value }));
-                            }}
-                          />
-                        </label>
-                        <label>
-                          Y Applied Corr. (ns)
-                          <input
-                            type="number"
-                            step="0.1"
-                            value=${relativeDelayDraft.y}
-                            onChange=${function (event) {
-                              setRelativeDelayDraft(Object.assign({}, relativeDelayDraft, { y: event.target.value }));
-                            }}
-                          />
-                        </label>
-                      </div>
-                      <div className="delay-pair-row">
-                        <label>
-                          X Effective Fit (ns)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_refcal.x_effective_relative_delay_ns || 0))} />
-                        </label>
-                        <label>
-                          Y Effective Fit (ns)
-                          <input type="text" disabled value=${formatNumber(Number(state.active_refcal.y_effective_relative_delay_ns || 0))} />
-                        </label>
-                      </div>
-                      <div className="delay-actions full">
-                        <button
-                          type="button"
-                          disabled=${busy}
-                          onClick=${function () {
-                            applyRelativeDelayEditorUpdate();
-                          }}
-                        >
-                          Apply
-                        </button>
-                        <button
-                          type="button"
-                          disabled=${busy || !hasRelativeSuggestion}
-                          onClick=${function () {
-                            applyRelativeDelaySuggestion();
-                          }}
-                        >
-                          Apply Suggestion
-                        </button>
-                        <button
-                          type="button"
-                          disabled=${busy || !(state.active_refcal && state.active_refcal.relative_undo_available)}
-                          onClick=${function () {
-                            undoRelativeDelayEditor();
-                          }}
-                        >
-                          Undo Last
-                        </button>
-                        <button
-                          type="button"
-                          disabled=${busy}
-                          onClick=${function () {
-                            resetRelativeDelayEditorAntenna();
-                          }}
-                        >
-                          Reset Auto
-                        </button>
-                      </div>
-                      <div className="full tiny">
-                        Auto baseline comes from kept-band fitting. Suggested correction is residual-guided and only applies when clicked.
-                      </div>
-                    </div>
-                  `
-                : html`
-                    <div className="delay-empty">
-                      <div className="delay-summary">
-                        <span>${isPhacalScan ? "Phacal: None; " : "Refcal: None; "}${"Selected antenna: " + relativeDelayDraft.ant}</span>
-                      </div>
-                      <div className="tiny">
-                        ${isPhacalScan
-                          ? "Analyze a phacal against an anchor refcal to edit multiband delay and offset."
-                          : "Set or analyze a refcal to edit per-antenna X/Y relative residual delays."}
-                      </div>
-                    </div>
-                  `}
-            </section>
+              <button
+                type="button"
+                className=${"control-rail-toggle" + (controlRailCollapsed ? " collapsed" : "")}
+                aria-label=${controlRailCollapsed ? "Show control rail" : "Hide control rail"}
+                onClick=${toggleControlRailCollapsed}
+              >
+                <span className="control-rail-chevron-glyph">${controlRailCollapsed ? "»" : "«"}</span>
+              </button>
+            </div>
           </aside>
+          ${controlRailCollapsed
+            ? null
+            : html`<div
+                className="content-grid-splitter"
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize control rail"
+                onPointerDown=${startControlRailResize}
+              ></div>`}
 
           <section className="analysis-wall panel">
             <div className="analysis-stack">
-              ${OVERVIEW_SECTIONS.map(function (section) {
+              ${!isPhacalScan && compareData
+                ? html`<${AnchorCompareView}
+                    data=${compareData}
+                    busy=${busy}
+                    canonicalId=${state && state.ref_scan_id !== null ? state.ref_scan_id : null}
+                    secondaryId=${state && state.secondary_ref_scan_id !== null ? state.secondary_ref_scan_id : null}
+                    onSetCanonical=${function (scanId) {
+                      runAction(function () {
+                        return postJson("/api/refcal/select", {
+                          session_id: sessionId,
+                          scan_id: scanId,
+                        });
+                      });
+                    }}
+                    onSetSecondary=${setSecondaryAnchor}
+                    onClearSecondary=${clearSecondaryAnchor}
+                    onToggleDonorPatch=${toggleDonorPatchCandidate}
+                    onApplyDonorPatch=${applyDonorPatchSelection}
+                    onClearCompare=${clearAnchorCompare}
+                  />`
+                : null}
+              ${OVERVIEW_SECTIONS.filter(function (section) {
+                if (section.phacalOnly && !isPhacalScan) {
+                  return false;
+                }
+                if (section.refcalOnly && isPhacalScan) {
+                  return false;
+                }
+                return true;
+              }).map(function (section) {
                 const plotData = overviewData ? overviewData[section.id] : null;
                 return html`
                   <${PlotCard}
                     key=${section.id}
                     title=${plotData && plotData.title ? plotData.title : section.label}
                     legend=${section.showLegend === false ? null : plotData && plotData.legend}
-                    inlineControls=${section.id === "inband_fit" && !isPhacalScan
-                      ? html`<${InbandWindowControls}
-                          antennaScope=${inbandAntennaScope}
-                          polScope=${inbandPolScope}
-                          busy=${busy}
-                          hasPending=${Object.keys(stagedInbandMasks).length > 0}
-                          pendingCount=${Object.keys(stagedInbandMasks).length}
-                          onAntennaScopeChange=${setInbandAntennaScope}
-                          onPolScopeChange=${setInbandPolScope}
-                          onApply=${applyStagedInbandWindow}
-                        />
-                        <button
-                          type="button"
-                          className="btn-outline-blue"
-                          disabled=${busy || !Object.keys(stagedInbandMasks).length}
-                          onClick=${function () {
-                            previewStagedInbandSection("inband_fit");
-                          }}
-                        >
-                          Refresh
-                        </button>`
-                      : section.id === "inband_relative_phase"
-                        ? html`
-                            <${InbandWindowControls}
+                    inlineControls=${section.id === "inband_fit"
+                      ? (isPhacalScan
+                          ? html`
+                              <div className="scope-pills" role="group" aria-label="Phacal mask mode">
+                                <button
+                                  type="button"
+                                  className=${"scope-pill" + (phacalMaskMode === "shared_xy" ? " active" : "")}
+                                  disabled=${busy}
+                                  onClick=${function () {
+                                    setPhacalMaskMode("shared_xy");
+                                  }}
+                                >
+                                  Shared XY
+                                </button>
+                                <button
+                                  type="button"
+                                  className=${"scope-pill" + (phacalMaskMode === "per_pol" ? " active" : "")}
+                                  disabled=${busy}
+                                  onClick=${function () {
+                                    setPhacalMaskMode("per_pol");
+                                  }}
+                                >
+                                  Per-pol Override
+                                </button>
+                              </div>
+                              <button
+                                type="button"
+                                className="btn-outline-blue"
+                                disabled=${busy || !Object.keys(stagedInbandMasks).length}
+                                onClick=${function () {
+                                  previewStagedInbandSection("inband_fit");
+                                }}
+                                title="Preview the fit with staged mask — does not commit"
+                              >
+                                Preview
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-outline-red"
+                                disabled=${busy || !Object.keys(stagedInbandMasks).length}
+                                onClick=${function () {
+                                  applyStagedInbandWindow();
+                                }}
+                                title="Commit the staged mask. Activates the previewed fit; no recomputation needed."
+                              >
+                                Commit
+                              </button>
+                            `
+                          : html`<${InbandWindowControls}
                               antennaScope=${inbandAntennaScope}
                               polScope=${inbandPolScope}
                               busy=${busy}
@@ -5161,12 +6476,40 @@
                               type="button"
                               className="btn-outline-blue"
                               disabled=${busy || !Object.keys(stagedInbandMasks).length}
+                              title="Preview the fit with staged mask — does not commit"
                               onClick=${function () {
-                                previewStagedInbandSection("inband_relative_phase");
+                                previewStagedInbandSection("inband_fit");
                               }}
                             >
-                              Refresh
-                            </button>
+                              Preview
+                            </button>`)
+                      : section.id === "inband_relative_phase"
+                        ? html`
+                            ${!isPhacalScan
+                              ? html`
+                                  <${InbandWindowControls}
+                                    antennaScope=${inbandAntennaScope}
+                                    hidePol=${true}
+                                    busy=${busy}
+                                    hasPending=${Object.keys(stagedRelPhaseMasks).length > 0}
+                                    pendingCount=${Object.keys(stagedRelPhaseMasks).length}
+                                    onAntennaScopeChange=${setInbandAntennaScope}
+                                    onPolScopeChange=${function () {}}
+                                    onApply=${applyRelPhaseInbandWindow}
+                                  />
+                                  <button
+                                    type="button"
+                                    className="btn-outline-blue"
+                                    disabled=${busy || !Object.keys(stagedRelPhaseMasks).length}
+                                    title="Preview the fit with staged mask — does not commit"
+                                    onClick=${function () {
+                                      previewStagedInbandSection("inband_relative_phase");
+                                    }}
+                                  >
+                                    Preview
+                                  </button>
+                                `
+                              : html`<span className="plot-inline-summary">Adv. QA only</span>`}
                             ${!isPhacalScan
                               ? html`<div className="plot-inline-threshold">
                                   <label>
@@ -5185,21 +6528,13 @@
                                     type="button"
                                     className="btn-outline-blue"
                                     disabled=${busy || !(state && state.active_refcal)}
+                                    title="Auto-flag antennas whose Y-X residual RMS exceeds the threshold above"
                                     onClick=${function () {
                                       applyYxResidualThreshold();
                                     }}
                                   >
                                     Apply
                                   </button>
-                                  <span className="plot-inline-summary">
-                                    ${state && state.active_refcal
-                                      ? "Y-X residual RMS: "
-                                        + formatNumber(Number(state.active_refcal.yx_residual_rms || 0))
-                                        + " rad (threshold "
-                                        + formatNumber(Number(state.active_refcal.yx_residual_threshold_rad || 1.5))
-                                        + ")"
-                                      : "No active refcal"}
-                                  </span>
                                 </div>`
                               : null}
                           `
@@ -5223,6 +6558,7 @@
                                     type="button"
                                     className="btn-outline-blue"
                                     disabled=${busy || !(state && state.active_refcal)}
+                                    title="Auto-flag bands whose in-band residual RMS exceeds the threshold above"
                                     onClick=${function () {
                                       applyResidualBandThreshold();
                                     }}
@@ -5235,26 +6571,29 @@
                               type="button"
                               className="btn-outline-red"
                               disabled=${busy || !canApplyResidualMultibandFit}
+                              title="Apply auto-suggested multiband delay to the antenna currently selected in the editor"
                               onClick=${function () {
                                 applyResidualMultibandFit();
                               }}
                             >
-                              Apply Multiband Fit
+                              Apply Auto Delay (Sel. Ant)
                             </button>
                             <button
                               type="button"
                               className="btn-outline-fit-blue"
                               disabled=${busy || !canApplyResidualFit}
+                              title="Apply per-band in-band residual correction to all eligible antennas"
                               onClick=${function () {
                                 applyResidualInbandFit();
                               }}
                             >
-                              Apply In-Band Res. Fit
+                              Apply In-Band (All Ants)
                             </button>
                             <button
                               type="button"
                               className="btn-outline-blue"
                               disabled=${busy || !canUndoResidualPanel}
+                              title="Undo the last residual-panel action (apply auto delay, in-band fit, or column flag)"
                               onClick=${function () {
                                 undoResidualPanelAction();
                               }}
@@ -5265,12 +6604,14 @@
                               type="button"
                               className="btn-outline-blue"
                               disabled=${busy || !Object.keys(stagedResidualMasks).length}
+                              title="Refresh the residual preview using the staged residual mask"
                               onClick=${function () {
                                 previewStagedResidualSection();
                               }}
                             >
                               Refresh
                             </button>
+                            ${isPhacalScan ? html`<span className="plot-inline-summary">Adv. QA only</span>` : null}
                           `
                       : null}
                   >
@@ -5280,40 +6621,58 @@
                       busy=${busy}
                       panelHeight=${section.panelHeight}
                       interactionMode=${section.id === "inband_residual_delay_band" ? "zoom" : null}
-                      panelOverride=${canEditKeptMaskSection(section.id)
+                      panelOverride=${section.id === "inband_relative_phase"
                         ? function (rowIdx, panelIdx, panel) {
-                            return panelWithStagedInbandSelection(section.id, rowIdx, panelIdx, panel);
+                            return panelWithStagedRelPhaseSelection(rowIdx, panelIdx, panel);
                           }
-                        : canEditResidualMaskSection(section.id)
+                        : canEditKeptMaskSection(section.id)
                           ? function (rowIdx, panelIdx, panel) {
-                              return panelWithStagedResidualSelection(rowIdx, panelIdx, panel);
+                              return panelWithStagedInbandSelection(section.id, rowIdx, panelIdx, panel);
                             }
-                        : null}
-                      onBandWindowSelect=${canEditKeptMaskSection(section.id)
+                          : canEditResidualMaskSection(section.id)
+                            ? function (rowIdx, panelIdx, panel) {
+                                return panelWithStagedResidualSelection(rowIdx, panelIdx, panel);
+                              }
+                            : null}
+                      onBandWindowSelect=${section.id === "inband_relative_phase" && !isPhacalScan
                         ? function (rowIdx, panelIdx, startBand, endBand, mode) {
-                            stageInbandWindow(startBand, endBand, rowIdx, panelIdx, mode);
+                            stageRelPhaseSelection(startBand, endBand, rowIdx, panelIdx, mode);
                           }
-                        : canEditResidualMaskSection(section.id)
-                          ? function (rowIdx, panelIdx, startBand, endBand) {
-                              stageResidualSelection(startBand, endBand, rowIdx, panelIdx);
+                        : canEditKeptMaskSection(section.id)
+                          ? function (rowIdx, panelIdx, startBand, endBand, mode) {
+                              if (isPhacalScan && section.id === "inband_fit" && Number(rowIdx) === 2) {
+                                return;
+                              }
+                              stageInbandWindow(startBand, endBand, rowIdx, panelIdx, mode);
                             }
-                        : null}
-                      onPanelDoubleClick=${canEditKeptMaskSection(section.id)
+                          : canEditResidualMaskSection(section.id)
+                            ? function (rowIdx, panelIdx, startBand, endBand) {
+                                stageResidualSelection(startBand, endBand, rowIdx, panelIdx);
+                              }
+                            : null}
+                      onPanelDoubleClick=${section.id === "inband_relative_phase" && !isPhacalScan
                         ? function (rowIdx, panelIdx) {
-                            stageInbandMaskClear(rowIdx, panelIdx);
+                            stageRelPhaseMaskClear(rowIdx, panelIdx);
                           }
-                        : canEditResidualMaskSection(section.id)
+                        : canEditKeptMaskSection(section.id)
                           ? function (rowIdx, panelIdx) {
-                              stageResidualMaskClear(rowIdx, panelIdx);
+                              stageInbandMaskClear(rowIdx, panelIdx);
                             }
-                        : null}
-                      bandSelectApplyLabel=${section.id === "inband_residual_phase_band" ? "Apply In-Band Res. Fit" : "Apply Mask"}
-                      onColumnToggle=${section.id === "inband_relative_phase" || section.id === "inband_residual_phase_band"
+                          : canEditResidualMaskSection(section.id)
+                            ? function (rowIdx, panelIdx) {
+                                stageResidualMaskClear(rowIdx, panelIdx);
+                              }
+                            : null}
+                      bandSelectApplyLabel=${section.id === "inband_residual_phase_band"
+                        ? "Apply In-Band (All Ants)"
+                        : (isPhacalScan && section.id === "inband_fit" ? "Commit" : "Apply Mask")}
+                      onColumnToggle=${(isPhacalScan && section.id === "inband_fit") || section.id === "inband_relative_phase" || section.id === "inband_residual_phase_band"
                         ? function (antennaIndex, flagged) {
                             toggleManualAntennaFlag(antennaIndex, flagged);
                           }
                         : null}
                       columnActionRenderer=${section.id === "inband_residual_phase_band"
+                        || (isPhacalScan && section.id === "inband_fit")
                         ? residualColumnActionRenderer
                         : null}
                     />

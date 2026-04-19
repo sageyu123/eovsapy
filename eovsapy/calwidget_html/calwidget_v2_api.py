@@ -52,6 +52,8 @@ from .calwidget_v2_plots import (
     TAB_NAMES,
     _auto_quality_flagged_antennas,
     _effective_disabled_antennas,
+    _expand_reference_antenna_dependencies,
+    _relative_delay_partial_payloads,
     export_model_bundle_entry,
     heatmap_payload,
     heatmap_plot_meta,
@@ -67,9 +69,12 @@ from .calwidget_v2_plots import (
     phacal_anchor_phase_payload,
     phacal_delay_editor_meta,
     phacal_multiband_residual_payload,
+    phacal_phase_compare_payload,
     phacal_per_band_residual_payload,
     phacal_residual_inband_suggestions,
+    _phacal_residual_panel_meta,
     refresh_model_flag_state,
+    refcal_compare_payload,
     relative_delay_editor_meta,
     render_heatmap,
     render_tab,
@@ -91,6 +96,12 @@ class ScanRequest(SessionRequest):
     """Requests that operate on one scan."""
 
     scan_id: int
+
+
+class OptionalScanRequest(SessionRequest):
+    """Requests that optionally operate on one scan."""
+
+    scan_id: Optional[int] = None
 
 
 class CombineRequest(SessionRequest):
@@ -132,6 +143,26 @@ class UpdateRelativeDelayRequest(SessionRequest):
     antenna: int
     x_delay_ns: Optional[float] = None
     y_delay_ns: Optional[float] = None
+    ant1_manual_dxy_corr_rad: Optional[float] = None
+    ant1_dip_center_ghz: Optional[float] = None
+    ant1_dip_width_ghz: Optional[float] = None
+    ant1_dip_depth_rad: Optional[float] = None
+    ant1_lowfreq_weight_power: Optional[float] = None
+
+
+class PreviewAnt1ShapeRequest(SessionRequest):
+    """Preview staged Ant 1 multiband-shape tuning without committing it."""
+
+    dip_center_ghz: float
+    dip_width_ghz: float
+    dip_depth_rad: float
+    lowfreq_weight_power: float
+
+
+class PreviewAnt1DxyRequest(SessionRequest):
+    """Preview staged Ant 1 ``Δ(Y-X)`` tuning without committing it."""
+
+    manual_dxy_corr_rad: float
 
 
 class UpdatePhacalSolveRequest(SessionRequest):
@@ -148,6 +179,20 @@ class RelativeDelayAntennaRequest(SessionRequest):
     """Operate on one antenna's display-only relative-delay state."""
 
     antenna: int
+
+
+class PhacalFallbackRequest(SessionRequest):
+    """Toggle one phacal antenna's temporary fallback path."""
+
+    antenna: int
+    enabled: bool
+
+
+class DonorPatchCandidateRequest(SessionRequest):
+    """Stage one donor-patch candidate antenna for compare mode."""
+
+    antenna: int
+    selected: bool
 
 
 class ResetInbandRequest(SessionRequest):
@@ -207,6 +252,13 @@ class InbandMaskBatchRequest(SessionRequest):
     targets: List[InbandMaskTarget]
 
 
+class MultibandFitKindRequest(SessionRequest):
+    """Set the per-antenna multiband fit kind for the active refcal."""
+
+    antenna: int
+    kind: str
+
+
 class SaveSqlRequest(SessionRequest):
     """Save the selected or provided scan to SQL."""
 
@@ -243,6 +295,7 @@ class ResidualInbandFitRequest(SessionRequest):
     """Apply residual in-band correction after committing residual masks."""
 
     targets: List[InbandMaskTarget] = []
+    antenna: Optional[int] = None
 
 
 class SectionMaskPreviewRequest(SessionRequest):
@@ -282,6 +335,26 @@ class TimeFlagDeleteRequest(SessionRequest):
     group_id: str
 
 
+def _phacal_mask_signature(targets: List[InbandMaskTarget]) -> str:
+    """Return a stable signature for a set of staged in-band mask targets.
+
+    Used to determine whether a Commit can short-circuit the re-solve by
+    reusing the cached preview result. The signature is independent of
+    target order so a Preview followed immediately by a Commit on the same
+    selection always matches.
+    """
+
+    parts = []
+    for target in (targets or []):
+        ranges = sorted(
+            (int(item.start_band), int(item.end_band))
+            for item in (target.kept_ranges or [])
+        )
+        parts.append((int(target.antenna), int(target.polarization), tuple(ranges)))
+    parts.sort()
+    return json.dumps(parts, separators=(",", ":"))
+
+
 @dataclass
 class WidgetSession:
     """State for one browser session."""
@@ -292,6 +365,11 @@ class WidgetSession:
     analyses: Dict[int, ScanAnalysis] = field(default_factory=dict)
     selected_scan_id: Optional[int] = None
     ref_scan_id: Optional[int] = None
+    secondary_ref_scan_id: Optional[int] = None
+    compare_ref_scan_ids: List[int] = field(default_factory=list)
+    compare_feed_kind: Optional[str] = None
+    staged_secondary_patch_antennas: List[int] = field(default_factory=list)
+    secondary_patch_antennas: List[int] = field(default_factory=list)
     selected_ant: int = 0
     selected_band: int = 0
     status_message: str = "Ready."
@@ -305,6 +383,9 @@ class WidgetSession:
         previous_date = None if self.day is None else self.day.get("date")
         previous_selected = self.selected_scan_id
         previous_ref = self.ref_scan_id
+        previous_secondary = self.secondary_ref_scan_id
+        previous_compare = list(self.compare_ref_scan_ids)
+        previous_compare_feed = self.compare_feed_kind
         previous_ant = self.selected_ant
         previous_band = self.selected_band
         previous_analyses = self.analyses
@@ -319,12 +400,31 @@ class WidgetSession:
             )
             self.selected_scan_id = previous_selected if previous_selected in valid_ids else None
             self.ref_scan_id = previous_ref if previous_ref in valid_ids else None
+            self.secondary_ref_scan_id = previous_secondary if previous_secondary in valid_ids else None
+            self.compare_ref_scan_ids = [int(scan_id) for scan_id in previous_compare if int(scan_id) in valid_ids]
+            if len(self.compare_ref_scan_ids) != 2:
+                self.compare_ref_scan_ids = []
+                self.compare_feed_kind = None
+            else:
+                self.compare_feed_kind = previous_compare_feed
+            valid_ant_ids = set(range(15))
+            self.staged_secondary_patch_antennas = [
+                int(ant) for ant in self.staged_secondary_patch_antennas if int(ant) in valid_ant_ids
+            ]
+            self.secondary_patch_antennas = [
+                int(ant) for ant in self.secondary_patch_antennas if int(ant) in valid_ant_ids
+            ]
             self.selected_ant = previous_ant
             self.selected_band = previous_band
         else:
             self.analyses = {}
             self.selected_scan_id = None
             self.ref_scan_id = None
+            self.secondary_ref_scan_id = None
+            self.compare_ref_scan_ids = []
+            self.compare_feed_kind = None
+            self.staged_secondary_patch_antennas = []
+            self.secondary_patch_antennas = []
             self.selected_ant = 0
             self.selected_band = 0
         if self.entries:
@@ -378,9 +478,24 @@ class WidgetSession:
             "color": entry["color"],
             "selected": self.selected_scan_id == int(entry["scan_id"]),
             "is_refcal": self.ref_scan_id == int(entry["scan_id"]),
+            "is_secondary_anchor": self.secondary_ref_scan_id == int(entry["scan_id"]),
             "saved_to_sql": saved,
             "analyzed": analysis is not None,
         }
+
+    def _secondary_refcal(self) -> Optional[ScanAnalysis]:
+        """Return the active secondary same-feed refcal."""
+
+        if self.secondary_ref_scan_id is None:
+            return None
+        return self._ensure_refcal_analysis(int(self.secondary_ref_scan_id))
+
+    def _invalidate_analyzed_phacals(self) -> None:
+        """Drop analyzed phacals after an anchor change."""
+
+        to_drop = [scan_id for scan_id, analysis in self.analyses.items() if analysis.scan_kind == "phacal"]
+        for scan_id in to_drop:
+            del self.analyses[scan_id]
 
     def get_scan_result(self, scan_id: int) -> Optional[ScanAnalysis]:
         """Return the best available representation of one scan."""
@@ -486,10 +601,109 @@ class WidgetSession:
         """Mark one scan as the active refcal."""
 
         result = self._ensure_refcal_analysis(scan_id)
+        if self.secondary_ref_scan_id == int(scan_id):
+            self.secondary_ref_scan_id = None
+        self.staged_secondary_patch_antennas = []
+        self.secondary_patch_antennas = []
+        self._invalidate_analyzed_phacals()
         self.ref_scan_id = scan_id
         self.selected_scan_id = scan_id
         self.selected_ant = min(self.selected_ant, max(result.layout.nsolant - 1, 0))
-        self.status_message = "Set scan {0} as active refcal.".format(scan_id)
+        self.status_message = "Set scan {0} as canonical anchor refcal.".format(scan_id)
+
+    def set_secondary_refcal(self, scan_id: Optional[int]) -> None:
+        """Set or clear the optional same-feed secondary anchor."""
+
+        if scan_id is None:
+            self.secondary_ref_scan_id = None
+            self.staged_secondary_patch_antennas = []
+            self.secondary_patch_antennas = []
+            self._invalidate_analyzed_phacals()
+            self.status_message = "Cleared the secondary anchor refcal."
+            return
+        if self.ref_scan_id is None:
+            raise CalWidgetV2Error("Set a canonical anchor refcal before selecting a secondary anchor.")
+        canonical = self._ensure_refcal_analysis(int(self.ref_scan_id))
+        secondary = self._ensure_refcal_analysis(int(scan_id))
+        if int(scan_id) == int(self.ref_scan_id):
+            raise CalWidgetV2Error("Canonical and secondary anchors must be different scans.")
+        if scan_feed_kind(canonical) != scan_feed_kind(secondary):
+            raise CalWidgetV2Error("Secondary anchor must have the same feed as the canonical anchor.")
+        self.secondary_ref_scan_id = int(scan_id)
+        self.staged_secondary_patch_antennas = []
+        self.secondary_patch_antennas = []
+        self._invalidate_analyzed_phacals()
+        self.status_message = "Set scan {0} as the secondary anchor refcal.".format(int(scan_id))
+
+    def compare_refcal_pair(self, scan_ids: List[int]) -> None:
+        """Enable side-by-side same-feed anchor compare mode."""
+
+        if len(scan_ids) != 2:
+            raise CalWidgetV2Error("Exactly two refcals are required for same-feed compare.")
+        left = self._ensure_refcal_analysis(int(scan_ids[0]))
+        right = self._ensure_refcal_analysis(int(scan_ids[1]))
+        left_feed = scan_feed_kind(left)
+        right_feed = scan_feed_kind(right)
+        if left_feed != right_feed:
+            raise CalWidgetV2Error("Compare 2 Anchors requires two refcals of the same feed.")
+        self.compare_ref_scan_ids = [int(scan_ids[0]), int(scan_ids[1])]
+        self.compare_feed_kind = str(left_feed)
+        compare_set = {int(scan_ids[0]), int(scan_ids[1])}
+        if self.ref_scan_id not in compare_set:
+            self.staged_secondary_patch_antennas = []
+            self.secondary_patch_antennas = []
+        elif self.secondary_ref_scan_id is not None and int(self.secondary_ref_scan_id) not in compare_set:
+            self.staged_secondary_patch_antennas = []
+            self.secondary_patch_antennas = []
+        self.status_message = "Comparing {0} anchors {1} and {2}.".format(
+            str(left_feed).upper(),
+            int(scan_ids[0]),
+            int(scan_ids[1]),
+        )
+
+    def clear_refcal_compare(self) -> None:
+        """Clear same-feed anchor compare mode."""
+
+        self.compare_ref_scan_ids = []
+        self.compare_feed_kind = None
+        self.staged_secondary_patch_antennas = []
+        self.status_message = "Cleared the anchor compare view."
+
+    def set_donor_patch_candidate(self, antenna: int, selected: bool) -> None:
+        """Stage one donor-patch antenna for the current compare pair."""
+
+        if len(self.compare_ref_scan_ids) != 2:
+            raise CalWidgetV2Error("Compare two same-feed refcals before staging donor patches.")
+        if self.ref_scan_id is None or self.secondary_ref_scan_id is None:
+            raise CalWidgetV2Error("Set canonical and secondary anchors before staging donor patches.")
+        compare_set = {int(scan_id) for scan_id in self.compare_ref_scan_ids}
+        if int(self.ref_scan_id) not in compare_set or int(self.secondary_ref_scan_id) not in compare_set:
+            raise CalWidgetV2Error("Canonical and secondary anchors must both be part of the current compare view.")
+        ant = int(max(0, min(int(antenna), 14)))
+        staged = set(int(value) for value in self.staged_secondary_patch_antennas)
+        if selected:
+            staged.add(ant)
+        else:
+            staged.discard(ant)
+        self.staged_secondary_patch_antennas = sorted(staged)
+        self.status_message = (
+            "Staged donor patch for antenna {0:d}.".format(ant + 1)
+            if selected
+            else "Removed staged donor patch for antenna {0:d}.".format(ant + 1)
+        )
+
+    def apply_donor_patch_selection(self) -> None:
+        """Commit the staged donor-patch antenna list."""
+
+        if self.ref_scan_id is None or self.secondary_ref_scan_id is None:
+            raise CalWidgetV2Error("Canonical and secondary anchors are required before applying donor patches.")
+        self.secondary_patch_antennas = sorted(int(value) for value in self.staged_secondary_patch_antennas)
+        self._invalidate_analyzed_phacals()
+        if self.secondary_patch_antennas:
+            labels = ", ".join("Ant {0:d}".format(int(ant) + 1) for ant in self.secondary_patch_antennas)
+            self.status_message = "Applied donor-patch candidates from the secondary anchor: {0}.".format(labels)
+        else:
+            self.status_message = "Cleared donor-patch candidates from the secondary anchor."
 
     def combine_refcal_pair(self, scan_ids: List[int]) -> None:
         """Combine two analyzed refcals into one LO/HI result."""
@@ -514,8 +728,16 @@ class WidgetSession:
         if self.ref_scan_id is None:
             raise CalWidgetV2Error("Select a refcal before analyzing a phacal.")
         refcal = self._ensure_refcal_analysis(self.ref_scan_id)
+        secondary_refcal = self._secondary_refcal()
         entry = self._entry(scan_id)
-        result = analyze_phacal_input(entry["file"], refcal, scan_id=scan_id, fix_drift=self.fix_drift)
+        result = analyze_phacal_input(
+            entry["file"],
+            refcal,
+            scan_id=scan_id,
+            fix_drift=self.fix_drift,
+            secondary_refcal=secondary_refcal,
+            donor_patch_antennas=self.secondary_patch_antennas,
+        )
         result.scan_meta.update(
             {
                 "project": entry.get("project", ""),
@@ -572,6 +794,7 @@ class WidgetSession:
         if scan.raw:
             scan.raw.pop("overview_payload_cache", None)
             scan.raw.pop("residual_diagnostics_cache", None)
+            scan.raw.pop("preview_solve_cache", None)
         scan.saved_to_sql = False
         self.selected_ant = ant
         self.status_message = "Updated phacal multiband solve values for antenna {0:d}.".format(ant + 1)
@@ -592,6 +815,7 @@ class WidgetSession:
         if scan.raw:
             scan.raw.pop("overview_payload_cache", None)
             scan.raw.pop("residual_diagnostics_cache", None)
+            scan.raw.pop("preview_solve_cache", None)
         scan.saved_to_sql = False
         self.selected_ant = ant
         self.status_message = "Applied the phacal suggested correction for antenna {0:d}.".format(ant + 1)
@@ -608,6 +832,7 @@ class WidgetSession:
         if scan.raw:
             scan.raw.pop("overview_payload_cache", None)
             scan.raw.pop("residual_diagnostics_cache", None)
+            scan.raw.pop("preview_solve_cache", None)
         scan.saved_to_sql = False
         self.selected_ant = ant
         self.status_message = "Undid the last phacal manual correction for antenna {0:d}.".format(ant + 1)
@@ -625,6 +850,7 @@ class WidgetSession:
         if scan.raw:
             scan.raw.pop("overview_payload_cache", None)
             scan.raw.pop("residual_diagnostics_cache", None)
+            scan.raw.pop("preview_solve_cache", None)
         scan.saved_to_sql = False
         self.selected_ant = ant
         self.status_message = "Reset phacal manual corrections for antenna {0:d}.".format(ant + 1)
@@ -639,11 +865,31 @@ class WidgetSession:
         if scan.raw:
             scan.raw.pop("overview_payload_cache", None)
             scan.raw.pop("residual_diagnostics_cache", None)
+            scan.raw.pop("preview_solve_cache", None)
         self.selected_ant = ant
         self.status_message = (
             "Skipped phacal diagnostics for antenna {0:d}.".format(ant + 1)
             if flagged
             else "Restored phacal diagnostics for antenna {0:d}.".format(ant + 1)
+        )
+
+    def set_phacal_anchor_fallback(self, antenna: int, enabled: bool) -> None:
+        """Toggle one phacal antenna's temporary anchor fallback."""
+
+        _scan_id, scan, refcal = self._editable_phacal_scan()
+        ant = int(max(0, min(int(antenna), scan.layout.nsolant - 1)))
+        state = ensure_phacal_solve_state(scan)
+        state.manual_anchor_fallback_override[ant] = bool(enabled)
+        _solve_phacal_against_anchor(scan, refcal)
+        if scan.raw:
+            scan.raw.pop("overview_payload_cache", None)
+            scan.raw.pop("residual_diagnostics_cache", None)
+            scan.raw.pop("preview_solve_cache", None)
+        self.selected_ant = ant
+        self.status_message = (
+            "Enabled temporary phacal fallback for antenna {0:d}.".format(ant + 1)
+            if enabled
+            else "Cleared temporary phacal fallback for antenna {0:d}.".format(ant + 1)
         )
 
     def _preview_scan_pair(self) -> tuple[ScanAnalysis, Optional[ScanAnalysis]]:
@@ -662,10 +908,50 @@ class WidgetSession:
         if scan.raw:
             scan.raw.pop("overview_payload_cache", None)
             scan.raw.pop("residual_diagnostics_cache", None)
+            scan.raw.pop("preview_solve_cache", None)
         if refcal is not None and refcal.raw:
             refcal.raw.pop("overview_payload_cache", None)
             refcal.raw.pop("residual_diagnostics_cache", None)
         return scan, refcal
+
+    def preview_refcal_ant1_shape(
+        self,
+        dip_center_ghz: float,
+        dip_width_ghz: float,
+        dip_depth_rad: float,
+        lowfreq_weight_power: float,
+    ) -> Dict[str, Dict]:
+        """Preview Ant 1 multiband-shape tuning without mutating session state."""
+
+        _ref_id, refcal = self._editable_inband_refcal()
+        preview = deepcopy(refcal)
+        if preview.delay_solution is None:
+            raise CalWidgetV2Error("The active refcal has no multiband fit to preview.")
+        if preview.raw:
+            preview.raw.pop("overview_payload_cache", None)
+            preview.raw.pop("residual_diagnostics_cache", None)
+        preview.delay_solution.set_ant1_multiband_shape(
+            dip_center_ghz,
+            dip_width_ghz,
+            dip_depth_rad,
+            lowfreq_weight_power,
+        )
+        refresh_model_flag_state(preview, antenna_indices=[0])
+        return relative_delay_update_payloads(preview, antenna=0)
+
+    def preview_refcal_ant1_dxy(self, manual_dxy_corr_rad: float) -> Dict[str, Dict]:
+        """Preview Ant 1 manual ``Δ(Y-X)`` tuning without mutating session state."""
+
+        _ref_id, refcal = self._editable_inband_refcal()
+        preview = deepcopy(refcal)
+        if preview.delay_solution is None:
+            raise CalWidgetV2Error("The active refcal has no multiband fit to preview.")
+        if preview.raw:
+            preview.raw.pop("overview_payload_cache", None)
+            preview.raw.pop("residual_diagnostics_cache", None)
+        preview.delay_solution.set_ant1_manual_dxy_corr(float(manual_dxy_corr_rad))
+        refresh_model_flag_state(preview, antenna_indices=[0])
+        return relative_delay_update_payloads(preview, antenna=0)
 
     def preview_inband_mask_section(self, section_id: str, targets: List[InbandMaskTarget]) -> Dict[str, Dict]:
         """Preview one kept-band-masked section without mutating session state."""
@@ -676,24 +962,55 @@ class WidgetSession:
         changed_ants = set()
         for target in targets:
             ant = int(max(0, min(int(target.antenna), scan.layout.nsolant - 1)))
-            pol = int(max(0, min(int(target.polarization), 1)))
+            pol = int(target.polarization)
             ranges = [(int(item.start_band), int(item.end_band)) for item in target.kept_ranges]
-            scan.delay_solution.set_kept_band_ranges(ant, pol, ranges)
+            if pol == 2:
+                scan.delay_solution.set_xy_kept_band_ranges(ant, ranges)
+            else:
+                scan.delay_solution.set_kept_band_ranges(ant, int(max(0, min(pol, 1))), ranges)
             changed_ants.add(ant)
         sparse_antennas = sorted(changed_ants) if changed_ants else None
         if scan.scan_kind == "phacal":
             if refcal is None:
                 raise CalWidgetV2Error("Active anchor refcal is required for phacal preview.")
             _solve_phacal_against_anchor(scan, refcal)
-            if section_id == "inband_relative_phase":
-                return {"inband_relative_phase": phacal_multiband_residual_payload(scan, refcal, antenna_indices=sparse_antennas)}
-            if section_id == "inband_fit":
-                return {"inband_fit": phacal_anchor_phase_payload(scan, refcal, antenna_indices=sparse_antennas)}
-            raise CalWidgetV2Error("Unsupported kept-mask preview section {0}.".format(section_id))
+            if section_id not in ("inband_relative_phase", "inband_fit"):
+                raise CalWidgetV2Error("Unsupported kept-mask preview section {0}.".format(section_id))
+            # Snapshot the previewed solver outputs onto the actual scan so a
+            # subsequent Commit on the same staged mask can skip the (slow)
+            # re-solve and just restore these values.
+            actual_current = self._current_result()
+            if actual_current is not None and actual_current.scan_kind == "phacal" and actual_current.raw is not None:
+                preview_state = ensure_phacal_solve_state(scan)
+                actual_current.raw["preview_solve_cache"] = {
+                    "mask_signature": _phacal_mask_signature(targets),
+                    "auto_delay_ns": np.asarray(preview_state.auto_delay_ns, dtype=np.float64).copy(),
+                    "auto_offset_rad": np.asarray(preview_state.auto_offset_rad, dtype=np.float64).copy(),
+                    "suggested_delay_ns": np.asarray(preview_state.suggested_delay_ns, dtype=np.float64).copy(),
+                    "suggested_offset_rad": np.asarray(preview_state.suggested_offset_rad, dtype=np.float64).copy(),
+                    "fallback_used": np.asarray(preview_state.fallback_used, dtype=bool).copy(),
+                    "ant1_self_reference_used": np.asarray(preview_state.ant1_self_reference_used, dtype=bool).copy(),
+                    "phacal_inband_per_band_delay_ns": np.asarray(preview_state.phacal_inband_per_band_delay_ns, dtype=np.float64).copy(),
+                    "phacal_inband_delay_ns": np.asarray(preview_state.phacal_inband_delay_ns, dtype=np.float64).copy(),
+                    "missing_in_phacal": np.asarray(preview_state.missing_in_phacal, dtype=bool).copy(),
+                    "missing_in_refcal": np.asarray(preview_state.missing_in_refcal, dtype=bool).copy(),
+                }
+            return {
+                "inband_fit": phacal_anchor_phase_payload(scan, refcal, antenna_indices=sparse_antennas),
+                "inband_relative_phase": phacal_multiband_residual_payload(scan, refcal, antenna_indices=sparse_antennas),
+            }
         refresh_refcal_solution(scan, antenna_indices=sparse_antennas, invalidate_legacy_summary=False)
         if section_id == "inband_fit":
             return {"inband_fit": inband_fit_payload(scan)}
         if section_id == "inband_relative_phase":
+            if sparse_antennas:
+                only_delta = all(int(t.polarization) == 2 for t in targets)
+                effective_antennas = (
+                    sparse_antennas if only_delta
+                    else _expand_reference_antenna_dependencies(scan, sparse_antennas)
+                )
+                partial = _relative_delay_partial_payloads(scan, effective_antennas)
+                return {"inband_relative_phase": partial["inband_relative_phase"]}
             return {"inband_relative_phase": inband_relative_phase_payload(scan)}
         raise CalWidgetV2Error("Unsupported kept-mask preview section {0}.".format(section_id))
 
@@ -964,7 +1281,17 @@ class WidgetSession:
         self.selected_ant = ant
         self.status_message = "Updated active in-band delays for antenna {0:d}.".format(ant + 1)
 
-    def update_relative_delay(self, antenna: int, x_delay_ns: Optional[float], y_delay_ns: Optional[float]) -> None:
+    def update_relative_delay(
+        self,
+        antenna: int,
+        x_delay_ns: Optional[float],
+        y_delay_ns: Optional[float],
+        ant1_manual_dxy_corr_rad: Optional[float] = None,
+        ant1_dip_center_ghz: Optional[float] = None,
+        ant1_dip_width_ghz: Optional[float] = None,
+        ant1_dip_depth_rad: Optional[float] = None,
+        ant1_lowfreq_weight_power: Optional[float] = None,
+    ) -> None:
         """Apply one display-only residual delay edit to the active refcal.
 
         :param antenna: Zero-based antenna index.
@@ -973,6 +1300,9 @@ class WidgetSession:
         :type x_delay_ns: float | None
         :param y_delay_ns: Residual Y delay override in ns.
         :type y_delay_ns: float | None
+        :param ant1_manual_dxy_corr_rad: Optional Ant 1 additive ``Δ(Y-X)``
+            correction in radians.
+        :type ant1_manual_dxy_corr_rad: float | None
         """
 
         _ref_id, refcal = self._editable_inband_refcal()
@@ -982,6 +1312,23 @@ class WidgetSession:
             refcal.delay_solution.relative_ns[ant, 0] = float(x_delay_ns)
         if y_delay_ns is not None:
             refcal.delay_solution.relative_ns[ant, 1] = float(y_delay_ns)
+        if ant == 0 and ant1_manual_dxy_corr_rad is not None:
+            refcal.delay_solution.set_ant1_manual_dxy_corr(float(ant1_manual_dxy_corr_rad))
+        if ant == 0 and all(
+            value is not None
+            for value in (
+                ant1_dip_center_ghz,
+                ant1_dip_width_ghz,
+                ant1_dip_depth_rad,
+                ant1_lowfreq_weight_power,
+            )
+        ):
+            refcal.delay_solution.set_ant1_multiband_shape(
+                float(ant1_dip_center_ghz),
+                float(ant1_dip_width_ghz),
+                float(ant1_dip_depth_rad),
+                float(ant1_lowfreq_weight_power),
+            )
         if refcal.raw:
             refcal.raw.pop("overview_payload_cache", None)
             refcal.raw.pop("residual_diagnostics_cache", None)
@@ -1019,11 +1366,18 @@ class WidgetSession:
         self.selected_ant = ant
         self.status_message = "Applied residual-guided relative-phase suggestion for antenna {0:d}.".format(ant + 1)
 
-    def apply_residual_inband_fit(self, targets: Optional[List[InbandMaskTarget]] = None) -> List[int]:
+    def apply_residual_inband_fit(
+        self,
+        targets: Optional[List[InbandMaskTarget]] = None,
+        antenna: Optional[int] = None,
+    ) -> List[int]:
         """Apply residual in-band delay suggestions for all antennas/pols.
 
         :param targets: Optional committed residual kept-band masks.
         :type targets: list[InbandMaskTarget] | None
+        :param antenna: Optional zero-based antenna index. When provided,
+            the correction is only applied to that one antenna.
+        :type antenna: int | None
         :returns: Zero-based antenna indices whose active delays were refreshed.
         :rtype: list[int]
         """
@@ -1038,48 +1392,88 @@ class WidgetSession:
                     pol = int(max(0, min(int(target.polarization), 1)))
                     ranges = [(int(item.start_band), int(item.end_band)) for item in target.kept_ranges]
                     scan.delay_solution.set_residual_kept_band_ranges(ant, pol, ranges)
+            if scan.delay_solution is None:
+                self.status_message = "No phacal in-band residual correction was applied (no delay solution)."
+                return []
             disabled_antennas = _effective_disabled_antennas(scan)
-            suggestions = phacal_residual_inband_suggestions(scan, refcal)
-            updated_ants = []
-            before_delay = np.asarray(state.applied_delay_ns, dtype=float).copy()
+            nbands = int(scan.delay_solution.band_values.size)
+            band_values = np.asarray(scan.delay_solution.band_values, dtype=int)
+            # Ensure the per-band correction array has the right shape for
+            # the current scan's band count (may have grown from default 0).
+            if state.phacal_applied_inband_correction_ns.shape != (scan.layout.nsolant, 2, nbands):
+                old = state.phacal_applied_inband_correction_ns
+                new = np.zeros((scan.layout.nsolant, 2, nbands), dtype=np.float64)
+                if old.ndim == 3 and old.shape[0] == scan.layout.nsolant and old.shape[1] == 2:
+                    copy_n = min(old.shape[2], nbands)
+                    new[:, :, :copy_n] = old[:, :, :copy_n]
+                state.phacal_applied_inband_correction_ns = new
+            before_corr = state.phacal_applied_inband_correction_ns.copy()
             effective_delay = np.asarray(state.auto_delay_ns + state.applied_delay_ns, dtype=float)
-            for ant in range(scan.layout.nsolant):
+            explicit_antenna = antenna is not None
+            ant_range = (
+                [int(max(0, min(int(antenna), scan.layout.nsolant - 1)))]
+                if explicit_antenna
+                else list(range(scan.layout.nsolant))
+            )
+            updated_ants: List[int] = []
+            for ant in ant_range:
                 if ant < disabled_antennas.size and disabled_antennas[ant]:
                     continue
-                if np.allclose(effective_delay[ant], 0.0, atol=0.0):
+                # Only apply the "must have a multiband fit" guard in the
+                # all-antennas auto-apply mode. When the user explicitly
+                # clicks the per-antenna I button, respect their choice —
+                # an in-band correction is meaningful even if the multiband
+                # delay is zero.
+                if not explicit_antenna and np.allclose(effective_delay[ant], 0.0, atol=0.0):
                     continue
                 ant_changed = False
                 for pol in range(2):
-                    suggestion = (
-                        float(suggestions[ant, pol])
-                        if suggestions.shape == (scan.layout.nsolant, 2) and np.isfinite(suggestions[ant, pol])
-                        else 0.0
-                    )
-                    if abs(suggestion) <= 0.0:
-                        continue
-                    state.applied_delay_ns[ant, pol] = float(state.applied_delay_ns[ant, pol] + suggestion)
-                    ant_changed = True
+                    meta = _phacal_residual_panel_meta(scan, refcal, ant, pol)
+                    band_fits = meta.get("residual_band_fits", [])
+                    kept_mask = scan.delay_solution.included_residual_band_mask(ant, pol)
+                    for band_idx, band_value in enumerate(band_values):
+                        if band_idx >= len(band_fits) or band_idx >= kept_mask.size:
+                            continue
+                        if not bool(kept_mask[band_idx]):
+                            continue
+                        band_fit = band_fits[band_idx] or {}
+                        delay = float(band_fit.get("delay_ns", 0.0) or 0.0)
+                        if not np.isfinite(delay) or delay == 0.0:
+                            continue
+                        state.phacal_applied_inband_correction_ns[ant, pol, band_idx] = float(
+                            state.phacal_applied_inband_correction_ns[ant, pol, band_idx] + delay
+                        )
+                        ant_changed = True
                 if ant_changed:
                     updated_ants.append(int(ant))
             if updated_ants:
                 self.residual_panel_history.append(
                     {
-                        "kind": "inband_global",
+                        "kind": "inband_perband",
                         "scan_kind": "phacal",
                         "scan_id": int(scan.scan_id),
                         "antennas": [int(ant) for ant in updated_ants],
-                        "applied_delay_ns": before_delay,
+                        "phacal_applied_inband_correction_ns": before_corr,
                     }
                 )
             _solve_phacal_against_anchor(scan, refcal)
             if scan.raw:
                 scan.raw.pop("overview_payload_cache", None)
                 scan.raw.pop("residual_diagnostics_cache", None)
+                scan.raw.pop("preview_solve_cache", None)
             scan.saved_to_sql = False
             if updated_ants:
-                self.status_message = "Applied in-band residual fit for eligible phacal antennas."
+                diff = state.phacal_applied_inband_correction_ns - before_corr
+                n_bands_changed = int(np.count_nonzero(np.isfinite(diff) & (np.abs(diff) > 0.0)))
+                if antenna is not None:
+                    self.status_message = "Applied in-band residual correction for phacal Ant {0:d} ({1:d} per-band rotations).".format(int(antenna) + 1, n_bands_changed)
+                else:
+                    self.status_message = "Applied in-band residual fit for {0:d} antennas ({1:d} per-band rotations).".format(len(updated_ants), n_bands_changed)
             else:
-                self.status_message = "No phacal in-band residual correction was applied."
+                if antenna is not None:
+                    self.status_message = "No in-band correction applied to Ant {0:d}: no kept bands had a finite per-band fit.".format(int(antenna) + 1)
+                else:
+                    self.status_message = "No phacal in-band residual correction was applied."
             return updated_ants
 
         ref_id, refcal = self._editable_inband_refcal()
@@ -1170,7 +1564,25 @@ class WidgetSession:
             if scan.raw:
                 scan.raw.pop("overview_payload_cache", None)
                 scan.raw.pop("residual_diagnostics_cache", None)
+                scan.raw.pop("preview_solve_cache", None)
             self.status_message = "Undid the last phacal in-band residual apply action."
+            return [int(ant) for ant in action.get("antennas", [])]
+        if kind == "inband_perband" and scan_kind == "phacal":
+            _scan_id, scan, refcal = self._editable_phacal_scan()
+            state = ensure_phacal_solve_state(scan)
+            saved = action.get("phacal_applied_inband_correction_ns")
+            if saved is not None:
+                saved = np.asarray(saved, dtype=float)
+                if saved.shape == state.phacal_applied_inband_correction_ns.shape:
+                    state.phacal_applied_inband_correction_ns[:, :, :] = saved
+                else:
+                    state.phacal_applied_inband_correction_ns = saved.copy()
+            _solve_phacal_against_anchor(scan, refcal)
+            if scan.raw:
+                scan.raw.pop("overview_payload_cache", None)
+                scan.raw.pop("residual_diagnostics_cache", None)
+                scan.raw.pop("preview_solve_cache", None)
+            self.status_message = "Undid the last phacal per-band in-band correction."
             return [int(ant) for ant in action.get("antennas", [])]
         if kind == "inband_global":
             ref_id, refcal = self._editable_inband_refcal()
@@ -1318,27 +1730,72 @@ class WidgetSession:
             changed_ants = set()
             for target in targets:
                 ant = int(max(0, min(int(target.antenna), scan.layout.nsolant - 1)))
-                pol = int(max(0, min(int(target.polarization), 1)))
+                pol = int(target.polarization)
                 ranges = [(int(item.start_band), int(item.end_band)) for item in target.kept_ranges]
-                scan.delay_solution.set_kept_band_ranges(ant, pol, ranges)
+                if pol == 2:
+                    scan.delay_solution.set_xy_kept_band_ranges(ant, ranges)
+                else:
+                    scan.delay_solution.set_kept_band_ranges(ant, int(max(0, min(pol, 1))), ranges)
                 changed_ants.add(ant)
                 last_ant = ant
-            _solve_phacal_against_anchor(scan, refcal)
+            # Fast path: if the user just previewed this exact mask, the solver
+            # output is already cached on the scan and re-running it would
+            # produce the same arrays. Restore from cache and skip the solve.
+            cache = scan.raw.get("preview_solve_cache") if scan.raw else None
+            commit_signature = _phacal_mask_signature(targets)
+            cache_hit = bool(
+                cache
+                and isinstance(cache, dict)
+                and cache.get("mask_signature") == commit_signature
+            )
+            if cache_hit:
+                state = ensure_phacal_solve_state(scan)
+                for key in (
+                    "auto_delay_ns",
+                    "auto_offset_rad",
+                    "suggested_delay_ns",
+                    "suggested_offset_rad",
+                    "fallback_used",
+                    "ant1_self_reference_used",
+                    "phacal_inband_per_band_delay_ns",
+                    "phacal_inband_delay_ns",
+                    "missing_in_phacal",
+                    "missing_in_refcal",
+                ):
+                    if key in cache:
+                        target_arr = getattr(state, key, None)
+                        cached_arr = np.asarray(cache[key])
+                        if target_arr is not None and target_arr.shape == cached_arr.shape:
+                            target_arr[...] = cached_arr
+                        else:
+                            setattr(state, key, cached_arr.copy())
+            else:
+                _solve_phacal_against_anchor(scan, refcal)
             if scan.raw:
                 scan.raw.pop("overview_payload_cache", None)
                 scan.raw.pop("residual_diagnostics_cache", None)
+                scan.raw.pop("preview_solve_cache", None)
+                # The cache has now been consumed (or was a miss). Either way,
+                # invalidate it so any subsequent state mutation can't hit a
+                # stale entry.
+                scan.raw.pop("preview_solve_cache", None)
             scan.saved_to_sql = False
             self.selected_ant = last_ant
-            self.status_message = "Applied {0:d} staged phasecal masks.".format(len(targets))
+            self.status_message = "Applied {0:d} staged phasecal masks.{1}".format(
+                len(targets), " (used preview cache)" if cache_hit else "",
+            )
             return
         ref_id, refcal = self._editable_inband_refcal()
         last_ant = self.selected_ant
         changed_ants = set()
         for target in targets:
             ant = int(max(0, min(int(target.antenna), refcal.layout.nsolant - 1)))
-            pol = int(max(0, min(int(target.polarization), 1)))
+            pol = int(target.polarization)
             ranges = [(int(item.start_band), int(item.end_band)) for item in target.kept_ranges]
-            refcal.delay_solution.set_kept_band_ranges(ant, pol, ranges)
+            if pol == 2:
+                refcal.delay_solution.set_xy_kept_band_ranges(ant, ranges)
+            else:
+                refcal.delay_solution.set_kept_band_ranges(ant, int(max(0, min(pol, 1))), ranges)
             changed_ants.add(ant)
             last_ant = ant
         refresh_refcal_solution(
@@ -1346,10 +1803,33 @@ class WidgetSession:
             antenna_indices=None if len(changed_ants) >= refcal.layout.nsolant else sorted(changed_ants),
             invalidate_legacy_summary=False,
         )
+        if refcal.raw:
+            refcal.raw.pop("overview_payload_cache", None)
+            refcal.raw.pop("residual_diagnostics_cache", None)
         refcal.saved_to_sql = False
         self._invalidate_dependent_phacals(ref_id)
         self.selected_ant = last_ant
         self.status_message = "Applied {0:d} staged in-band masks.".format(len(targets))
+
+    def set_multiband_fit_kind(self, antenna: int, kind: str) -> None:
+        """Set the per-antenna multiband fit kind on the active refcal."""
+
+        ref_id, refcal = self._editable_inband_refcal()
+        if refcal.delay_solution is None:
+            raise CalWidgetV2Error("No in-band delay solution is available.")
+        ant = int(max(0, min(int(antenna), refcal.layout.nsolant - 1)))
+        valid = {"linear", "poly2", "poly3"}
+        kind_str = str(kind)
+        if kind_str not in valid:
+            raise CalWidgetV2Error("Multiband fit kind must be one of linear, poly2, poly3.")
+        refcal.delay_solution.set_multiband_fit_kind(ant, kind_str)
+        if refcal.raw:
+            refcal.raw.pop("overview_payload_cache", None)
+            refcal.raw.pop("residual_diagnostics_cache", None)
+        refcal.saved_to_sql = False
+        self._invalidate_dependent_phacals(ref_id)
+        self.selected_ant = ant
+        self.status_message = "Set multiband fit kind to {0} for antenna {1:d}.".format(kind_str, ant + 1)
 
     def reset_inband(self, antenna: Optional[int] = None) -> None:
         """Reset active in-band delays."""
@@ -1476,17 +1956,19 @@ class WidgetSession:
             raise CalWidgetV2Error("Analyze at least one scan before saving the NPZ bundle.")
 
         canonical_ref = self.ref_scan_id if self.ref_scan_id is not None else None
-        high_ref_candidates = [
+        same_feed_ref_candidates = [
             int(scan_id)
             for scan_id in chosen_ids
             if scan_id in self.analyses
             and self.analyses[scan_id].scan_kind == "refcal"
-            and scan_feed_kind(self.analyses[scan_id]) == "hi"
+            and (
+                canonical_ref is None
+                or scan_feed_kind(self.analyses[scan_id]) == scan_feed_kind(self.analyses[int(canonical_ref)])
+            )
         ]
-        secondary_ref = None
-        if canonical_ref in high_ref_candidates:
-            secondary_candidates = [scan_id for scan_id in high_ref_candidates if scan_id != int(canonical_ref)]
-            secondary_ref = secondary_candidates[0] if secondary_candidates else None
+        secondary_ref = self.secondary_ref_scan_id if self.secondary_ref_scan_id is not None else None
+        if secondary_ref is not None and secondary_ref not in same_feed_ref_candidates:
+            secondary_ref = None
         bundle_threshold = float(YX_RESIDUAL_THRESHOLD_RAD)
         if canonical_ref is not None and int(canonical_ref) in self.analyses:
             bundle_threshold = float(yx_residual_threshold(self.analyses[int(canonical_ref)]))
@@ -1603,6 +2085,7 @@ class WidgetSession:
                 "timestamp_iso": refcal.timestamp.iso[:19],
                 "scan_time": ref_entry["scan_time"] if ref_entry else refcal.t_bg.iso[11:19],
                 "source": refcal.source,
+                "feed_kind": scan_feed_kind(refcal),
                 "dirty_inband": refcal.dirty_inband,
                 "sidecar_path": refcal.sidecar_path,
                 "x_delay_ns": None if refcal.delay_solution is None else float(refcal.delay_solution.active_ns[self.selected_ant, 0]),
@@ -1639,8 +2122,13 @@ class WidgetSession:
                 "source": current.source,
                 "anchor_scan_id": None if phacal_ref_id is None else int(phacal_ref_id),
                 "anchor_scan_time": None if phacal_ref is None else (phacal_ref_entry["scan_time"] if phacal_ref_entry else phacal_ref.t_bg.iso[11:19]),
-                "secondary_anchor_scan_id": None,
-                "secondary_anchor_scan_time": None,
+                "secondary_anchor_scan_id": (current.scan_meta or {}).get("secondary_refcal_scan_id"),
+                "secondary_anchor_scan_time": (current.scan_meta or {}).get("secondary_refcal_time"),
+                "patched_antennas": list((current.scan_meta or {}).get("patched_antennas", [])),
+                "patch_method": list((current.scan_meta or {}).get("patch_method", [])),
+                "manual_anchor_fallback_override": list(
+                    (current.scan_meta or {}).get("manual_anchor_fallback_override", [])
+                ),
                 **editor_meta,
             }
         return {
@@ -1651,6 +2139,11 @@ class WidgetSession:
             "use_lobe": self.use_lobe,
             "selected_scan_id": self.selected_scan_id,
             "ref_scan_id": self.ref_scan_id,
+            "secondary_ref_scan_id": self.secondary_ref_scan_id,
+            "compare_ref_scan_ids": [int(scan_id) for scan_id in self.compare_ref_scan_ids],
+            "compare_feed_kind": self.compare_feed_kind,
+            "staged_secondary_patch_antennas": [int(ant) for ant in self.staged_secondary_patch_antennas],
+            "secondary_patch_antennas": [int(ant) for ant in self.secondary_patch_antennas],
             "selected_ant": self.selected_ant,
             "selected_band": self.selected_band,
             "tabs": list(TAB_NAMES),
@@ -1825,6 +2318,58 @@ def build_app() -> FastAPI:
             response["overview"] = overview_payloads(scan, refcal=refcal, use_lobe=session.use_lobe)
         return response
 
+    @app.post("/api/refcal/secondary")
+    def select_secondary_refcal(payload: OptionalScanRequest) -> Dict:
+        """Set or clear the active secondary same-feed anchor refcal."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.set_secondary_refcal(payload.scan_id)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"state": session.state()}
+
+    @app.post("/api/refcal/compare")
+    def compare_refcals(payload: CombineRequest) -> Dict:
+        """Enable side-by-side same-feed anchor compare mode."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.compare_refcal_pair(payload.scan_ids)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"state": session.state()}
+
+    @app.post("/api/refcal/compare/clear")
+    def clear_refcal_compare(payload: SessionRequest) -> Dict:
+        """Clear side-by-side same-feed anchor compare mode."""
+
+        session = _get_session(payload.session_id)
+        session.clear_refcal_compare()
+        return {"state": session.state()}
+
+    @app.post("/api/refcal/donor-patch/candidate")
+    def set_donor_patch_candidate(payload: DonorPatchCandidateRequest) -> Dict:
+        """Stage one donor-patch candidate antenna in compare mode."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.set_donor_patch_candidate(payload.antenna, payload.selected)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"state": session.state()}
+
+    @app.post("/api/refcal/donor-patch/apply")
+    def apply_donor_patch_selection(payload: SessionRequest) -> Dict:
+        """Commit the staged donor-patch antenna selection."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.apply_donor_patch_selection()
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"state": session.state()}
+
     @app.post("/api/refcal/combine")
     def combine_refcal(payload: CombineRequest) -> Dict:
         """Combine two refcals."""
@@ -1846,6 +2391,22 @@ def build_app() -> FastAPI:
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         return session.state()
+
+    @app.post("/api/phacal/anchor-fallback")
+    def set_phacal_anchor_fallback(payload: PhacalFallbackRequest) -> Dict:
+        """Toggle one phacal antenna's temporary anchor fallback."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.set_phacal_anchor_fallback(payload.antenna, payload.enabled)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        scan, refcal = _overview_context(session)
+        return {
+            "state": session.state(),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna, refcal=refcal),
+            "updated_antenna": int(max(0, payload.antenna)),
+        }
 
     @app.post("/api/select-band")
     def select_band(payload: SelectionRequest) -> Dict:
@@ -1962,7 +2523,16 @@ def build_app() -> FastAPI:
 
         session = _get_session(payload.session_id)
         try:
-            session.update_relative_delay(payload.antenna, payload.x_delay_ns, payload.y_delay_ns)
+            session.update_relative_delay(
+                payload.antenna,
+                payload.x_delay_ns,
+                payload.y_delay_ns,
+                ant1_manual_dxy_corr_rad=payload.ant1_manual_dxy_corr_rad,
+                ant1_dip_center_ghz=payload.ant1_dip_center_ghz,
+                ant1_dip_width_ghz=payload.ant1_dip_width_ghz,
+                ant1_dip_depth_rad=payload.ant1_dip_depth_rad,
+                ant1_lowfreq_weight_power=payload.ant1_lowfreq_weight_power,
+            )
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         scan, _refcal = _overview_context(session)
@@ -1971,6 +2541,33 @@ def build_app() -> FastAPI:
             "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna, refcal=_refcal),
             "updated_antenna": int(max(0, payload.antenna)),
         }
+
+    @app.post("/api/relative-delay/ant1-shape/preview")
+    def preview_ant1_shape(payload: PreviewAnt1ShapeRequest) -> Dict:
+        """Preview staged Ant 1 multiband-shape tuning."""
+
+        session = _get_session(payload.session_id)
+        try:
+            overview_updates = session.preview_refcal_ant1_shape(
+                payload.dip_center_ghz,
+                payload.dip_width_ghz,
+                payload.dip_depth_rad,
+                payload.lowfreq_weight_power,
+            )
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"overview_updates": overview_updates, "updated_antenna": 0}
+
+    @app.post("/api/relative-delay/ant1-dxy/preview")
+    def preview_ant1_dxy(payload: PreviewAnt1DxyRequest) -> Dict:
+        """Preview staged Ant 1 ``Δ(Y-X)`` tuning."""
+
+        session = _get_session(payload.session_id)
+        try:
+            overview_updates = session.preview_refcal_ant1_dxy(payload.manual_dxy_corr_rad)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"overview_updates": overview_updates, "updated_antenna": 0}
 
     @app.post("/api/phacal/solve/update")
     def update_phacal_solve(payload: UpdatePhacalSolveRequest) -> Dict:
@@ -2028,16 +2625,23 @@ def build_app() -> FastAPI:
 
     @app.post("/api/inband/apply-residual-fit")
     def apply_residual_inband_fit(payload: ResidualInbandFitRequest) -> Dict:
-        """Apply residual in-band correction after committing residual masks."""
+        """Apply residual in-band correction after committing residual masks.
+
+        When ``payload.antenna`` is provided, the correction is applied to
+        that single antenna only (per-antenna apply, mirrors the per-antenna
+        Multiband Fit M button). Otherwise it applies to all eligible
+        antennas as before.
+        """
 
         session = _get_session(payload.session_id)
         try:
-            updated_antennas = session.apply_residual_inband_fit(payload.targets)
+            updated_antennas = session.apply_residual_inband_fit(payload.targets, antenna=payload.antenna)
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         scan, _refcal = _overview_context(session)
         if scan is not None and scan.scan_kind == "phacal":
             overview_updates = {
+                "inband_fit": phacal_anchor_phase_payload(scan, _refcal, antenna_indices=updated_antennas),
                 "inband_relative_phase": phacal_multiband_residual_payload(scan, _refcal, antenna_indices=updated_antennas),
                 "inband_residual_phase_band": phacal_per_band_residual_payload(scan, _refcal, antenna_indices=updated_antennas),
             }
@@ -2231,6 +2835,25 @@ def build_app() -> FastAPI:
             ),
         }
 
+    @app.post("/api/refcal/multiband-fit-kind")
+    def set_multiband_fit_kind(payload: MultibandFitKindRequest) -> Dict:
+        """Set per-antenna multiband fit kind on the active refcal."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.set_multiband_fit_kind(payload.antenna, payload.kind)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        scan, _refcal = _overview_context(session)
+        return {
+            "state": session.state(),
+            "overview_updates": inband_window_update_payloads(
+                scan,
+                antenna_indices=[int(payload.antenna)],
+                refcal=_refcal,
+            ),
+        }
+
     @app.post("/api/inband/mask/preview")
     def preview_inband_mask(payload: SectionMaskPreviewRequest) -> Dict:
         """Preview one kept-band-masked section without committing state."""
@@ -2408,6 +3031,28 @@ def build_app() -> FastAPI:
         session = _get_session(session_id)
         scan, refcal = _overview_context(session)
         return JSONResponse(content=overview_payloads(scan, refcal=refcal, use_lobe=session.use_lobe))
+
+    @app.get("/api/plot/refcal-compare")
+    def refcal_compare_data(session_id: str) -> JSONResponse:
+        """Return same-feed refcal compare payloads."""
+
+        session = _get_session(session_id)
+        compare_ids = [int(scan_id) for scan_id in session.compare_ref_scan_ids]
+        if len(compare_ids) != 2:
+            raise HTTPException(status_code=400, detail="Select exactly two same-feed refcals to compare.")
+        left = session._ensure_refcal_analysis(compare_ids[0])
+        right = session._ensure_refcal_analysis(compare_ids[1])
+        return JSONResponse(
+            content=refcal_compare_payload(
+                left,
+                right,
+                use_lobe=session.use_lobe,
+                canonical_scan_id=session.ref_scan_id,
+                secondary_scan_id=session.secondary_ref_scan_id,
+                staged_patch_antennas=session.staged_secondary_patch_antennas,
+                applied_patch_antennas=session.secondary_patch_antennas,
+            )
+        )
 
     @app.get("/api/plot/time-history")
     def time_history_json(session_id: str) -> JSONResponse:

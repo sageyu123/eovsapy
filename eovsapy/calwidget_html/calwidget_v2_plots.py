@@ -1026,16 +1026,63 @@ def _interp_complex_model(freq_src_hz: np.ndarray, vis_src: np.ndarray, freq_des
     return out
 
 
-def _lowfreq_weights(freq_ghz: np.ndarray) -> np.ndarray:
+def _lowfreq_weights(freq_ghz: np.ndarray, power: float = 0.5) -> np.ndarray:
     """Return low-frequency-upweighted fitting weights."""
 
     freq_ghz = np.asarray(freq_ghz, dtype=float)
+    weight_power = max(float(power), 0.0)
     return np.divide(
         1.0,
-        np.sqrt(np.clip(freq_ghz, 1e-6, np.inf)),
+        np.power(np.clip(freq_ghz, 1e-6, np.inf), weight_power),
         out=np.ones_like(freq_ghz, dtype=float),
         where=np.isfinite(freq_ghz),
     )
+
+
+def _reference_ant_fit_weights(
+    freq_ghz: np.ndarray,
+    band_id: np.ndarray,
+    band_values: np.ndarray,
+    weight_power: float = 0.5,
+) -> np.ndarray:
+    """Return band-balanced low-frequency weights for the Ant 1 Chebyshev fit.
+
+    The reference-antenna fit is judged band-to-band, but the fine-channel grids
+    are denser at high frequency. If the raw per-channel weights are used
+    directly, the high-frequency region dominates the global Chebyshev fit and
+    the low-frequency dip is systematically underfit. This helper equalizes each
+    band's total leverage and then reapplies one low-frequency band weight so
+    the Ant 1 trend follows the low end more faithfully without changing the
+    non-reference linear-fit path.
+
+    :param freq_ghz: Fine-channel frequencies in GHz.
+    :type freq_ghz: np.ndarray
+    :param band_id: Fine-channel band id per channel.
+    :type band_id: np.ndarray
+    :param band_values: Ordered fitted band values.
+    :type band_values: np.ndarray
+    :returns: Per-channel Ant 1 fit weights.
+    :rtype: np.ndarray
+    """
+
+    freq = np.asarray(freq_ghz, dtype=float)
+    band_id = np.asarray(band_id, dtype=int)
+    band_values = np.asarray(band_values, dtype=int)
+    out = np.zeros(freq.shape, dtype=float)
+    valid = np.isfinite(freq) & np.isfinite(band_id)
+    if not np.any(valid):
+        return _lowfreq_weights(freq)
+    for band in band_values:
+        idx = np.where(valid & (band_id == int(band)))[0]
+        if idx.size == 0:
+            continue
+        band_center = float(np.nanmean(freq[idx]))
+        band_weight = float(_lowfreq_weights(np.asarray([band_center], dtype=float), power=weight_power)[0])
+        out[idx] = band_weight / float(idx.size)
+    fallback = out <= 0.0
+    if np.any(fallback):
+        out[fallback] = _lowfreq_weights(freq[fallback], power=weight_power)
+    return out
 
 
 def _weighted_circular_mean_phase(phases: np.ndarray, weights: np.ndarray) -> float:
@@ -1132,15 +1179,36 @@ def _band_phase_samples(
     }
 
 
-def _fit_weighted_chebyshev(freq_ghz: np.ndarray, phase_rad: np.ndarray, weights: np.ndarray, degree: int = 3) -> dict[str, Any]:
-    """Fit a weighted Chebyshev model on normalized frequency."""
+def _fit_weighted_chebyshev(
+    freq_ghz: np.ndarray,
+    phase_rad: np.ndarray,
+    weights: np.ndarray,
+    degree: int = 4,
+    add_lowfreq_term: bool = False,
+    lowfreq_center_ghz: Optional[float] = None,
+    lowfreq_width_ghz: Optional[float] = None,
+    lowfreq_depth_rad: Optional[float] = None,
+) -> dict[str, Any]:
+    """Fit a weighted Chebyshev model on normalized frequency.
+
+    For the reference antenna, one extra localized low-frequency basis term can
+    be enabled to capture the broad dip near 4 GHz without forcing the global
+    Chebyshev terms to bend away from the high-frequency trend.
+    """
 
     freq = np.asarray(freq_ghz, dtype=float)
     phase = np.asarray(phase_rad, dtype=float)
     weights = np.asarray(weights, dtype=float)
     valid = np.isfinite(freq) & np.isfinite(phase) & np.isfinite(weights) & (weights > 0.0)
     if np.count_nonzero(valid) <= degree:
-        return {"coeffs": np.zeros(degree + 1, dtype=float), "x_min": 0.0, "x_max": 1.0}
+        return {
+            "coeffs": np.zeros(degree + 1, dtype=float),
+            "x_min": 0.0,
+            "x_max": 1.0,
+            "lowfreq_coeff": 0.0,
+            "lowfreq_center": np.nan,
+            "lowfreq_sigma": np.nan,
+        }
     xfit = freq[valid]
     yfit = phase[valid]
     wfit = weights[valid]
@@ -1151,9 +1219,49 @@ def _fit_weighted_chebyshev(freq_ghz: np.ndarray, phase_rad: np.ndarray, weights
         span = 1.0
     xnorm = 2.0 * (xfit - x_min) / span - 1.0
     matrix = np.polynomial.chebyshev.chebvander(xnorm, int(degree))
+    ysolve = yfit.copy()
+    lowfreq_coeff = 0.0
+    lowfreq_center = np.nan
+    lowfreq_sigma = np.nan
+    use_fixed_lowfreq = bool(add_lowfreq_term)
+    for candidate in (lowfreq_center_ghz, lowfreq_width_ghz, lowfreq_depth_rad):
+        if candidate is None:
+            use_fixed_lowfreq = False
+            break
+        try:
+            if not np.isfinite(float(candidate)):
+                use_fixed_lowfreq = False
+                break
+        except (TypeError, ValueError):
+            use_fixed_lowfreq = False
+            break
+    if use_fixed_lowfreq:
+        lowfreq_center = float(lowfreq_center_ghz)
+        lowfreq_sigma = max(float(lowfreq_width_ghz), 1.0e-3)
+        lowfreq_coeff = -abs(float(lowfreq_depth_rad))
+        lowfreq_basis = np.exp(-0.5 * np.square((xfit - lowfreq_center) / lowfreq_sigma))
+        ysolve = yfit - lowfreq_coeff * lowfreq_basis
+    elif bool(add_lowfreq_term) and xfit.size > degree + 2:
+        low_limit = x_min + 0.35 * span
+        low_mask = xfit <= low_limit
+        if np.count_nonzero(low_mask) >= 3:
+            lowfreq_center = float(xfit[low_mask][np.nanargmin(yfit[low_mask])])
+            lowfreq_sigma = float(max(0.75, 0.12 * span))
+            lowfreq_basis = np.exp(-0.5 * np.square((xfit - lowfreq_center) / lowfreq_sigma))
+            matrix = np.column_stack([matrix, lowfreq_basis])
     sqrt_w = np.sqrt(wfit)
-    coeffs, *_rest = np.linalg.lstsq(matrix * sqrt_w[:, None], yfit * sqrt_w, rcond=None)
-    return {"coeffs": coeffs, "x_min": x_min, "x_max": x_max}
+    coeffs, *_rest = np.linalg.lstsq(matrix * sqrt_w[:, None], ysolve * sqrt_w, rcond=None)
+    if (not use_fixed_lowfreq) and matrix.shape[1] > degree + 1:
+        lowfreq_coeff = float(coeffs[-1])
+        coeffs = np.asarray(coeffs[:-1], dtype=float)
+    return {
+        "coeffs": np.asarray(coeffs, dtype=float),
+        "x_min": x_min,
+        "x_max": x_max,
+        "lowfreq_coeff": lowfreq_coeff,
+        "lowfreq_center": lowfreq_center,
+        "lowfreq_sigma": lowfreq_sigma,
+    }
 
 
 def _eval_weighted_chebyshev(freq_ghz: np.ndarray, fit: dict[str, Any]) -> np.ndarray:
@@ -1166,7 +1274,115 @@ def _eval_weighted_chebyshev(freq_ghz: np.ndarray, fit: dict[str, Any]) -> np.nd
     if not np.isfinite(span) or span <= 0.0:
         span = 1.0
     xnorm = 2.0 * (freq - x_min) / span - 1.0
-    return np.polynomial.chebyshev.chebval(xnorm, np.asarray(fit["coeffs"], dtype=float))
+    model = np.polynomial.chebyshev.chebval(xnorm, np.asarray(fit["coeffs"], dtype=float))
+    lowfreq_coeff = float(fit.get("lowfreq_coeff", 0.0))
+    lowfreq_center = float(fit.get("lowfreq_center", np.nan))
+    lowfreq_sigma = float(fit.get("lowfreq_sigma", np.nan))
+    if np.isfinite(lowfreq_center) and np.isfinite(lowfreq_sigma) and lowfreq_sigma > 0.0 and lowfreq_coeff != 0.0:
+        model = model + lowfreq_coeff * np.exp(-0.5 * np.square((freq - lowfreq_center) / lowfreq_sigma))
+    return model
+
+
+def _ensure_ant1_multiband_shape_defaults(scan: ScanAnalysis, context: dict[str, Any]) -> dict[str, float]:
+    """Return committed Ant 1 fit-shape controls, seeding defaults when unset."""
+
+    if scan.delay_solution is None:
+        return {
+            "dip_center_ghz": 4.0,
+            "dip_width_ghz": 1.5,
+            "dip_depth_rad": 0.0,
+            "lowfreq_weight_power": 0.5,
+            "manual_dxy_corr_rad": 0.0,
+        }
+    delay_solution = scan.delay_solution
+    center = float(delay_solution.ant1_multiband_dip_center_ghz)
+    width = float(delay_solution.ant1_multiband_dip_width_ghz)
+    depth = float(delay_solution.ant1_multiband_dip_depth_rad)
+    power = float(delay_solution.ant1_multiband_lowfreq_weight_power)
+    if np.isfinite(center) and np.isfinite(width) and np.isfinite(depth) and np.isfinite(power):
+        return {
+            "dip_center_ghz": center,
+            "dip_width_ghz": width,
+            "dip_depth_rad": depth,
+            "lowfreq_weight_power": max(power, 0.0),
+            "manual_dxy_corr_rad": float(delay_solution.ant1_manual_dxy_corr_rad),
+        }
+
+    freq_ghz = np.asarray(context["freq_ghz"], dtype=float)
+    band_id = np.asarray(context["band_id"], dtype=int)
+    band_values = np.asarray(context["band_values"], dtype=int)
+    corrected_avg = np.asarray(context["corrected_avg"], dtype=np.complex128)
+    fit_power = max(power, 0.0) if np.isfinite(power) else 0.5
+    fit_weights = _reference_ant_fit_weights(freq_ghz, band_id, band_values, weight_power=fit_power)
+    vis_x = np.asarray(corrected_avg[0, 0], dtype=np.complex128)
+    vis_y = np.asarray(corrected_avg[0, 1], dtype=np.complex128)
+    valid_x = np.isfinite(freq_ghz) & np.isfinite(vis_x.real) & np.isfinite(vis_x.imag) & (np.abs(vis_x) > 0.0)
+    valid_y = np.isfinite(freq_ghz) & np.isfinite(vis_y.real) & np.isfinite(vis_y.imag) & (np.abs(vis_y) > 0.0)
+    fit_valid_x = valid_x & np.isin(band_id, band_values[delay_solution.included_band_mask(0, 0)])
+    fit_valid_y = valid_y & np.isin(band_id, band_values[delay_solution.included_band_mask(0, 1)])
+    common = fit_valid_x & fit_valid_y
+    if not np.any(common):
+        common = valid_x & valid_y
+    dxy = 0.0
+    if np.any(common):
+        ratio = np.divide(
+            vis_y[common],
+            vis_x[common],
+            out=np.full(np.count_nonzero(common), np.nan + 0j, dtype=np.complex128),
+            where=np.abs(vis_x[common]) > 0.0,
+        )
+        dxy = _weighted_circular_mean_phase(np.angle(ratio), fit_weights[common])
+    display_phase_x = np.full(freq_ghz.shape, np.nan, dtype=float)
+    display_phase_y_rot = np.full(freq_ghz.shape, np.nan, dtype=float)
+    display_phase_x[valid_x] = np.angle(vis_x[valid_x])
+    display_phase_y_rot[valid_y] = np.angle(vis_y[valid_y] * np.exp(-1j * dxy))
+    coarse_x = _band_phase_samples(freq_ghz, band_id, band_values, display_phase_x, fit_weights, fit_valid_x)
+    coarse_y = _band_phase_samples(freq_ghz, band_id, band_values, display_phase_y_rot, fit_weights, fit_valid_y)
+    coarse_freq = (
+        np.concatenate([coarse_x["freq"], coarse_y["freq"]])
+        if coarse_x["freq"].size or coarse_y["freq"].size
+        else np.asarray([], dtype=float)
+    )
+    coarse_phase = (
+        np.concatenate([coarse_x["phase"], coarse_y["phase"]])
+        if coarse_x["phase"].size or coarse_y["phase"].size
+        else np.asarray([], dtype=float)
+    )
+    coarse_weights = (
+        np.concatenate([coarse_x["weights"], coarse_y["weights"]])
+        if coarse_x["weights"].size or coarse_y["weights"].size
+        else np.asarray([], dtype=float)
+    )
+    auto_fit = _fit_weighted_chebyshev(coarse_freq, coarse_phase, coarse_weights, degree=4, add_lowfreq_term=True)
+    center = float(auto_fit.get("lowfreq_center", np.nan))
+    width = float(auto_fit.get("lowfreq_sigma", np.nan))
+    depth = max(-float(auto_fit.get("lowfreq_coeff", 0.0) or 0.0), 0.0)
+    if not np.isfinite(center):
+        if coarse_freq.size:
+            x_min = float(np.nanmin(coarse_freq))
+            x_max = float(np.nanmax(coarse_freq))
+            span = max(x_max - x_min, 1.0)
+            low_limit = x_min + 0.35 * span
+            low_mask = coarse_freq <= low_limit
+            if np.count_nonzero(low_mask) >= 1:
+                center = float(coarse_freq[low_mask][np.nanargmin(coarse_phase[low_mask])])
+            else:
+                center = x_min + 0.15 * span
+        else:
+            center = 4.0
+    if not np.isfinite(width) or width <= 0.0:
+        if coarse_freq.size:
+            width = max(0.75, 0.12 * max(float(np.nanmax(coarse_freq) - np.nanmin(coarse_freq)), 1.0))
+        else:
+            width = 1.5
+    delay_solution.set_ant1_multiband_shape(center, width, depth, fit_power)
+    return {
+        "dip_center_ghz": float(delay_solution.ant1_multiband_dip_center_ghz),
+        "dip_width_ghz": float(delay_solution.ant1_multiband_dip_width_ghz),
+        "dip_depth_rad": float(delay_solution.ant1_multiband_dip_depth_rad),
+        "lowfreq_weight_power": float(delay_solution.ant1_multiband_lowfreq_weight_power),
+        "manual_dxy_corr_rad": float(delay_solution.ant1_manual_dxy_corr_rad),
+    }
 
 
 def _fit_shared_phase_model(
@@ -1174,6 +1390,8 @@ def _fit_shared_phase_model(
     freq_ghz: np.ndarray,
     phase_rad: np.ndarray,
     weights: np.ndarray,
+    ant1_shape: Optional[dict[str, float]] = None,
+    fit_kind: str = "linear",
 ) -> dict[str, Any]:
     """Fit one shared analytic phase model."""
 
@@ -1181,12 +1399,189 @@ def _fit_shared_phase_model(
     phase_rad = np.asarray(phase_rad, dtype=float)
     weights = np.asarray(weights, dtype=float)
     if ant == 0:
-        return {"kind": "chebyshev", "fit": _fit_weighted_chebyshev(freq_ghz, phase_rad, weights, degree=4)}
+        return {
+            "kind": "chebyshev",
+            "fit": _fit_weighted_chebyshev(
+                freq_ghz,
+                phase_rad,
+                weights,
+                degree=4,
+                add_lowfreq_term=True,
+                lowfreq_center_ghz=None if ant1_shape is None else ant1_shape.get("dip_center_ghz"),
+                lowfreq_width_ghz=None if ant1_shape is None else ant1_shape.get("dip_width_ghz"),
+                lowfreq_depth_rad=None if ant1_shape is None else ant1_shape.get("dip_depth_rad"),
+            ),
+        }
+    deg_by_kind = {"linear": 1, "poly2": 2, "poly3": 3}
+    deg = deg_by_kind.get(str(fit_kind), 1)
+    out_kind = "linear" if deg == 1 else ("poly2" if deg == 2 else "poly3")
     valid = np.isfinite(freq_ghz) & np.isfinite(phase_rad) & np.isfinite(weights) & (weights > 0.0)
-    if np.count_nonzero(valid) < 2:
-        return {"kind": "linear", "coeffs": np.asarray([0.0, 0.0], dtype=float)}
-    coeffs, _model = weighted_polyfit(freq_ghz, phase_rad, weights, deg=1, ridge=1e-6)
-    return {"kind": "linear", "coeffs": coeffs}
+    if np.count_nonzero(valid) < deg + 1:
+        return {"kind": out_kind, "coeffs": np.zeros(deg + 1, dtype=float)}
+    if deg == 1:
+        coeffs, _model = weighted_polyfit(freq_ghz, phase_rad, weights, deg=deg, ridge=1e-6)
+        return {"kind": out_kind, "coeffs": coeffs}
+    # Polynomial deg >= 2: rescale freq to [-1, 1] for numerical conditioning,
+    # fit in the rescaled basis, then convert coeffs back to the standard
+    # (ascending) basis in raw freq_ghz so callers (eval, downstream code)
+    # stay unchanged.
+    f_valid = freq_ghz[valid]
+    f_lo = float(np.min(f_valid))
+    f_hi = float(np.max(f_valid))
+    if f_hi <= f_lo:
+        coeffs = np.zeros(deg + 1, dtype=float)
+        coeffs[0] = float(np.average(phase_rad[valid], weights=weights[valid])) if np.any(weights[valid] > 0) else 0.0
+        return {"kind": out_kind, "coeffs": coeffs}
+    center = 0.5 * (f_lo + f_hi)
+    scale = 0.5 * (f_hi - f_lo)
+    u = (freq_ghz - center) / scale
+    rescaled_coeffs, _model = weighted_polyfit(u, phase_rad, weights, deg=deg, ridge=1e-6)
+    # Convert from coefficients in u to coefficients in f via composition:
+    # P(u) = sum_k c_k * ((f - center) / scale)^k
+    # Expand using Polynomial composition.
+    poly_in_u = np.polynomial.polynomial.Polynomial(np.asarray(rescaled_coeffs, dtype=float))
+    # Convert to a Polynomial in f: substitute u = (f - center) / scale.
+    # Build the substitution as a Polynomial in f and compose.
+    substitution = np.polynomial.polynomial.Polynomial([-center / scale, 1.0 / scale])
+    poly_in_f = poly_in_u(substitution)
+    coeffs = np.asarray(poly_in_f.coef, dtype=float)
+    if coeffs.size < deg + 1:
+        coeffs = np.pad(coeffs, (0, deg + 1 - coeffs.size), constant_values=0.0)
+    return {"kind": out_kind, "coeffs": coeffs[: deg + 1]}
+
+
+def _fit_xy_shared_shape_polynomial(
+    freq_x: np.ndarray,
+    phase_x: np.ndarray,
+    weights_x: np.ndarray,
+    freq_y: np.ndarray,
+    phase_y: np.ndarray,
+    weights_y: np.ndarray,
+    deg: int,
+    ridge: float = 1e-6,
+) -> dict[str, np.ndarray]:
+    """Fit X+Y phase polynomials with shared shape (c1..cdeg) and per-pol c0.
+
+    Solves a single weighted least-squares problem with the design matrix
+
+        [phase_x_i] = c0_x + c1*f_x_i + c2*f_x_i^2 + c3*f_x_i^3 + ...
+        [phase_y_j] = c0_y + c1*f_y_j + c2*f_y_j^2 + c3*f_y_j^3 + ...
+
+    Every shape coefficient ``c1..cdeg`` is shared across X and Y. Only the
+    constant offsets ``c0_x, c0_y`` differ. This matches the physical
+    expectation that both polarizations see the same antenna cable / IF
+    chain group-delay shape, so the implied ``Y − X`` is a constant equal
+    to ``c0_y - c0_x`` at every frequency.
+
+    A previous revision used per-pol curvature (``c2_x, c2_y`` independent),
+    which let one pol's noisy/aliased channels pull its curvature off
+    while the other pol fitted cleanly — leaving one residual flat and
+    the other still curved. Sharing c2..cdeg ties them together so the
+    cleaner pol's data constrains the shared shape for both.
+
+    Frequencies are internally rescaled to ``[-1, 1]`` for numerical
+    conditioning; coefficients are returned in the standard ascending basis
+    on raw frequency in GHz.
+    """
+
+    fx = np.asarray(freq_x, dtype=float).reshape(-1)
+    px = np.asarray(phase_x, dtype=float).reshape(-1)
+    wx = np.asarray(weights_x, dtype=float).reshape(-1)
+    fy = np.asarray(freq_y, dtype=float).reshape(-1)
+    py = np.asarray(phase_y, dtype=float).reshape(-1)
+    wy = np.asarray(weights_y, dtype=float).reshape(-1)
+    valid_x = np.isfinite(fx) & np.isfinite(px) & np.isfinite(wx) & (wx > 0.0)
+    valid_y = np.isfinite(fy) & np.isfinite(py) & np.isfinite(wy) & (wy > 0.0)
+    fx, px, wx = fx[valid_x], px[valid_x], wx[valid_x]
+    fy, py, wy = fy[valid_y], py[valid_y], wy[valid_y]
+
+    deg_i = int(deg)
+    if deg_i < 1:
+        deg_i = 1
+    # Parameters: c0_x, c0_y, c1 (shared), c2 (shared), ..., cdeg (shared)
+    # → total = 2 + deg_i parameters.
+    n_params = 2 + deg_i
+    n_total = fx.size + fy.size
+    if n_total < n_params:
+        cx_const = float(np.average(px, weights=wx)) if px.size else 0.0
+        cy_const = float(np.average(py, weights=wy)) if py.size else 0.0
+        coeffs_x = np.zeros(deg_i + 1, dtype=float)
+        coeffs_y = np.zeros(deg_i + 1, dtype=float)
+        coeffs_x[0] = cx_const
+        coeffs_y[0] = cy_const
+        return {"coeffs_x": coeffs_x, "coeffs_y": coeffs_y}
+
+    f_all = np.concatenate([fx, fy])
+    f_lo = float(np.min(f_all))
+    f_hi = float(np.max(f_all))
+    if f_hi <= f_lo:
+        cx_const = float(np.average(px, weights=wx)) if px.size else 0.0
+        cy_const = float(np.average(py, weights=wy)) if py.size else 0.0
+        coeffs_x = np.zeros(deg_i + 1, dtype=float)
+        coeffs_y = np.zeros(deg_i + 1, dtype=float)
+        coeffs_x[0] = cx_const
+        coeffs_y[0] = cy_const
+        return {"coeffs_x": coeffs_x, "coeffs_y": coeffs_y}
+    center = 0.5 * (f_lo + f_hi)
+    scale = 0.5 * (f_hi - f_lo)
+    ux = (fx - center) / scale
+    uy = (fy - center) / scale
+
+    n_x = ux.size
+    n_y = uy.size
+    n = n_x + n_y
+    M = np.zeros((n, n_params), dtype=float)
+    # Column 0: c0_x indicator (only for X rows)
+    # Column 1: c0_y indicator (only for Y rows)
+    # Columns 2..2+deg_i-1: shared c1, c2, ..., cdeg (filled for BOTH X and Y rows)
+    M[:n_x, 0] = 1.0
+    M[n_x:, 1] = 1.0
+    for k in range(1, deg_i + 1):
+        col = 2 + (k - 1)
+        M[:n_x, col] = ux ** k
+        M[n_x:, col] = uy ** k
+
+    y_all = np.concatenate([px, py])
+    w_all = np.concatenate([wx, wy])
+    sqrt_w = np.sqrt(np.clip(w_all, 0.0, np.inf))
+    Mw = M * sqrt_w[:, None]
+    yw = y_all * sqrt_w
+    lhs = Mw.T @ Mw
+    rhs = Mw.T @ yw
+    if ridge > 0.0:
+        penalty = np.eye(n_params, dtype=float) * float(ridge)
+        # Don't regularize intercepts or the shared delay (c1 lives in column 2).
+        penalty[0, 0] = 0.0
+        penalty[1, 1] = 0.0
+        penalty[2, 2] = 0.0
+        lhs = lhs + penalty
+    sol = np.linalg.solve(lhs, rhs)
+
+    # Unpack: assemble per-pol coefficient vectors in the u basis (increasing order).
+    # X and Y share c1..cdeg; only c0 differs.
+    coeffs_x_u = np.zeros(deg_i + 1, dtype=float)
+    coeffs_y_u = np.zeros(deg_i + 1, dtype=float)
+    coeffs_x_u[0] = float(sol[0])       # c0_x
+    coeffs_y_u[0] = float(sol[1])       # c0_y
+    for k in range(1, deg_i + 1):
+        shared_ck = float(sol[2 + (k - 1)])
+        coeffs_x_u[k] = shared_ck
+        coeffs_y_u[k] = shared_ck
+
+    # Convert each per-pol polynomial from u basis to standard f basis.
+    substitution = np.polynomial.polynomial.Polynomial([-center / scale, 1.0 / scale])
+
+    def _convert(coef_u: np.ndarray) -> np.ndarray:
+        poly_u = np.polynomial.polynomial.Polynomial(np.asarray(coef_u, dtype=float))
+        poly_f = poly_u(substitution)
+        out = np.asarray(poly_f.coef, dtype=float)
+        if out.size < deg_i + 1:
+            out = np.pad(out, (0, deg_i + 1 - out.size), constant_values=0.0)
+        return out[: deg_i + 1]
+
+    coeffs_x = _convert(coeffs_x_u)
+    coeffs_y = _convert(coeffs_y_u)
+    return {"coeffs_x": coeffs_x, "coeffs_y": coeffs_y}
 
 
 def _eval_shared_phase_model(freq_ghz: np.ndarray, fit: dict[str, Any]) -> np.ndarray:
@@ -1195,7 +1590,10 @@ def _eval_shared_phase_model(freq_ghz: np.ndarray, fit: dict[str, Any]) -> np.nd
     if fit.get("kind") == "chebyshev":
         return _eval_weighted_chebyshev(freq_ghz, fit["fit"])
     coeffs = np.asarray(fit["coeffs"], dtype=float)
-    return coeffs[0] + coeffs[1] * np.asarray(freq_ghz, dtype=float)
+    x = np.asarray(freq_ghz, dtype=float)
+    if coeffs.size == 0:
+        return np.zeros(x.shape, dtype=float)
+    return np.polynomial.polynomial.polyval(x, coeffs)
 
 
 def _align_phase_segments_to_model(
@@ -1253,7 +1651,10 @@ def _fit_joint_xy_relative_model(
     corrected_avg: np.ndarray,
     fit_mask_x: Optional[np.ndarray] = None,
     fit_mask_y: Optional[np.ndarray] = None,
+    fit_mask_xy: Optional[np.ndarray] = None,
     manual_delay_ns: Optional[np.ndarray] = None,
+    ant1_shape: Optional[dict[str, float]] = None,
+    fit_kind: str = "linear",
 ) -> dict[str, Any]:
     """Fit a joint X/Y relative-phase model with Y-X = const.
 
@@ -1286,19 +1687,35 @@ def _fit_joint_xy_relative_model(
     band_values = np.asarray(band_values, dtype=int)
     freq_hz = freq_ghz * 1e9
     weights = _lowfreq_weights(freq_ghz)
+    ant1_shape = ant1_shape or {}
+    weight_power = float(ant1_shape.get("lowfreq_weight_power", 0.5))
+    manual_dxy_corr = float(ant1_shape.get("manual_dxy_corr_rad", 0.0)) if ant == 0 else 0.0
+    fit_weights = (
+        _reference_ant_fit_weights(freq_ghz, band_id, band_values, weight_power=weight_power)
+        if ant == 0
+        else weights
+    )
     valid_x = np.isfinite(freq_ghz) & np.isfinite(vis_x.real) & np.isfinite(vis_x.imag) & (np.abs(vis_x) > 0.0)
     valid_y = np.isfinite(freq_ghz) & np.isfinite(vis_y.real) & np.isfinite(vis_y.imag) & (np.abs(vis_y) > 0.0)
     fit_mask_x = np.ones(freq_ghz.shape, dtype=bool) if fit_mask_x is None else np.asarray(fit_mask_x, dtype=bool).reshape(-1)
     fit_mask_y = np.ones(freq_ghz.shape, dtype=bool) if fit_mask_y is None else np.asarray(fit_mask_y, dtype=bool).reshape(-1)
+    fit_mask_xy = None if fit_mask_xy is None else np.asarray(fit_mask_xy, dtype=bool).reshape(-1)
     if fit_mask_x.shape != freq_ghz.shape:
         fit_mask_x = np.ones(freq_ghz.shape, dtype=bool)
     if fit_mask_y.shape != freq_ghz.shape:
         fit_mask_y = np.ones(freq_ghz.shape, dtype=bool)
+    if fit_mask_xy is not None and fit_mask_xy.shape != freq_ghz.shape:
+        fit_mask_xy = None
     fit_valid_x = valid_x & fit_mask_x
     fit_valid_y = valid_y & fit_mask_y
-    common = fit_valid_x & fit_valid_y
-    if not np.any(common):
-        common = valid_x & valid_y
+    if fit_mask_xy is not None:
+        common = valid_x & valid_y & fit_mask_xy
+        if not np.any(common):
+            common = valid_x & valid_y
+    else:
+        common = fit_valid_x & fit_valid_y
+        if not np.any(common):
+            common = valid_x & valid_y
 
     if np.any(common):
         ratio = np.divide(
@@ -1307,7 +1724,7 @@ def _fit_joint_xy_relative_model(
             out=np.full(np.count_nonzero(common), np.nan + 0j, dtype=np.complex128),
             where=np.abs(vis_x[common]) > 0.0,
         )
-        dxy = _weighted_circular_mean_phase(np.angle(ratio), weights[common])
+        dxy = _weighted_circular_mean_phase(np.angle(ratio), fit_weights[common])
     else:
         dxy = 0.0
 
@@ -1318,12 +1735,16 @@ def _fit_joint_xy_relative_model(
     display_phase_y[valid_y] = np.angle(vis_y[valid_y])
     display_phase_y_rot[valid_y] = np.angle(vis_y[valid_y] * np.exp(-1j * dxy))
 
-    coarse_x = _band_phase_samples(freq_ghz, band_id, band_values, display_phase_x, weights, fit_valid_x)
-    coarse_y = _band_phase_samples(freq_ghz, band_id, band_values, display_phase_y_rot, weights, fit_valid_y)
+    coarse_x = _band_phase_samples(freq_ghz, band_id, band_values, display_phase_x, fit_weights, fit_valid_x)
+    coarse_y = _band_phase_samples(freq_ghz, band_id, band_values, display_phase_y_rot, fit_weights, fit_valid_y)
     coarse_freq = np.concatenate([coarse_x["freq"], coarse_y["freq"]]) if coarse_x["freq"].size or coarse_y["freq"].size else np.asarray([], dtype=float)
     coarse_phase = np.concatenate([coarse_x["phase"], coarse_y["phase"]]) if coarse_x["phase"].size or coarse_y["phase"].size else np.asarray([], dtype=float)
     coarse_weights = np.concatenate([coarse_x["weights"], coarse_y["weights"]]) if coarse_x["weights"].size or coarse_y["weights"].size else np.asarray([], dtype=float)
-    coarse_fit = _fit_shared_phase_model(ant, coarse_freq, coarse_phase, coarse_weights)
+    coarse_fit = _fit_shared_phase_model(
+        ant, coarse_freq, coarse_phase, coarse_weights,
+        ant1_shape=ant1_shape,
+        fit_kind="linear",
+    )
     coarse_model_phase = _eval_shared_phase_model(freq_ghz, coarse_fit)
 
     aligned_phase_x = _align_phase_segments_to_model(
@@ -1331,7 +1752,7 @@ def _fit_joint_xy_relative_model(
         band_id,
         band_values,
         display_phase_x,
-        weights,
+        fit_weights,
         fit_valid_x,
         coarse_model_phase,
     )
@@ -1340,28 +1761,42 @@ def _fit_joint_xy_relative_model(
         band_id,
         band_values,
         display_phase_y_rot,
-        weights,
+        fit_weights,
         fit_valid_y,
         coarse_model_phase,
     )
     common_aligned = fit_valid_x & fit_valid_y & np.isfinite(aligned_phase_x) & np.isfinite(aligned_phase_y_rot)
+    if fit_mask_xy is not None:
+        xy_restricted = common_aligned & fit_mask_xy
+        if np.any(xy_restricted):
+            common_aligned = xy_restricted
     if not np.any(common_aligned):
         common_aligned = common & np.isfinite(aligned_phase_x) & np.isfinite(aligned_phase_y_rot)
     if np.any(common_aligned):
-        align_delta = _weighted_mean(aligned_phase_y_rot[common_aligned] - aligned_phase_x[common_aligned], weights[common_aligned])
+        # Circular mean: aligned_phase_y_rot - aligned_phase_x is angular
+        # in nature and can have ±2π outliers from independent per-pol
+        # 2π-rounding in _align_phase_segments_to_model.
+        align_delta = _weighted_circular_mean_phase(
+            aligned_phase_y_rot[common_aligned] - aligned_phase_x[common_aligned],
+            fit_weights[common_aligned],
+        )
     else:
         align_delta = 0.0
     aligned_phase_y = aligned_phase_y_rot - align_delta
-    dxy_total = float(dxy + align_delta)
+    auto_dxy_total = float(dxy + align_delta)
 
     fit_x = fit_valid_x & np.isfinite(aligned_phase_x)
     fit_y = fit_valid_y & np.isfinite(aligned_phase_y)
     shared_freq = np.concatenate([freq_ghz[fit_x], freq_ghz[fit_y]]) if np.any(fit_x) or np.any(fit_y) else np.asarray([], dtype=float)
     shared_phase = np.concatenate([aligned_phase_x[fit_x], aligned_phase_y[fit_y]]) if np.any(fit_x) or np.any(fit_y) else np.asarray([], dtype=float)
-    shared_weights = np.concatenate([weights[fit_x], weights[fit_y]]) if np.any(fit_x) or np.any(fit_y) else np.asarray([], dtype=float)
-    fit = _fit_shared_phase_model(ant, shared_freq, shared_phase, shared_weights)
+    shared_weights = (
+        np.concatenate([fit_weights[fit_x], fit_weights[fit_y]])
+        if np.any(fit_x) or np.any(fit_y)
+        else np.asarray([], dtype=float)
+    )
+    fit = _fit_shared_phase_model(ant, shared_freq, shared_phase, shared_weights, ant1_shape=ant1_shape, fit_kind=fit_kind)
     base_model_x_phase = _eval_shared_phase_model(freq_ghz, fit)
-    base_model_y_phase = base_model_x_phase + dxy_total
+    base_model_y_phase = base_model_x_phase + auto_dxy_total
     manual_delay_ns = np.zeros(2, dtype=float) if manual_delay_ns is None else np.asarray(manual_delay_ns, dtype=float).reshape(-1)
     if manual_delay_ns.size < 2:
         manual_delay_ns = np.pad(manual_delay_ns, (0, max(0, 2 - manual_delay_ns.size)), constant_values=0.0)
@@ -1369,19 +1804,61 @@ def _fit_joint_xy_relative_model(
         coeffs = np.asarray(fit["coeffs"], dtype=float)
         slope_x = float(coeffs[1] + 2.0 * np.pi * float(manual_delay_ns[0]))
         slope_y = float(coeffs[1] + 2.0 * np.pi * float(manual_delay_ns[1]))
-        intercept_x = _refit_phase_intercept(freq_ghz, aligned_phase_x, weights, fit_x, slope_x)
-        intercept_y = _refit_phase_intercept(freq_ghz, aligned_phase_y, weights, fit_y, slope_y)
+        intercept_x = _refit_phase_intercept(freq_ghz, aligned_phase_x, fit_weights, fit_x, slope_x)
+        intercept_y = _refit_phase_intercept(freq_ghz, aligned_phase_y, fit_weights, fit_y, slope_y)
         model_x_phase = intercept_x + slope_x * freq_ghz
-        model_y_phase = intercept_y + slope_y * freq_ghz + dxy_total
+        model_y_phase = intercept_y + slope_y * freq_ghz + auto_dxy_total
+    elif fit.get("kind") in ("poly2", "poly3"):
+        # Constrained joint fit: X and Y share c1..cdeg (shape) with
+        # separate intercepts c0_x, c0_y. This guarantees the implied
+        # delta(Y-X) is a constant (= c0_y - c0_x) at all frequencies,
+        # which is the physical expectation. The independent per-pol path
+        # was overfitting (allowing X and Y to have different curvatures).
+        deg = 2 if fit_kind == "poly2" else 3
+        joint = _fit_xy_shared_shape_polynomial(
+            freq_ghz[fit_x] if np.any(fit_x) else np.zeros(0, dtype=float),
+            aligned_phase_x[fit_x] if np.any(fit_x) else np.zeros(0, dtype=float),
+            fit_weights[fit_x] if np.any(fit_x) else np.zeros(0, dtype=float),
+            freq_ghz[fit_y] if np.any(fit_y) else np.zeros(0, dtype=float),
+            aligned_phase_y[fit_y] if np.any(fit_y) else np.zeros(0, dtype=float),
+            fit_weights[fit_y] if np.any(fit_y) else np.zeros(0, dtype=float),
+            deg=deg, ridge=1e-6,
+        )
+        fit_pol_x = {"kind": fit_kind, "coeffs": joint["coeffs_x"]}
+        fit_pol_y = {"kind": fit_kind, "coeffs": joint["coeffs_y"]}
+        valid_any = np.isfinite(freq_ghz)
+        pivot_ghz = float(np.nanmean(freq_ghz[valid_any])) if np.any(valid_any) else 0.0
+        base_model_x_phase = _eval_shared_phase_model(freq_ghz, fit_pol_x)
+        # aligned_phase_y had auto_dxy_total subtracted; add it back so the
+        # displayed Y model matches display_phase_y = angle(vis_y).
+        base_model_y_phase = _eval_shared_phase_model(freq_ghz, fit_pol_y) + auto_dxy_total
+        model_x_phase = base_model_x_phase + 2.0 * np.pi * (freq_ghz - pivot_ghz) * float(manual_delay_ns[0])
+        model_y_phase = base_model_y_phase + 2.0 * np.pi * (freq_ghz - pivot_ghz) * float(manual_delay_ns[1])
     else:
         valid_any = np.isfinite(freq_ghz)
         pivot_ghz = float(np.nanmean(freq_ghz[valid_any])) if np.any(valid_any) else 0.0
         model_x_phase = base_model_x_phase + 2.0 * np.pi * (freq_ghz - pivot_ghz) * float(manual_delay_ns[0])
         model_y_phase = base_model_y_phase + 2.0 * np.pi * (freq_ghz - pivot_ghz) * float(manual_delay_ns[1])
-        intercept_x = _weighted_mean(aligned_phase_x[fit_x] - model_x_phase[fit_x], weights[fit_x]) if np.any(fit_x) else 0.0
-        intercept_y = _weighted_mean(aligned_phase_y[fit_y] - model_y_phase[fit_y], weights[fit_y]) if np.any(fit_y) else 0.0
+        # Chebyshev (ant=0) branch: keep the existing circular-mean intercept correction.
+        intercept_x = (
+            _weighted_circular_mean_phase(
+                aligned_phase_x[fit_x] - model_x_phase[fit_x], fit_weights[fit_x]
+            )
+            if np.any(fit_x)
+            else 0.0
+        )
+        intercept_y = (
+            _weighted_circular_mean_phase(
+                aligned_phase_y[fit_y] - model_y_phase[fit_y], fit_weights[fit_y]
+            )
+            if np.any(fit_y)
+            else 0.0
+        )
         model_x_phase = model_x_phase + intercept_x
         model_y_phase = model_y_phase + intercept_y
+    if ant == 0 and np.isfinite(manual_dxy_corr) and manual_dxy_corr != 0.0:
+        model_y_phase = model_y_phase + manual_dxy_corr
+    effective_dxy_total = float(auto_dxy_total + manual_dxy_corr)
 
     residual_x = np.full(freq_ghz.shape, np.nan, dtype=float)
     residual_y = np.full(freq_ghz.shape, np.nan, dtype=float)
@@ -1401,7 +1878,7 @@ def _fit_joint_xy_relative_model(
         xy_residual = np.angle(np.exp(1j * (xy_phase[xy_model_mask] - xy_mean)))
         yx_residual_rms = float(np.sqrt(np.average(np.square(xy_residual), weights=weights[xy_model_mask])))
     else:
-        xy_mean = float(dxy_total)
+        xy_mean = float(effective_dxy_total)
         yx_residual_rms = np.nan
     base_delay_ns = np.nan
     auto_delay_ns_by_pol = [0.0, 0.0]
@@ -1409,7 +1886,21 @@ def _fit_joint_xy_relative_model(
     residual_fit_segments_by_pol: list[list[dict[str, np.ndarray]]] = [[], []]
     if ant != 0:
         coeffs = np.asarray(fit["coeffs"], dtype=float)
-        base_delay_ns = float(coeffs[1] / (2.0 * np.pi))
+        if str(fit.get("kind")) == "linear" or coeffs.size <= 2:
+            base_delay_ns = float(coeffs[1] / (2.0 * np.pi)) if coeffs.size >= 2 else 0.0
+        else:
+            valid_any = np.isfinite(freq_ghz)
+            if np.any(valid_any):
+                f_lo = float(np.nanmin(freq_ghz[valid_any]))
+                f_hi = float(np.nanmax(freq_ghz[valid_any]))
+                if f_hi > f_lo:
+                    avg_slope = float((np.polynomial.polynomial.polyval(f_hi, coeffs)
+                                        - np.polynomial.polynomial.polyval(f_lo, coeffs)) / (f_hi - f_lo))
+                    base_delay_ns = avg_slope / (2.0 * np.pi)
+                else:
+                    base_delay_ns = 0.0
+            else:
+                base_delay_ns = 0.0
         auto_delay_ns_by_pol = [base_delay_ns, base_delay_ns]
         residual_freq = np.concatenate([freq_hz[fit_x], freq_hz[fit_y]]) if np.any(fit_x) or np.any(fit_y) else np.asarray([], dtype=float)
         residual_vis = (
@@ -1474,6 +1965,9 @@ def _fit_joint_xy_relative_model(
         "xy_model_mask": xy_model_mask,
         "xy_annotation": "Δ(Y-X)={0:.2f} rad | RMS={1:.2f} rad".format(xy_mean, yx_residual_rms),
         "yx_residual_rms": yx_residual_rms,
+        "auto_dxy_rad": float(auto_dxy_total),
+        "manual_dxy_corr_rad": float(manual_dxy_corr),
+        "effective_dxy_rad": float(effective_dxy_total),
     }
 
 
@@ -1664,7 +2158,10 @@ def _compute_inband_diagnostic_antenna(scan: ScanAnalysis, ant: int, context: di
         corrected_avg,
         fit_mask_x=np.isin(band_id, band_values[scan.delay_solution.included_band_mask(ant_i, 0)]),
         fit_mask_y=np.isin(band_id, band_values[scan.delay_solution.included_band_mask(ant_i, 1)]),
+        fit_mask_xy=np.isin(band_id, band_values[scan.delay_solution.included_xy_band_mask(ant_i)]),
         manual_delay_ns=scan.delay_solution.relative_ns[ant_i],
+        ant1_shape=_ensure_ant1_multiband_shape_defaults(scan, context) if ant_i == 0 else None,
+        fit_kind=scan.delay_solution.get_multiband_fit_kind(ant_i),
     )
     panels: list[dict[str, Any]] = []
     for pol in range(2):
@@ -1810,7 +2307,7 @@ def _compute_inband_diagnostic_antenna(scan: ScanAnalysis, ant: int, context: di
                 "fit_method": "complex_poly_lowfreq",
             }
         )
-    xy_kept_mask = scan.delay_solution.included_band_mask(ant_i, 0) & scan.delay_solution.included_band_mask(ant_i, 1)
+    xy_kept_mask = scan.delay_solution.included_xy_band_mask(ant_i)
     xy_included_bands = band_values[xy_kept_mask]
     xy_phase_by_band = _band_series_payload(
         freq_ghz,
@@ -1839,6 +2336,9 @@ def _compute_inband_diagnostic_antenna(scan: ScanAnalysis, ant: int, context: di
             "model_phase": np.asarray(joint_fit["xy_model_phase"], dtype=float),
             "model_mask": np.asarray(joint_fit["xy_model_mask"], dtype=bool),
             "yx_residual_rms": float(joint_fit["yx_residual_rms"]),
+            "auto_dxy_rad": float(joint_fit["auto_dxy_rad"]),
+            "manual_dxy_corr_rad": float(joint_fit["manual_dxy_corr_rad"]),
+            "effective_dxy_rad": float(joint_fit["effective_dxy_rad"]),
         },
         "relative_auto_ns": np.asarray(joint_fit["auto_delay_ns_by_pol"], dtype=float),
         "relative_suggested_ns": np.asarray(joint_fit["suggested_delay_ns_by_pol"], dtype=float),
@@ -2356,6 +2856,10 @@ def inband_residual_phase_band_payload(scan: Optional[ScanAnalysis]) -> Dict[str
     payload["fit_method"] = "complex_poly_lowfreq"
     payload["column_controls"] = _shared_column_controls(scan)
     payload["residual_band_threshold_rad"] = float(residual_band_threshold(scan))
+    payload["multiband_fit_kinds"] = [
+        scan.delay_solution.get_multiband_fit_kind(ant_i)
+        for ant_i in range(scan.layout.nsolant)
+    ]
     return payload
 
 
@@ -2472,6 +2976,10 @@ def inband_relative_phase_payload(scan: Optional[ScanAnalysis]) -> Dict[str, Any
     payload["band_edges"] = diag["band_edges"]
     payload["fit_method"] = "complex_poly_lowfreq"
     payload["column_controls"] = _shared_column_controls(scan)
+    payload["multiband_fit_kinds"] = [
+        scan.delay_solution.get_multiband_fit_kind(ant_i)
+        for ant_i in range(scan.layout.nsolant)
+    ]
     return payload
 
 
@@ -2597,6 +3105,7 @@ def overview_payloads(
         payload = {
             "sum_amp": sum_amp_payload(scan),
             "sum_pha": sum_phase_payload(scan, use_lobe=use_lobe),
+            "phacal_phase_compare": phacal_phase_compare_payload(scan, refcal),
             "inband_fit": phacal_anchor_phase_payload(scan, refcal),
             "inband_relative_phase": phacal_multiband_residual_payload(scan, refcal),
             "inband_residual_phase_band": phacal_per_band_residual_payload(scan, refcal),
@@ -2617,6 +3126,104 @@ def overview_payloads(
     if scan is not None and scan.raw:
         scan.raw["overview_payload_cache"] = {"key": cache_key, "value": payload}
     return payload
+
+
+def _anchor_compare_summary(scan: ScanAnalysis) -> Dict[str, Any]:
+    """Return one compact same-feed anchor compare summary."""
+
+    disabled = _effective_disabled_antennas(scan)
+    return {
+        "scan_id": int(scan.scan_id),
+        "scan_time": scan.t_bg.iso[11:19],
+        "source": str(scan.source),
+        "feed_kind": str(scan_feed_kind(scan)),
+        "total_antennas": int(scan.layout.nsolant),
+        "kept_antennas": int(np.count_nonzero(~disabled)),
+        "flagged_antennas": int(np.count_nonzero(disabled)),
+    }
+
+
+def refcal_compare_payload(
+    left: ScanAnalysis,
+    right: ScanAnalysis,
+    use_lobe: bool = False,
+    canonical_scan_id: Optional[int] = None,
+    secondary_scan_id: Optional[int] = None,
+    staged_patch_antennas: Optional[Sequence[int]] = None,
+    applied_patch_antennas: Optional[Sequence[int]] = None,
+) -> Dict[str, Any]:
+    """Return side-by-side same-feed refcal compare payloads."""
+
+    left_overview = overview_payloads(left, refcal=None, use_lobe=use_lobe)
+    right_overview = overview_payloads(right, refcal=None, use_lobe=use_lobe)
+    staged_set = {int(ant) for ant in (staged_patch_antennas or [])}
+    applied_set = {int(ant) for ant in (applied_patch_antennas or [])}
+
+    def usable_mask(scan: ScanAnalysis) -> np.ndarray:
+        with np.errstate(invalid="ignore"):
+            avg = np.nanmean(np.asarray(scan.corrected_channel_vis[: scan.layout.nsolant, :2], dtype=np.complex128), axis=3)
+        valid = np.any(np.isfinite(avg.real) & np.isfinite(avg.imag) & (np.abs(avg) > 0.0), axis=(1, 2))
+        disabled = _effective_disabled_antennas(scan)
+        size = min(valid.size, disabled.size)
+        valid[:size] &= ~disabled[:size]
+        return valid
+
+    left_usable = usable_mask(left)
+    right_usable = usable_mask(right)
+    donor_enabled = (
+        canonical_scan_id is not None
+        and secondary_scan_id is not None
+        and int(canonical_scan_id) in (int(left.scan_id), int(right.scan_id))
+        and int(secondary_scan_id) in (int(left.scan_id), int(right.scan_id))
+        and int(canonical_scan_id) != int(secondary_scan_id)
+    )
+    canonical_is_left = bool(donor_enabled and int(canonical_scan_id) == int(left.scan_id))
+    donor_candidates = []
+    for ant in range(left.layout.nsolant):
+        canonical_ok = bool(left_usable[ant] if canonical_is_left else right_usable[ant])
+        secondary_ok = bool(right_usable[ant] if canonical_is_left else left_usable[ant])
+        recommended = (not canonical_ok) and secondary_ok
+        donor_candidates.append(
+            {
+                "antenna": int(ant),
+                "label": "Ant {0:d}".format(int(ant) + 1),
+                "canonical_usable": canonical_ok,
+                "secondary_usable": secondary_ok,
+                "can_patch": secondary_ok,
+                "recommended": recommended,
+                "staged": int(ant) in staged_set,
+                "applied": int(ant) in applied_set,
+                "reason": (
+                    "canonical missing/unusable; secondary usable"
+                    if recommended
+                    else ("secondary unusable" if not secondary_ok else "optional donor patch")
+                ),
+            }
+        )
+    return {
+        "title": "Compare 2 Anchors",
+        "feed_kind": str(scan_feed_kind(left)),
+        "left": _anchor_compare_summary(left),
+        "right": _anchor_compare_summary(right),
+        "sections": [
+            {"id": "sum_pha", "title": "Sum X & Y Phase [rad]", "left": left_overview["sum_pha"], "right": right_overview["sum_pha"]},
+            {"id": "inband_fit", "title": "Inband Fit", "left": left_overview["inband_fit"], "right": right_overview["inband_fit"]},
+            {
+                "id": "inband_relative_phase",
+                "title": "Relative Phase + Fit",
+                "left": left_overview["inband_relative_phase"],
+                "right": right_overview["inband_relative_phase"],
+            },
+        ],
+        "donor_patch": {
+            "enabled": bool(donor_enabled),
+            "canonical_scan_id": None if canonical_scan_id is None else int(canonical_scan_id),
+            "secondary_scan_id": None if secondary_scan_id is None else int(secondary_scan_id),
+            "staged_antennas": sorted(int(ant) for ant in staged_set),
+            "applied_antennas": sorted(int(ant) for ant in applied_set),
+            "candidates": donor_candidates,
+        },
+    }
 
 
 def _normalize_sparse_antennas(scan: ScanAnalysis, antenna_indices: Sequence[int]) -> list[int]:
@@ -2851,6 +3458,7 @@ def inband_window_update_payloads(
 
     if scan is not None and scan.scan_kind == "phacal":
         return {
+            "inband_fit": phacal_anchor_phase_payload(scan, refcal, antenna_indices=antenna_indices),
             "inband_relative_phase": phacal_multiband_residual_payload(scan, refcal, antenna_indices=antenna_indices),
             "inband_residual_phase_band": phacal_per_band_residual_payload(scan, refcal, antenna_indices=antenna_indices),
         }
@@ -3061,6 +3669,10 @@ def _relative_delay_partial_payloads(scan: ScanAnalysis, antenna_indices: Sequen
     relative_payload["fit_method"] = "complex_poly_lowfreq"
     relative_payload["sparse_antennas"] = sparse_antennas
     relative_payload["column_controls"] = _shared_column_controls(scan)
+    relative_payload["multiband_fit_kinds"] = [
+        scan.delay_solution.get_multiband_fit_kind(ant_i)
+        for ant_i in range(nsolant)
+    ]
 
     residual_phase_panels = [[None] * nsolant for _ in range(2)]
     for ant_i in sparse_antennas:
@@ -3138,6 +3750,10 @@ def _relative_delay_partial_payloads(scan: ScanAnalysis, antenna_indices: Sequen
     residual_phase_payload["sparse_antennas"] = sparse_antennas
     residual_phase_payload["column_controls"] = _shared_column_controls(scan)
     residual_phase_payload["residual_band_threshold_rad"] = float(residual_band_threshold(scan))
+    residual_phase_payload["multiband_fit_kinds"] = [
+        scan.delay_solution.get_multiband_fit_kind(ant_i)
+        for ant_i in range(nsolant)
+    ]
 
     band_centers = np.asarray([edge["x_center"] for edge in context["band_edges"]], dtype=float)
     residual_delay_panels = [[None] * nsolant for _ in range(2)]
@@ -3288,13 +3904,35 @@ def relative_delay_editor_meta(scan: Optional[ScanAnalysis], ant: int) -> Dict[s
     antenna_diag = None
     if scan.raw:
         antenna_diag = _inband_diagnostic_for_antenna(scan, ant_i)
+    fitted = np.asarray(scan.delay_solution.fitted_ns[ant_i], dtype=float)
+    active = np.asarray(scan.delay_solution.active_ns[ant_i], dtype=float)
+    override_delta = active - fitted
     auto = np.asarray(scan.delay_solution.relative_auto_ns[ant_i], dtype=float)
     suggested = np.asarray(scan.delay_solution.relative_suggested_ns[ant_i], dtype=float)
     applied = np.asarray(scan.delay_solution.relative_ns[ant_i], dtype=float)
     effective = auto + applied
     yx_rms = np.asarray(scan.raw.get("yx_residual_rms", np.full(scan.layout.nsolant, np.nan)), dtype=float)
     panel_meta = antenna_diag["panels"] if antenna_diag is not None else [{}, {}]
+    xy_panel_meta = antenna_diag["xy_panel"] if antenna_diag is not None else {}
+    ant1_shape = None
+    if ant_i == 0 and scan.raw:
+        ant1_shape = _ensure_ant1_multiband_shape_defaults(scan, _inband_diag_context(scan))
+    ant1_auto_dxy = float(xy_panel_meta.get("auto_dxy_rad", np.nan)) if ant_i == 0 else np.nan
+    ant1_manual_dxy = float(scan.delay_solution.ant1_manual_dxy_corr_rad) if ant_i == 0 else 0.0
+    ant1_effective_dxy = (
+        float(xy_panel_meta.get("effective_dxy_rad", ant1_auto_dxy + ant1_manual_dxy))
+        if ant_i == 0
+        else np.nan
+    )
     return {
+        "x_auto_inband_delay_ns": float(fitted[0]),
+        "y_auto_inband_delay_ns": float(fitted[1]),
+        "x_effective_inband_delay_ns": float(active[0]),
+        "y_effective_inband_delay_ns": float(active[1]),
+        "x_inband_override_delta_ns": float(override_delta[0]),
+        "y_inband_override_delta_ns": float(override_delta[1]),
+        "x_residual_inband_suggest_ns": float(panel_meta[0].get("residual_inband_delay_ns", 0.0) or 0.0),
+        "y_residual_inband_suggest_ns": float(panel_meta[1].get("residual_inband_delay_ns", 0.0) or 0.0),
         "x_auto_relative_delay_ns": float(auto[0]),
         "y_auto_relative_delay_ns": float(auto[1]),
         "x_suggested_relative_delay_ns": float(suggested[0]),
@@ -3305,6 +3943,24 @@ def relative_delay_editor_meta(scan: Optional[ScanAnalysis], ant: int) -> Dict[s
         "y_applied_relative_delay_ns": float(applied[1]),
         "x_effective_relative_delay_ns": float(effective[0]),
         "y_effective_relative_delay_ns": float(effective[1]),
+        "is_reference_antenna": bool(ant_i == 0),
+        "ant1_auto_dxy_rad": ant1_auto_dxy,
+        "ant1_manual_dxy_corr_rad": ant1_manual_dxy,
+        "ant1_effective_dxy_rad": ant1_effective_dxy,
+        "ant1_multiband_dip_center_ghz": float(
+            ant1_shape["dip_center_ghz"] if ant1_shape is not None else scan.delay_solution.ant1_multiband_dip_center_ghz
+        ),
+        "ant1_multiband_dip_width_ghz": float(
+            ant1_shape["dip_width_ghz"] if ant1_shape is not None else scan.delay_solution.ant1_multiband_dip_width_ghz
+        ),
+        "ant1_multiband_dip_depth_rad": float(
+            ant1_shape["dip_depth_rad"] if ant1_shape is not None else scan.delay_solution.ant1_multiband_dip_depth_rad
+        ),
+        "ant1_multiband_lowfreq_weight_power": float(
+            ant1_shape["lowfreq_weight_power"]
+            if ant1_shape is not None
+            else scan.delay_solution.ant1_multiband_lowfreq_weight_power
+        ),
         "relative_undo_available": bool(scan.delay_solution.relative_prev_valid[ant_i]),
         "manual_ant_flagged": bool(scan.delay_solution.manual_ant_flag_override[ant_i]),
         "manual_ant_kept": bool(scan.delay_solution.manual_ant_keep_override[ant_i]),
@@ -3343,6 +3999,27 @@ def phacal_delay_editor_meta(
     applied_offset = np.asarray(state.applied_offset_rad[ant_i], dtype=float)
     effective_delay = auto_delay + applied_delay
     effective_offset = auto_offset + applied_offset
+    x_kept_band_count = 0
+    y_kept_band_count = 0
+    x_kept_channel_count = 0
+    y_kept_channel_count = 0
+    if scan.delay_solution is not None:
+        channel_band = np.asarray((scan.raw or {}).get("channel_band", []), dtype=int)
+        for pol in range(2):
+            kept_mask = np.asarray(scan.delay_solution.included_band_mask(ant_i, pol), dtype=bool)
+            kept_bands = (
+                np.asarray(scan.delay_solution.band_values, dtype=int)[kept_mask]
+                if scan.delay_solution.band_values.size == kept_mask.size
+                else np.asarray([], dtype=int)
+            )
+            kept_band_count = int(kept_bands.size)
+            kept_channel_count = int(np.count_nonzero(np.isin(channel_band, kept_bands))) if kept_bands.size else 0
+            if pol == 0:
+                x_kept_band_count = kept_band_count
+                x_kept_channel_count = kept_channel_count
+            else:
+                y_kept_band_count = kept_band_count
+                y_kept_channel_count = kept_channel_count
     return {
         "x_auto_delay_ns": float(auto_delay[0]),
         "y_auto_delay_ns": float(auto_delay[1]),
@@ -3362,10 +4039,19 @@ def phacal_delay_editor_meta(
         "y_effective_offset_rad": float(effective_offset[1]),
         "phacal_undo_available": bool(state.prev_valid[ant_i]),
         "manual_ant_flagged": bool(state.manual_skip_override[ant_i]),
+        "manual_anchor_fallback_override": bool(state.manual_anchor_fallback_override[ant_i]),
         "fallback_in_use": bool(state.fallback_used[ant_i]),
+        "donor_patch_used": bool(state.donor_patch_used[ant_i]),
+        "donor_patch_method": str((scan.scan_meta or {}).get("patch_method", ["none"] * scan.layout.nsolant)[ant_i]),
         "missing_in_phacal": bool(state.missing_in_phacal[ant_i]),
         "missing_in_refcal": bool(state.missing_in_refcal[ant_i]),
         "anchor_scan_id": None if refcal is None else int(refcal.scan_id),
+        "secondary_anchor_scan_id": (scan.scan_meta or {}).get("secondary_refcal_scan_id"),
+        "secondary_anchor_scan_time": (scan.scan_meta or {}).get("secondary_refcal_time"),
+        "x_kept_band_count": x_kept_band_count,
+        "y_kept_band_count": y_kept_band_count,
+        "x_kept_channel_count": x_kept_channel_count,
+        "y_kept_channel_count": y_kept_channel_count,
     }
 
 
@@ -3386,11 +4072,12 @@ def _phacal_plot_context(scan: ScanAnalysis, refcal: Optional[ScanAnalysis]) -> 
     band_edges = _band_edges(freq_ghz, band_id, band_values, band_colors, band_indices=band_indices)
     with np.errstate(invalid="ignore"):
         phacal_avg = np.nanmean(np.asarray(scan.corrected_channel_vis[: scan.layout.nsolant, :2], dtype=np.complex128), axis=3)
-        ref_avg = (
+        canonical_ref_avg = (
             np.nanmean(np.asarray(refcal.corrected_channel_vis[: refcal.layout.nsolant, :2], dtype=np.complex128), axis=3)
             if refcal is not None and refcal.raw
             else np.full_like(phacal_avg, np.nan + 0j)
         )
+        ref_avg = np.asarray(scan.raw.get("anchor_ref_avg", canonical_ref_avg), dtype=np.complex128)
     return {
         "freq_ghz": freq_ghz,
         "band_id": band_id,
@@ -3399,6 +4086,7 @@ def _phacal_plot_context(scan: ScanAnalysis, refcal: Optional[ScanAnalysis]) -> 
         "band_indices": band_indices,
         "band_edges": band_edges,
         "phacal_avg": phacal_avg,
+        "canonical_ref_avg": canonical_ref_avg,
         "ref_avg": ref_avg,
     }
 
@@ -3409,7 +4097,17 @@ def _phacal_base_vis(
     pol: int,
     context: Dict[str, Any],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return one phacal antenna/pol complex series and its valid mask."""
+    """Return one phacal antenna/pol complex series and its valid mask.
+
+    If ``state.phacal_applied_inband_correction_ns`` is non-zero for any band
+    on this antenna/pol, the returned visibility is rotated per band by
+    ``exp(-i·2π·(f − f_mid_band)·τ_band)``. The rotation is centered on the
+    band-mean frequency so the band-averaged complex sample is unchanged
+    (per-band mean phase preserved, multiband slope across band centers
+    preserved). Only the within-band slope is removed — i.e. the I-button
+    correction lives on the **data side**, leaving the multiband model line
+    in :func:`_phacal_effective_model_phase` smooth.
+    """
 
     state = ensure_phacal_solve_state(scan)
     ant_i = int(ant)
@@ -3418,27 +4116,98 @@ def _phacal_base_vis(
     ref_vis = np.asarray(context["ref_avg"][ant_i, pol_i], dtype=np.complex128)
     ph_valid = np.isfinite(ph_vis.real) & np.isfinite(ph_vis.imag) & (np.abs(ph_vis) > 0.0)
     ref_valid = np.isfinite(ref_vis.real) & np.isfinite(ref_vis.imag) & (np.abs(ref_vis) > 0.0)
-    if bool(state.fallback_used[ant_i]):
-        return ph_vis, ph_valid
-    valid = ph_valid & ref_valid
-    ratio = np.divide(
-        ph_vis,
-        ref_vis,
-        out=np.full(ph_vis.shape, np.nan + 0j, dtype=np.complex128),
-        where=valid,
-    )
-    return ratio, valid
+    if (
+        ant_i != 0
+        and ant_i < state.ant1_self_reference_used.size
+        and bool(state.ant1_self_reference_used[ant_i])
+    ):
+        ant1_ph_vis = np.asarray(context["phacal_avg"][0, pol_i], dtype=np.complex128)
+        ant1_valid = np.isfinite(ant1_ph_vis.real) & np.isfinite(ant1_ph_vis.imag) & (np.abs(ant1_ph_vis) > 0.0)
+        valid = ph_valid & ant1_valid
+        vis = np.divide(
+            ph_vis,
+            ant1_ph_vis,
+            out=np.full(ph_vis.shape, np.nan + 0j, dtype=np.complex128),
+            where=valid,
+        )
+    elif bool(state.fallback_used[ant_i]):
+        vis = ph_vis
+        valid = ph_valid
+    else:
+        valid = ph_valid & ref_valid
+        vis = np.divide(
+            ph_vis,
+            ref_vis,
+            out=np.full(ph_vis.shape, np.nan + 0j, dtype=np.complex128),
+            where=valid,
+        )
+    vis = _phacal_apply_inband_correction_to_vis(scan, ant_i, pol_i, vis)
+    return vis, valid
+
+
+def _phacal_apply_inband_correction_to_vis(
+    scan: ScanAnalysis,
+    ant_i: int,
+    pol_i: int,
+    vis: np.ndarray,
+) -> np.ndarray:
+    """Rotate ``vis`` per band by the persistent in-band correction (I button)."""
+
+    state = ensure_phacal_solve_state(scan)
+    correction = state.phacal_applied_inband_correction_ns
+    if (
+        scan.delay_solution is None
+        or correction.ndim != 3
+        or correction.shape[0] <= ant_i
+        or correction.shape[1] <= pol_i
+        or correction.shape[2] == 0
+        or not scan.raw
+        or "channel_band" not in scan.raw
+        or "channel_freq_ghz" not in scan.raw
+    ):
+        return vis
+    band_id = np.asarray(scan.raw["channel_band"], dtype=int)
+    band_values = np.asarray(scan.delay_solution.band_values, dtype=int)
+    f = np.asarray(scan.raw["channel_freq_ghz"], dtype=float)
+    if band_values.size != correction.shape[2] or band_id.shape != vis.shape:
+        return vis
+    rotated = vis.copy()
+    any_applied = False
+    for band_idx, band_value in enumerate(band_values):
+        tau = float(correction[ant_i, pol_i, band_idx])
+        if not np.isfinite(tau) or tau == 0.0:
+            continue
+        idx = np.where(band_id == int(band_value))[0]
+        if idx.size == 0:
+            continue
+        f_band = f[idx]
+        finite_f = f_band[np.isfinite(f_band)]
+        if finite_f.size == 0:
+            continue
+        fmid = float(np.mean(finite_f))
+        phasor = np.exp(-1j * 2.0 * np.pi * (f_band - fmid) * tau)
+        rotated[idx] = rotated[idx] * phasor
+        any_applied = True
+    return rotated if any_applied else vis
 
 
 def _phacal_effective_model_phase(scan: ScanAnalysis, ant: int, pol: int, freq_ghz: np.ndarray) -> np.ndarray:
-    """Return one phacal antenna/pol effective wrapped model phase."""
+    """Return one phacal antenna/pol effective unwrapped model phase.
+
+    The model is the multiband linear baseline
+    ``2π·f·(auto_delay + applied_delay) + (auto_offset + applied_offset)``.
+    The per-band in-band correction (the I button) is applied to the data
+    inside :func:`_phacal_base_vis` via centered phasor rotation, so the
+    model line stays smooth and continuous across bands.
+    """
 
     state = ensure_phacal_solve_state(scan)
     ant_i = int(ant)
     pol_i = int(pol)
     delay_ns = float(state.auto_delay_ns[ant_i, pol_i] + state.applied_delay_ns[ant_i, pol_i])
     offset_rad = float(state.auto_offset_rad[ant_i, pol_i] + state.applied_offset_rad[ant_i, pol_i])
-    return 2.0 * np.pi * np.asarray(freq_ghz, dtype=float) * delay_ns + offset_rad
+    f = np.asarray(freq_ghz, dtype=float)
+    return 2.0 * np.pi * f * delay_ns + offset_rad
 
 
 def _phacal_sparse_antennas(scan: ScanAnalysis, antenna_indices: Optional[Sequence[int]] = None) -> list[int]:
@@ -3646,6 +4415,7 @@ def phacal_anchor_phase_payload(
             panels[pol][ant_idx] = {
                 "title": "Ant {0:d}".format(ant_idx + 1),
                 "annotation": None,
+                "kept_ranges": _phacal_kept_ranges_payload(scan, ant_idx, pol),
                 "disabled": bool(disabled_antennas[ant_idx]),
                 "series": series_list,
             }
@@ -3703,6 +4473,7 @@ def phacal_anchor_phase_payload(
         panels[2][ant_idx] = {
             "title": "Ant {0:d}".format(ant_idx + 1),
             "annotation": "Δ(Y-X) RMS={0:.2f} rad".format(xy_rms) if np.isfinite(xy_rms) else None,
+            "kept_ranges": _phacal_kept_ranges_payload(scan, ant_idx, 0),
             "disabled": bool(disabled_antennas[ant_idx]),
             "series": series_list,
         }
@@ -3717,6 +4488,93 @@ def phacal_anchor_phase_payload(
         auto_scale_rows=False,
     )
     payload["legend"] = [{"label": "Fit", "color": "#c43c35", "mode": "line"}]
+    payload["band_edges"] = context["band_edges"]
+    payload["column_controls"] = _shared_column_controls(scan)
+    payload["sparse_antennas"] = sparse_antennas
+    return payload
+
+
+def phacal_phase_compare_payload(
+    scan: Optional[ScanAnalysis],
+    refcal: Optional[ScanAnalysis],
+    antenna_indices: Optional[Sequence[int]] = None,
+) -> Dict[str, Any]:
+    """Serialize read-only phacal QA panels before anchor ratioing.
+
+    :param scan: Active phacal scan.
+    :type scan: ScanAnalysis | None
+    :param refcal: Canonical anchor refcal.
+    :type refcal: ScanAnalysis | None
+    :param antenna_indices: Optional sparse antenna subset.
+    :type antenna_indices: Sequence[int] | None
+    :returns: Read-only pre-ratio phase comparison payload.
+    :rtype: dict[str, Any]
+    """
+
+    if scan is None:
+        return _blank_payload("Select a scan.", "Refcal vs Phacal Phase")
+    if scan.scan_kind != "phacal" or not scan.raw:
+        return _blank_payload("No phacal phase-comparison data are available.", "Refcal vs Phacal Phase")
+    context = _phacal_plot_context(scan, refcal)
+    freq_ghz = np.asarray(context["freq_ghz"], dtype=float)
+    all_x = freq_ghz[np.isfinite(freq_ghz)]
+    sparse_antennas = _phacal_sparse_antennas(scan, antenna_indices)
+    panels = [[None] * scan.layout.nsolant for _ in range(4)]
+    row_sources = [
+        ("canonical_ref_avg", 0, "XX Refcal Phase [rad]"),
+        ("canonical_ref_avg", 1, "YY Refcal Phase [rad]"),
+        ("phacal_avg", 0, "XX Phacal Phase [rad]"),
+        ("phacal_avg", 1, "YY Phacal Phase [rad]"),
+    ]
+    patch_methods = list((scan.scan_meta or {}).get("patch_method", ["none"] * scan.layout.nsolant))
+    donor_patch_used = np.asarray((scan.scan_meta or {}).get("patched_antennas", []), dtype=int)
+    donor_patch_set = {int(value) for value in donor_patch_used.tolist()}
+    for row_idx, (source_key, pol, _label) in enumerate(row_sources):
+        for ant_idx in sparse_antennas:
+            vis = np.asarray(context[source_key][ant_idx, pol], dtype=np.complex128)
+            valid = np.isfinite(vis.real) & np.isfinite(vis.imag) & (np.abs(vis) > 0.0)
+            phase = np.full(freq_ghz.shape, np.nan, dtype=float)
+            phase[valid] = np.angle(vis[valid])
+            series_list = []
+            for band_phase in _band_series_payload(
+                freq_ghz,
+                context["band_id"],
+                context["band_values"],
+                phase,
+                band_indices=context["band_indices"],
+            ):
+                series = _finite_series(band_phase["x"], band_phase["y"])
+                series_list.append(
+                    {
+                        "label": "Phase",
+                        "role": "data",
+                        "band": int(band_phase["band"]),
+                        "mode": "points",
+                        "color": context["band_colors"][int(band_phase["band"])],
+                        "opacity": 0.95,
+                        "x": series["x"],
+                        "y": series["y"],
+                    }
+                )
+            annotation = None
+            if row_idx == 0 and ant_idx in donor_patch_set:
+                annotation = "secondary donor ({0})".format(str(patch_methods[ant_idx]))
+            panels[row_idx][ant_idx] = {
+                "title": "Ant {0:d}".format(ant_idx + 1),
+                "annotation": annotation,
+                "disabled": False,
+                "series": series_list,
+            }
+    payload = _panel_grid_payload(
+        "Refcal vs Phacal Phase",
+        "Frequency [GHz]",
+        [label for _source_key, _pol, label in row_sources],
+        [float(np.nanmin(all_x)), float(np.nanmax(all_x))],
+        _tick_values(all_x, max_ticks=4),
+        [[-3.4, 3.4], [-3.4, 3.4], [-3.4, 3.4], [-3.4, 3.4]],
+        panels,
+        auto_scale_rows=False,
+    )
     payload["sparse_antennas"] = sparse_antennas
     return payload
 
@@ -3789,9 +4647,16 @@ def phacal_multiband_residual_payload(
                             "y": fit_series["y"],
                         }
                     )
+            uses_ant1_ref = (
+                ant_idx < state.ant1_self_reference_used.size
+                and bool(state.ant1_self_reference_used[ant_idx])
+            )
+            annotation = "fit Δdelay={0:.3f} ns".format(float(state.suggested_delay_ns[ant_idx, pol]))
+            if uses_ant1_ref:
+                annotation += " | Ant 1 self-ref"
             panels[pol][ant_idx] = {
                 "title": "Ant {0:d}".format(ant_idx + 1),
-                "annotation": "fit Δdelay={0:.3f} ns".format(float(state.suggested_delay_ns[ant_idx, pol])),
+                "annotation": annotation,
                 "kept_ranges": _phacal_kept_ranges_payload(scan, ant_idx, pol),
                 "disabled": bool(disabled_antennas[ant_idx]),
                 "series": series_list,
