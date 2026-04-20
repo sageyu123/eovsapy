@@ -1453,22 +1453,23 @@
       return margin.top + ((yMax - value) / denom) * plotHeight;
     }
     function xValueFromClientX(event) {
+      // The hitbox <rect> has width == plotWidth in SVG user units, so the
+      // pixel fraction within the rect maps directly to the plot fraction —
+      // no margin offset or full viewBox width is involved.
       const rect = event.currentTarget.getBoundingClientRect();
       if (!rect.width) {
         return null;
       }
-      const svgX = ((event.clientX - rect.left) / rect.width) * width;
-      const clampedX = clamp(svgX, margin.left, margin.left + plotWidth);
-      return xMin + ((clampedX - margin.left) / Math.max(plotWidth, 1)) * (xMax - xMin || 1.0);
+      const fraction = clamp((event.clientX - rect.left) / rect.width, 0, 1);
+      return xMin + fraction * (xMax - xMin || 1.0);
     }
     function yValueFromClientY(event) {
       const rect = event.currentTarget.getBoundingClientRect();
       if (!rect.height) {
         return null;
       }
-      const svgY = ((event.clientY - rect.top) / rect.height) * height;
-      const clampedY = clamp(svgY, margin.top, margin.top + plotHeight);
-      return yMax - ((clampedY - margin.top) / Math.max(plotHeight, 1)) * (yMax - yMin || 1.0);
+      const fraction = clamp((event.clientY - rect.top) / rect.height, 0, 1);
+      return yMax - fraction * (yMax - yMin || 1.0);
     }
     function bandFromXValue(xValue) {
       if (!Number.isFinite(xValue) || !bandEdges.length) {
@@ -2417,7 +2418,7 @@
             props.onApply();
           }}
         >
-          Apply Mask
+          ${props.applyLabel || "Apply Mask"}
         </button>
       </div>
     `;
@@ -4632,7 +4633,7 @@
           },
         });
       });
-      setInteractionMessage("Residual mask staged. Click Apply In-Band (All Ants) to apply.");
+      setInteractionMessage("Residual mask staged. Click Apply In-Band to apply.");
       return true;
     }
 
@@ -4666,7 +4667,7 @@
           },
         });
       });
-      setInteractionMessage("Residual mask reset to the auto mask. Click Apply In-Band (All Ants) to apply.");
+      setInteractionMessage("Residual mask reset to the auto mask. Click Apply In-Band to apply.");
       return true;
     }
 
@@ -4898,10 +4899,13 @@
       if (!Number.isFinite(fa) || !Number.isFinite(fb) || Math.abs(fb - fa) < 1e-6) {
         return;
       }
-      // Wrap the phase delta into (-π, π] before dividing — two clicks that
-      // span a 2π jump would otherwise give a nonsense slope.
-      const dphiRaw = Number(point2.y) - Number(point1.y);
-      const dphi = Math.atan2(Math.sin(dphiRaw), Math.cos(dphiRaw));
+      // Use the raw phase delta: the user is clicking two points on a
+      // visually-continuous line segment (no 2π jump between them), so
+      // y2 − y1 in the wrapped plot coords already equals the true phase
+      // change along the line. Wrapping into (−π, π] here would collapse
+      // steep slopes (|dphi| > π), which shows up on fallback/self-ref
+      // antennas whose base vis retains a large residual delay.
+      const dphi = Number(point2.y) - Number(point1.y);
       const seedDelayNs = dphi / (2.0 * Math.PI * (fb - fa));
       const offsetRaw = Number(point1.y) - 2.0 * Math.PI * fa * seedDelayNs;
       const seedOffsetRad = Math.atan2(Math.sin(offsetRaw), Math.cos(offsetRaw));
@@ -5073,6 +5077,23 @@
           );
         },
         { progressKind: "relative_delay", successMessage: enabled ? "Temporary fallback enabled" : "Temporary fallback cleared" }
+      );
+    }
+
+    function promotePhacalAntennaToRefcal() {
+      const antennaIndex = Math.max(0, parseInt(relativeDelayDraft.ant || "1", 10) - 1);
+      runAction(
+        function () {
+          return postJsonWithOverviewPatch(
+            "/api/refcal/promote-from-phacal",
+            {
+              session_id: sessionId,
+              antenna: antennaIndex,
+            },
+            antennaIndex
+          );
+        },
+        { progressKind: "relative_delay", successMessage: "Promoted antenna to refcal" }
       );
     }
 
@@ -5362,7 +5383,6 @@
         )
       );
     const canApplyResidualFit = !!(state && (state.active_refcal || state.active_phacal));
-    const canApplyResidualMultibandFit = !!(activeRelativeRef && hasRelativeSuggestion);
     const canUndoResidualPanel = !!(state && state.residual_panel_undo_available);
     const workflowGuide = workflowGuideState({
       state: state,
@@ -5827,7 +5847,7 @@
                 `
               : null}
             <div className="delay-actions full">
-              <button type="button" className="btn-outline-red" disabled=${busy} title="Apply the manual multiband delay/offset values typed above to the selected antenna" onClick=${applyRelativeDelayEditorUpdate}>Apply Multiband</button>
+              <button type="button" className=${"btn-outline-red" + (ant1DxyDirty ? " btn-pending-pulse" : "")} disabled=${busy} title=${ant1DxyDirty ? "Pending Manual Δ(Y-X) change — click to commit" : "Apply the manual multiband delay/offset values typed above to the selected antenna"} onClick=${applyRelativeDelayEditorUpdate}>Apply Multiband</button>
               <button type="button" className="btn-outline-red" disabled=${busy || !hasRelativeSuggestion} title="Adopt the auto-suggested multiband delay/offset (suggested → applied) for the selected antenna" onClick=${applyRelativeDelaySuggestion}>Apply Suggestion</button>
               <button
                 type="button"
@@ -6029,6 +6049,20 @@
                 }}
               >
                 ${activePhacalMeta.manual_anchor_fallback_override ? "Clear Temp Fallback" : "Use Temp Fallback"}
+              </button>
+              <button
+                type="button"
+                disabled=${busy || !activePhacalMeta.manual_anchor_fallback_override}
+                title=${activePhacalMeta.manual_anchor_fallback_override
+                  ? (activePhacalMeta.promoted_to_refcal
+                      ? "Re-promote: overwrite refcal anchor with this phacal's data for this antenna. Re-analyze later phacals to pick up."
+                      : "Patch the refcal anchor with this phacal's complex visibility for this antenna. Re-analyze later phacals to pick up.")
+                  : "Enable Use Temp Fallback first"}
+                onClick=${function () {
+                  promotePhacalAntennaToRefcal();
+                }}
+              >
+                ${activePhacalMeta.promoted_to_refcal ? "Re-Promote to Refcal" : "Promote to Refcal"}
               </button>
             </div>
           </div>
@@ -6641,6 +6675,7 @@
                                     onAntennaScopeChange=${setInbandAntennaScope}
                                     onPolScopeChange=${function () {}}
                                     onApply=${applyRelPhaseInbandWindow}
+                                    applyLabel="Commit"
                                   />
                                   <button
                                     type="button"
@@ -6708,21 +6743,10 @@
                                       applyResidualBandThreshold();
                                     }}
                                   >
-                                    Apply Threshold
+                                    Apply
                                   </button>
                                 </div>`
                               : null}
-                            <button
-                              type="button"
-                              className="btn-outline-red"
-                              disabled=${busy || !canApplyResidualMultibandFit}
-                              title="Apply auto-suggested multiband delay to the antenna currently selected in the editor"
-                              onClick=${function () {
-                                applyResidualMultibandFit();
-                              }}
-                            >
-                              Apply Auto Delay (Sel. Ant)
-                            </button>
                             <button
                               type="button"
                               className="btn-outline-fit-blue"
@@ -6732,7 +6756,7 @@
                                 applyResidualInbandFit();
                               }}
                             >
-                              Apply In-Band (All Ants)
+                              Apply In-Band
                             </button>
                             <button
                               type="button"
@@ -6749,12 +6773,12 @@
                               type="button"
                               className="btn-outline-blue"
                               disabled=${busy || !Object.keys(stagedResidualMasks).length}
-                              title="Refresh the residual preview using the staged residual mask"
+                              title="Preview the residual fit using the staged residual mask"
                               onClick=${function () {
                                 previewStagedResidualSection();
                               }}
                             >
-                              Refresh
+                              Preview
                             </button>
                             ${isPhacalScan ? html`<span className="plot-inline-summary">Adv. QA only</span>` : null}
                           `
@@ -6809,7 +6833,7 @@
                               }
                             : null}
                       bandSelectApplyLabel=${section.id === "inband_residual_phase_band"
-                        ? "Apply In-Band (All Ants)"
+                        ? "Apply In-Band"
                         : (isPhacalScan && section.id === "inband_fit" ? "Commit" : "Apply Mask")}
                       onColumnToggle=${(isPhacalScan && section.id === "inband_fit") || section.id === "inband_relative_phase" || section.id === "inband_residual_phase_band"
                         ? function (antennaIndex, flagged) {

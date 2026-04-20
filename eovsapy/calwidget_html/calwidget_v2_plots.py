@@ -3870,6 +3870,7 @@ def relative_delay_update_payloads(
     if scan is not None and scan.scan_kind == "phacal":
         sparse_antennas = None if antenna is None else [antenna]
         return {
+            "phacal_phase_compare": phacal_phase_compare_payload(scan, refcal, antenna_indices=sparse_antennas),
             "inband_fit": phacal_anchor_phase_payload(scan, refcal, antenna_indices=sparse_antennas),
             "inband_relative_phase": phacal_multiband_residual_payload(scan, refcal, antenna_indices=sparse_antennas),
             "inband_residual_phase_band": phacal_per_band_residual_payload(scan, refcal, antenna_indices=sparse_antennas),
@@ -4069,6 +4070,21 @@ def phacal_delay_editor_meta(
         "phacal_undo_available": bool(state.prev_valid[ant_i]),
         "manual_ant_flagged": bool(state.manual_skip_override[ant_i]),
         "manual_anchor_fallback_override": bool(state.manual_anchor_fallback_override[ant_i]),
+        "promoted_to_refcal": (
+            str(ant_i) in ((refcal.scan_meta or {}).get("promoted_antennas") or {})
+            if refcal is not None
+            else False
+        ),
+        "promoted_from_phacal_scan_id": (
+            ((refcal.scan_meta or {}).get("promoted_antennas") or {}).get(str(ant_i), {}).get("from_phacal_scan_id")
+            if refcal is not None
+            else None
+        ),
+        "promoted_from_phacal_timestamp_iso": (
+            ((refcal.scan_meta or {}).get("promoted_antennas") or {}).get(str(ant_i), {}).get("from_phacal_timestamp_iso")
+            if refcal is not None
+            else None
+        ),
         "fallback_in_use": bool(state.fallback_used[ant_i]),
         "donor_patch_used": bool(state.donor_patch_used[ant_i]),
         "donor_patch_method": str((scan.scan_meta or {}).get("patch_method", ["none"] * scan.layout.nsolant)[ant_i]),
@@ -4190,6 +4206,22 @@ def _phacal_effective_model_phase(scan: ScanAnalysis, ant: int, pol: int, freq_g
     delay_ns = float(state.auto_delay_ns[ant_i, pol_i] + state.applied_delay_ns[ant_i, pol_i])
     offset_rad = float(state.auto_offset_rad[ant_i, pol_i] + state.applied_offset_rad[ant_i, pol_i])
     f = np.asarray(freq_ghz, dtype=float)
+    if ant_i == 12 and pol_i == 0:
+        import sys
+        print(
+            "[SLOPEDIAG-render] ant={0} "
+            "auto_delay_ns={1} applied_delay_ns={2} "
+            "auto_offset_rad={3} applied_offset_rad={4} "
+            "effective_delay_ns={5:.6f} effective_offset_rad={6:.6f}".format(
+                ant_i,
+                np.asarray(state.auto_delay_ns[ant_i], dtype=float).tolist(),
+                np.asarray(state.applied_delay_ns[ant_i], dtype=float).tolist(),
+                np.asarray(state.auto_offset_rad[ant_i], dtype=float).tolist(),
+                np.asarray(state.applied_offset_rad[ant_i], dtype=float).tolist(),
+                delay_ns, offset_rad,
+            ),
+            file=sys.stderr, flush=True,
+        )
     return 2.0 * np.pi * f * delay_ns + offset_rad
 
 

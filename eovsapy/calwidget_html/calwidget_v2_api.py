@@ -72,6 +72,7 @@ from .calwidget_v2_plots import (
     phacal_phase_compare_payload,
     phacal_per_band_residual_payload,
     phacal_residual_inband_suggestions,
+    _phacal_effective_model_phase,
     _phacal_residual_panel_meta,
     refresh_model_flag_state,
     refcal_compare_payload,
@@ -194,6 +195,12 @@ class PhacalFallbackRequest(SessionRequest):
 
     antenna: int
     enabled: bool
+
+
+class PhacalPromoteRequest(SessionRequest):
+    """Promote one phacal antenna's complex visibility into the active refcal."""
+
+    antenna: int
 
 
 class DonorPatchCandidateRequest(SessionRequest):
@@ -834,26 +841,67 @@ class WidgetSession:
         seed_delay_ns: float,
         seed_offset_rad: float,
     ) -> None:
-        """Re-solve one phacal antenna with a user-supplied slope as the seed.
+        """Direct-set the phacal effective model line for one antenna from a gesture.
 
         Used by the Anchor-Ref. Phase Shift+click gesture: the two clicked
-        points give ``(seed_delay_ns, seed_offset_rad)``; the solver runs a
-        narrow ±1 ns coherence search centered on the seed for both pols.
-        ``applied_delay_ns`` and per-band I-corrections are untouched so M,
-        Apply Manual, and Reset continue to compose naturally.
+        points define a ``y = 2π·f·seed_delay_ns + seed_offset_rad`` line. The
+        displayed model is ``2π·f·(auto+applied) + (auto_offset+applied_offset)``,
+        so we run the plain solver first to refresh ``auto_*``, then set
+        ``applied_* := target − auto`` per pol so the effective line equals the
+        drawn line exactly. A second plain solve refreshes ``suggested_*`` to
+        the residual between the drawn line and the data, which is what the M
+        button applies on top.
         """
 
         _scan_id, scan, refcal = self._editable_phacal_scan()
         ant = int(max(0, min(int(antenna), scan.layout.nsolant - 1)))
         state = ensure_phacal_solve_state(scan)
         state.snapshot_ant(ant)
-        _solve_phacal_against_anchor(
-            scan,
-            refcal,
-            seed_ant=ant,
-            seed_delay_ns=float(seed_delay_ns),
-            seed_offset_rad=float(seed_offset_rad),
-        )
+        # Refresh auto_delay_ns / auto_offset_rad for this antenna from the
+        # current base visibility before we choose applied_*.
+        _solve_phacal_against_anchor(scan, refcal)
+        target_delay = float(seed_delay_ns)
+        target_offset = float(seed_offset_rad)
+        for pol in range(2):
+            state.applied_delay_ns[ant, pol] = target_delay - float(state.auto_delay_ns[ant, pol])
+            offset_raw = target_offset - float(state.auto_offset_rad[ant, pol])
+            # wrap to (-π, π] matching the convention used by other edit paths
+            state.applied_offset_rad[ant, pol] = float(np.angle(np.exp(1j * offset_raw)))
+        if ant == 12:
+            import sys
+            print(
+                "[SLOPEDIAG-post-set] ant={0} fallback_used={1} ant1_self_ref={2} "
+                "seed_delay_ns={3:.6f} seed_offset_rad={4:.6f} "
+                "auto_delay_ns={5} applied_delay_ns={6} "
+                "auto_offset_rad={7} applied_offset_rad={8}".format(
+                    ant,
+                    bool(state.fallback_used[ant]),
+                    bool(state.ant1_self_reference_used[ant]),
+                    target_delay, target_offset,
+                    np.asarray(state.auto_delay_ns[ant], dtype=float).tolist(),
+                    np.asarray(state.applied_delay_ns[ant], dtype=float).tolist(),
+                    np.asarray(state.auto_offset_rad[ant], dtype=float).tolist(),
+                    np.asarray(state.applied_offset_rad[ant], dtype=float).tolist(),
+                ),
+                file=sys.stderr, flush=True,
+            )
+        # Re-run the plain solve so suggested_* reflects the residual between
+        # the newly-set target line and the data (what M would apply on top).
+        _solve_phacal_against_anchor(scan, refcal)
+        if ant == 12:
+            import sys
+            print(
+                "[SLOPEDIAG-post-solve2] ant={0} "
+                "auto_delay_ns={1} applied_delay_ns={2} "
+                "auto_offset_rad={3} applied_offset_rad={4}".format(
+                    ant,
+                    np.asarray(state.auto_delay_ns[ant], dtype=float).tolist(),
+                    np.asarray(state.applied_delay_ns[ant], dtype=float).tolist(),
+                    np.asarray(state.auto_offset_rad[ant], dtype=float).tolist(),
+                    np.asarray(state.applied_offset_rad[ant], dtype=float).tolist(),
+                ),
+                file=sys.stderr, flush=True,
+            )
         if scan.raw:
             scan.raw.pop("overview_payload_cache", None)
             scan.raw.pop("residual_diagnostics_cache", None)
@@ -935,6 +983,118 @@ class WidgetSession:
             if enabled
             else "Cleared temporary phacal fallback for antenna {0:d}.".format(ant + 1)
         )
+
+    def promote_phacal_antenna_to_refcal(self, antenna: int) -> None:
+        """Copy one antenna's vis/flag/sigma from the selected phacal into the active refcal.
+
+        Stores the original refcal slice plus the source phacal id and timestamp under
+        ``refcal.scan_meta["promoted_antennas"][ant]`` so the promotion is reversible
+        and so downstream UI / save flows can surface that ant N now carries a
+        different effective observation time than the rest of the refcal.
+        """
+
+        scan_id, scan, refcal = self._editable_phacal_scan()
+        ant = int(max(0, min(int(antenna), scan.layout.nsolant - 1)))
+        state = ensure_phacal_solve_state(scan)
+        if not bool(state.manual_anchor_fallback_override[ant]):
+            raise CalWidgetV2Error(
+                "Enable Use Temp Fallback for antenna {0:d} before promoting to refcal.".format(ant + 1)
+            )
+        if not (
+            ant < state.ant1_self_reference_used.size
+            and bool(state.ant1_self_reference_used[ant])
+        ):
+            raise CalWidgetV2Error(
+                "Promotion currently requires Ant 1 self-reference for antenna {0:d}.".format(ant + 1)
+            )
+        if refcal.corrected_band_vis is None:
+            raise CalWidgetV2Error("Active refcal has no band visibilities to patch.")
+        if scan.corrected_band_vis is None:
+            raise CalWidgetV2Error("Selected phacal has no band visibilities to promote.")
+        promoted = dict(refcal.scan_meta.get("promoted_antennas") or {})
+        ant_key = str(ant)
+        if ant_key not in promoted:
+            promoted[ant_key] = {
+                "original_vis_real": np.asarray(refcal.corrected_band_vis[ant, :2], dtype=float).real.tolist(),
+                "original_vis_imag": np.asarray(refcal.corrected_band_vis[ant, :2], dtype=np.complex128).imag.tolist(),
+                "original_flag": np.asarray(refcal.flags[ant, :2], dtype=int).tolist(),
+                "original_sigma": np.asarray(refcal.sigma[ant, :2], dtype=float).tolist(),
+            }
+        promoted[ant_key].update(
+            {
+                "from_phacal_scan_id": int(scan_id),
+                "from_phacal_timestamp_iso": scan.timestamp.iso[:19],
+                "from_phacal_t_bg_iso": scan.t_bg.iso[:19],
+                "from_phacal_t_ed_iso": scan.t_ed.iso[:19],
+                "promoted_at_iso": Time.now().iso[:19],
+            }
+        )
+        # Bake the user's corrections into the promoted vis. Display base vis for
+        # this fallback+self-ref ant is ph_ant / ph_ant1, so the effective model
+        # phase the user sees is `ant13_model`. To write an absolute ant13 phase
+        # into refcal such that downstream consumers reconstruct the corrected
+        # display, we compose: phase(refcal_ant1) + ant1_phacal_model +
+        # ant13_effective_model. Amplitude preserved from the phacal scan.
+        fghz = np.asarray(scan.fghz_band, dtype=float)
+        for pol in range(2):
+            phase_refcal_ant1 = np.angle(
+                np.asarray(refcal.corrected_band_vis[0, pol], dtype=np.complex128)
+            )
+            phase_ant1_model = _phacal_effective_model_phase(scan, 1, pol, fghz)
+            phase_ant13_model = _phacal_effective_model_phase(scan, ant, pol, fghz)
+            target_phase = phase_refcal_ant1 + phase_ant1_model + phase_ant13_model
+            scan_vis = np.asarray(scan.corrected_band_vis[ant, pol], dtype=np.complex128)
+            refcal.corrected_band_vis[ant, pol] = np.abs(scan_vis) * np.exp(1j * target_phase)
+        # Also bake into the fine-channel grid. The Refcal vs Phacal Phase panel
+        # (and `_phacal_plot_context`) read refcal phases from a time-mean of
+        # `refcal.corrected_channel_vis`, which is an independent array from
+        # `corrected_band_vis` — without this write the panel renders the
+        # pre-promotion phase. Amplitude preserved from the refcal's original
+        # ant slice so NaN/invalid channel masks carry over unchanged.
+        if (
+            refcal.corrected_channel_vis is not None
+            and refcal.raw
+            and "channel_freq_ghz" in refcal.raw
+            and refcal.corrected_channel_vis.size
+        ):
+            channel_fghz = np.asarray(refcal.raw["channel_freq_ghz"], dtype=float)
+            for pol in range(2):
+                ref_ant1_chan = np.asarray(
+                    refcal.corrected_channel_vis[0, pol, :, :], dtype=np.complex128
+                )
+                phase_refcal_ant1_chan = np.angle(ref_ant1_chan)
+                phase_ant1_model_chan = _phacal_effective_model_phase(scan, 1, pol, channel_fghz)
+                phase_ant13_model_chan = _phacal_effective_model_phase(scan, ant, pol, channel_fghz)
+                model_sum = (phase_ant1_model_chan + phase_ant13_model_chan)[:, None]
+                target_phase_chan = phase_refcal_ant1_chan + model_sum
+                orig_ant_chan = np.asarray(
+                    refcal.corrected_channel_vis[ant, pol, :, :], dtype=np.complex128
+                )
+                refcal.corrected_channel_vis[ant, pol, :, :] = (
+                    np.abs(orig_ant_chan) * np.exp(1j * target_phase_chan)
+                )
+        refcal.flags[ant, :2] = scan.flags[ant, :2]
+        refcal.sigma[ant, :2] = scan.sigma[ant, :2]
+        refcal.scan_meta["promoted_antennas"] = promoted
+        refcal.saved_to_sql = False
+        if refcal.raw:
+            refcal.raw.pop("overview_payload_cache", None)
+            refcal.raw.pop("residual_diagnostics_cache", None)
+            refcal.raw.pop("preview_solve_cache", None)
+        self.selected_ant = ant
+        self.status_message = (
+            "Promoted Ant {0:d} from phacal {1:d} into refcal {2:d}. "
+            "Re-analyze later phacals to pick up the patched anchor."
+        ).format(ant + 1, int(scan_id), int(refcal.scan_id))
+        self._invalidate_dependent_phacals(int(refcal.scan_id))
+        # The source phacal is also a dependent of this refcal and was just
+        # dropped by the invalidation above. Restore its analysis entry and
+        # re-solve against the patched refcal so the user's non-compare panels
+        # (Anchor-Ref. Phase, Per-Band Res., residual QA) stay populated
+        # instead of rendering "No phacal ... data are available". Applied
+        # delay/offset state is preserved across the solve.
+        self.analyses[int(scan_id)] = scan
+        refresh_phacal_solution(scan, refcal)
 
     def _preview_scan_pair(self) -> tuple[ScanAnalysis, Optional[ScanAnalysis]]:
         """Return deep-copied scan/refcal objects for preview-only section recompute."""
@@ -2078,6 +2238,91 @@ class WidgetSession:
         self.status_message = "Saved daily v2/model NPZ bundle to {0}.".format(outpath)
         return str(outpath)
 
+    def save_calibeovsa_npz(self) -> str:
+        """Save active refcal + analyzed phacals as a calibeovsa-ready NPZ bundle.
+
+        The bundle stores SQL-equivalent fields so ``task_calibeovsa`` can
+        consume it via a ``cal_npz=`` kwarg, bypassing the SQL database. Promoted
+        antenna metadata is included so downstream tooling can audit which
+        antenna entries carry a different effective observation time.
+        """
+
+        if self.day is None:
+            raise CalWidgetV2Error("Load a day before saving a calibeovsa NPZ bundle.")
+        if self.ref_scan_id is None:
+            raise CalWidgetV2Error("Select a refcal before saving a calibeovsa NPZ bundle.")
+        ref_id = int(self.ref_scan_id)
+        refcal = self._ensure_refcal_analysis(ref_id)
+        ref_payload = refcal.to_refcal_sql()
+
+        phacal_ids: List[int] = []
+        phacal_payloads: Dict[int, Dict[str, Any]] = {}
+        for scan_id, analysis in self.analyses.items():
+            if analysis.scan_kind != "phacal":
+                continue
+            if analysis.mbd is None or analysis.mbd_flag is None or analysis.offsets is None:
+                continue
+            payload = analysis.to_phacal_sql()
+            phacal_payloads[int(scan_id)] = payload
+            phacal_ids.append(int(scan_id))
+        phacal_ids.sort()
+
+        outpath = SIDECAR_DIR / "{0}_calwidget_v2_calibeovsa.npz".format(self.day["date"].replace("-", ""))
+        outpath.parent.mkdir(parents=True, exist_ok=True)
+
+        promoted_meta = (refcal.scan_meta or {}).get("promoted_antennas") or {}
+        archive: Dict[str, Any] = {
+            "schema_version": np.asarray(1, dtype=np.int32),
+            "kind": np.asarray("calibeovsa_v1"),
+            "date": np.asarray(self.day["date"]),
+            "saved_at_iso": np.asarray(Time.now().iso[:19]),
+            "refcal__scan_id": np.asarray(int(ref_id), dtype=np.int32),
+            "refcal__timestamp_lv": np.asarray(float(ref_payload["timestamp"].lv), dtype=np.float64),
+            "refcal__t_bg_lv": np.asarray(float(ref_payload["t_bg"].lv), dtype=np.float64),
+            "refcal__t_ed_lv": np.asarray(float(ref_payload["t_ed"].lv), dtype=np.float64),
+            "refcal__vis_real": np.asarray(np.real(ref_payload["vis"]), dtype=np.float64),
+            "refcal__vis_imag": np.asarray(np.imag(ref_payload["vis"]), dtype=np.float64),
+            "refcal__flag": np.asarray(ref_payload["flag"], dtype=np.int32),
+            "refcal__sigma": np.asarray(ref_payload["sigma"], dtype=np.float64),
+            "refcal__fghz": np.asarray(ref_payload["fghz"], dtype=np.float64),
+            "refcal__promoted_antennas_json": np.asarray(
+                json.dumps(promoted_meta, separators=(",", ":"))
+            ),
+            "phacal_scan_ids": np.asarray(phacal_ids, dtype=np.int32),
+        }
+
+        for scan_id in phacal_ids:
+            phacal_scan = self.analyses[scan_id]
+            payload = phacal_payloads[scan_id]
+            inner = payload["phacal"]
+            t_ref_lv: float
+            applied_ref_id = phacal_scan.applied_ref_id if phacal_scan.applied_ref_id is not None else ref_id
+            try:
+                anchor = self._ensure_refcal_analysis(int(applied_ref_id))
+                t_ref_lv = float(anchor.timestamp.lv)
+            except CalWidgetV2Error:
+                t_ref_lv = float(refcal.timestamp.lv)
+            prefix = "phacal_{0}".format(scan_id)
+            archive[prefix + "__scan_id"] = np.asarray(int(scan_id), dtype=np.int32)
+            archive[prefix + "__t_pha_lv"] = np.asarray(float(payload["t_pha"].lv), dtype=np.float64)
+            archive[prefix + "__t_bg_lv"] = np.asarray(float(payload["t_bg"].lv), dtype=np.float64)
+            archive[prefix + "__t_ed_lv"] = np.asarray(float(payload["t_ed"].lv), dtype=np.float64)
+            archive[prefix + "__t_ref_lv"] = np.asarray(t_ref_lv, dtype=np.float64)
+            archive[prefix + "__pslope"] = np.asarray(payload["pslope"], dtype=np.float64)
+            archive[prefix + "__poff"] = np.asarray(payload["poff"], dtype=np.float64)
+            archive[prefix + "__flag"] = np.asarray(payload["flag"], dtype=np.int32)
+            archive[prefix + "__phacal_pha"] = np.asarray(inner["pha"], dtype=np.float64)
+            archive[prefix + "__phacal_amp"] = np.asarray(inner["amp"], dtype=np.float64)
+            archive[prefix + "__phacal_flag"] = np.asarray(inner["flag"], dtype=np.int32)
+            archive[prefix + "__phacal_sigma"] = np.asarray(inner["sigma"], dtype=np.float64)
+            archive[prefix + "__phacal_fghz"] = np.asarray(inner["fghz"], dtype=np.float64)
+            archive[prefix + "__phacal_t_bg_lv"] = np.asarray(float(inner["t_bg"].lv), dtype=np.float64)
+            archive[prefix + "__phacal_t_ed_lv"] = np.asarray(float(inner["t_ed"].lv), dtype=np.float64)
+
+        np.savez_compressed(str(outpath), **archive)
+        self.status_message = "Saved calibeovsa NPZ bundle to {0}.".format(outpath)
+        return str(outpath)
+
     def state(self) -> Dict:
         """Serialize session state for the frontend."""
 
@@ -2443,6 +2688,22 @@ def build_app() -> FastAPI:
         session = _get_session(payload.session_id)
         try:
             session.set_phacal_anchor_fallback(payload.antenna, payload.enabled)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        scan, refcal = _overview_context(session)
+        return {
+            "state": session.state(),
+            "overview_updates": relative_delay_update_payloads(scan, antenna=payload.antenna, refcal=refcal),
+            "updated_antenna": int(max(0, payload.antenna)),
+        }
+
+    @app.post("/api/refcal/promote-from-phacal")
+    def promote_phacal_antenna_to_refcal(payload: PhacalPromoteRequest) -> Dict:
+        """Patch the active refcal's antenna entry with the selected phacal's vis."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.promote_phacal_antenna_to_refcal(payload.antenna)
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         scan, refcal = _overview_context(session)
@@ -3038,6 +3299,17 @@ def build_app() -> FastAPI:
         session = _get_session(payload.session_id)
         try:
             outpath = session.save_npz_bundle(payload.scan_ids)
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"state": session.state(), "path": outpath}
+
+    @app.post("/api/save/calibeovsa-npz")
+    def save_calibeovsa_npz(payload: SessionRequest) -> Dict:
+        """Write the active refcal + analyzed phacals as a calibeovsa-ready NPZ."""
+
+        session = _get_session(payload.session_id)
+        try:
+            outpath = session.save_calibeovsa_npz()
         except CalWidgetV2Error as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         return {"state": session.state(), "path": outpath}
