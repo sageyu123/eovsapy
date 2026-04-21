@@ -4,19 +4,28 @@
   const useRef = React.useRef;
   const useState = React.useState;
 
+  // Toggle to re-enable the legacy Sum Amplitude / Sum Phase (Band-Averaged
+  // Amplitude & Band-Averaged Phase Difference) overview panels. Off by default
+  // because these are redundant with the Inband-Fit / Refcal-vs-Phacal panels
+  // below; flip to `true` in-source if you need them back.
+  const SHOW_SUM_OVERVIEW_PANELS = false;
   const OVERVIEW_SECTIONS = [
-    {
-      id: "sum_amp",
-      label: "Sum X & Y Amplitude",
-      showLegend: false,
-      panelHeight: 116,
-    },
-    {
-      id: "sum_pha",
-      label: "Sum X & Y Phase [rad]",
-      showLegend: false,
-      panelHeight: 116,
-    },
+    ...(SHOW_SUM_OVERVIEW_PANELS
+      ? [
+          {
+            id: "sum_amp",
+            label: "Sum X & Y Amplitude",
+            showLegend: false,
+            panelHeight: 116,
+          },
+          {
+            id: "sum_pha",
+            label: "Sum X & Y Phase [rad]",
+            showLegend: false,
+            panelHeight: 116,
+          },
+        ]
+      : []),
     {
       id: "phacal_phase_compare",
       label: "Refcal vs Phacal Phase",
@@ -171,15 +180,15 @@
         "Updating browser state",
       ],
     },
-    save_npz: {
-      label: "Saving NPZ",
-      success: "Daily NPZ bundle saved",
+    save_calibeovsa_npz: {
+      label: "Saving calibeovsa NPZ",
+      success: "calibeovsa NPZ bundle saved",
       paceMs: 7000,
       waitForPlots: false,
       stages: [
-        "Collecting tuned scan products",
-        "Building model-phase export arrays",
-        "Writing daily bundle under /common/webplots/phasecal",
+        "Collecting active refcal and analyzed phacals",
+        "Building SQL-equivalent export arrays",
+        "Writing calibeovsa bundle under /common/webplots/phasecal",
         "Updating browser state",
       ],
     },
@@ -454,7 +463,7 @@
           "If Refcal phase is bad but Phacal phase is good for one antenna, use Temp Fallback for that antenna only.",
           "Anchor-Ref. Phase is the primary solve surface. Mask bad frequencies there, Preview, then Commit when the slope looks right.",
           "Use the residual panels only after the multiband solve looks reasonable. They are advanced QA, not the first solve step.",
-          "When the phacal solve is acceptable, Save SQL. Save NPZ whenever you want a bundle of the current derived products.",
+          "When the phacal solve is acceptable, Save SQL. Save calibeovsa NPZ whenever you want a SQL-equivalent bundle of the active refcal and analyzed phacals.",
         ],
         note: activePhacal.secondary_anchor_scan_id
           ? "Secondary anchor is active as donor/drift support only. The canonical anchor remains the model source."
@@ -1738,12 +1747,14 @@
       }
       setShowHint(false);
     }
+    const isSelectedColumn = props.isSelectedColumn === true;
     return html`
       <div
         ref=${containerRef}
         className=${"mini-plot-shell"
           + (interactionMode ? " interactive" : props.onDoubleClick ? " interactive" : "")
-          + (panel.disabled ? " disabled" : "")}
+          + (panel.disabled ? " disabled" : "")
+          + (isSelectedColumn ? " selected-column" : "")}
         style=${{ "--mini-panel-width": String(width), "--mini-panel-height": String(height) }}
         onDoubleClick=${function () {
           if (interactionMode === "zoom" && props.onResetViewport) {
@@ -1852,6 +1863,18 @@
                 dominantBaseline="hanging"
                 className="mini-panel-title"
               >${panel.title}</text>`
+            : null}
+          ${showTitle && panel.header_badge
+            ? html`<g className="mini-panel-badge-group">
+                <title>${panel.header_badge.tooltip}</title>
+                <text
+                  x=${width - margin.right - 2}
+                  y="1"
+                  textAnchor="end"
+                  dominantBaseline="hanging"
+                  className="mini-panel-badge"
+                >${panel.header_badge.symbol}</text>
+              </g>`
             : null}
           ${panel.annotation
             ? html`<text x=${margin.left + 4} y=${margin.top + 12} className="mini-annotation">${panel.annotation}</text>`
@@ -2038,7 +2061,9 @@
               ? html`
                   <div className="panel-grid-column-controls">
                     <div className="panel-grid-panels">
-                      ${data.column_controls.map(function (control) {
+                      ${data.column_controls.map(function (control, idx) {
+                        const firstRow = (data.panels && data.panels[0]) || [];
+                        const badge = (firstRow[idx] && firstRow[idx].header_badge) || null;
                         return html`
                           <div
                             key=${"col-control-" + control.antenna}
@@ -2058,6 +2083,12 @@
                                   : null}
                               />
                               <span className="panel-grid-column-control-text">${control.label}</span>
+                              ${badge
+                                ? html`<span
+                                    className="panel-grid-column-control-badge"
+                                    title=${badge.tooltip}
+                                  >${badge.symbol}</span>`
+                                : null}
                             </div>
                             ${props.columnActionRenderer ? props.columnActionRenderer(control) : null}
                           </div>
@@ -2075,10 +2106,16 @@
                     <div className="panel-grid-panels">
                       ${row.map(function (panel, panelIdx) {
                         const displayPanel = props.panelOverride ? props.panelOverride(rowIdx, panelIdx, panel) : panel;
+                        const isSelectedColumn =
+                          props.selectedAnt !== null
+                          && props.selectedAnt !== undefined
+                          && Number(props.selectedAnt) === Number(panelIdx);
+                        const hasColumnHeader = !!(data.column_controls && data.column_controls.length);
                         return html`<${MiniPanelPlot}
                           key=${"panel-" + rowIdx + "-" + panelIdx}
                           panel=${displayPanel}
-                          showTitle=${rowIdx === 0}
+                          isSelectedColumn=${isSelectedColumn}
+                          showTitle=${rowIdx === 0 && !hasColumnHeader}
                           xLimits=${rowXLimits(rowIdx)}
                           xTicks=${data.x_ticks}
                           yLimits=${data.y_limits[rowIdx]}
@@ -5322,7 +5359,20 @@
     }
 
     const canAnalyze = sessionId && selectedScanId() !== null;
-    const canRefcal = canAnalyze;
+    const selectedScanEntryForGate =
+      state && state.scans
+        ? state.scans.find(function (scan) {
+            return scan.scan_id === selectedScanId();
+          }) || null
+        : null;
+    const selectedIsAnalyzedOrSaved =
+      !!selectedScanEntryForGate &&
+      (!!selectedScanEntryForGate.analyzed ||
+        selectedScanEntryForGate.status === "refcal" ||
+        selectedScanEntryForGate.status === "phacal");
+    const selectedIsActiveRefcalGate =
+      state && state.ref_scan_id !== null && selectedScanId() === state.ref_scan_id;
+    const canRefcal = canAnalyze && (selectedIsAnalyzedOrSaved || selectedIsActiveRefcalGate);
     const canPhacal = canAnalyze && state && state.ref_scan_id !== null;
     const checkedScans = state && state.scans
       ? state.scans.filter(function (scan) {
@@ -6264,7 +6314,12 @@
                   className="btn-dark-fill"
                   disabled=${!canRefcal || busy}
                   onClick=${function () {
+                    const selectedIsActiveRefcal =
+                      state && state.ref_scan_id !== null && selectedScanId() === state.ref_scan_id;
                     runAction(function () {
+                      if (selectedIsActiveRefcal) {
+                        return postJson("/api/refcal/clear", { session_id: sessionId });
+                      }
                       return isPhacalScan
                         ? postJsonWithOverviewRefresh(
                             "/api/refcal/select",
@@ -6278,7 +6333,9 @@
                     });
                   }}
                 >
-                  Set Refcal
+                  ${state && state.ref_scan_id !== null && selectedScanId() === state.ref_scan_id
+                    ? "Unset Refcal"
+                    : "Set Refcal"}
                 </button>
                 <button
                   type="button"
@@ -6357,10 +6414,10 @@
                   onClick=${function () {
                     runAction(
                       function () {
-                        return jsonFetch("/api/save/npz", {
+                        return jsonFetch("/api/save/calibeovsa-npz", {
                           method: "POST",
                           headers: { "Content-Type": "application/json" },
-                          body: JSON.stringify({ session_id: sessionId, scan_ids: checkedScanIds }),
+                          body: JSON.stringify({ session_id: sessionId }),
                         }).then(function (next) {
                           const nextState = next && next.state ? next.state : next;
                           setState(nextState);
@@ -6368,11 +6425,11 @@
                           return next;
                         });
                       },
-                      { progressKind: "save_npz", successMessage: "Daily NPZ bundle saved" }
+                      { progressKind: "save_calibeovsa_npz", successMessage: "calibeovsa NPZ bundle saved" }
                     );
                   }}
                 >
-                  Save NPZ
+                  Save calibeovsa NPZ
                 </button>
               </div>
 
@@ -6789,6 +6846,7 @@
                       hideLegend=${true}
                       busy=${busy}
                       panelHeight=${section.panelHeight}
+                      selectedAnt=${state ? state.selected_ant : null}
                       interactionMode=${section.id === "inband_residual_delay_band" ? "zoom" : null}
                       panelOverride=${section.id === "inband_relative_phase"
                         ? function (rowIdx, panelIdx, panel) {

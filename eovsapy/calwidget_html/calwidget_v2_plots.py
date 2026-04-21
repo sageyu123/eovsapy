@@ -1835,19 +1835,6 @@ def _fit_joint_xy_relative_model(
         base_model_y_phase = _eval_shared_phase_model(freq_ghz, fit_pol_y) + auto_dxy_total
         model_x_phase = base_model_x_phase + 2.0 * np.pi * (freq_ghz - pivot_ghz) * float(manual_delay_ns[0])
         model_y_phase = base_model_y_phase + 2.0 * np.pi * (freq_ghz - pivot_ghz) * float(manual_delay_ns[1])
-        # TEMP DIAGNOSTIC (ant 6, poly2/poly3) — remove after root cause identified.
-        if ant == 5:
-            import sys
-            print(
-                "[POLY2DIAG-fit] ant={ant} kind={kind} pivot={piv:.6f} auto_dxy_total={dxy:.6f} "
-                "manual_delay_ns={mdn} coeffs_x={cx} coeffs_y={cy}".format(
-                    ant=ant, kind=fit_kind, piv=pivot_ghz, dxy=float(auto_dxy_total),
-                    mdn=np.asarray(manual_delay_ns, dtype=float).tolist(),
-                    cx=np.asarray(joint["coeffs_x"], dtype=float).tolist(),
-                    cy=np.asarray(joint["coeffs_y"], dtype=float).tolist(),
-                ),
-                file=sys.stderr, flush=True,
-            )
     else:
         valid_any = np.isfinite(freq_ghz)
         pivot_ghz = float(np.nanmean(freq_ghz[valid_any])) if np.any(valid_any) else 0.0
@@ -2164,21 +2151,6 @@ def _compute_inband_diagnostic_antenna(scan: ScanAnalysis, ant: int, context: di
     raw_avg = np.asarray(context["raw_avg"], dtype=np.complex128)
     corrected_avg = np.asarray(context["corrected_avg"], dtype=np.complex128)
 
-    # TEMP DIAGNOSTIC (ant 6) — remove after root cause identified.
-    if ant_i == 5:
-        import sys
-        ds = scan.delay_solution
-        print(
-            "[POLY2DIAG-state] ant={ant} fit_kind={kind} active_ns={act} relative_ns={rel} "
-            "ant1_manual_dxy_corr_rad={dxy}".format(
-                ant=ant_i,
-                kind=ds.get_multiband_fit_kind(ant_i),
-                act=np.asarray(ds.active_ns[ant_i], dtype=float).tolist(),
-                rel=np.asarray(ds.relative_ns[ant_i], dtype=float).tolist(),
-                dxy=float(getattr(ds, "ant1_manual_dxy_corr_rad", 0.0)),
-            ),
-            file=sys.stderr, flush=True,
-        )
     joint_fit = _fit_joint_xy_relative_model(
         ant_i,
         band_id,
@@ -2423,6 +2395,79 @@ def _inband_diagnostic_for_antenna(
     return payload
 
 
+def refcal_smooth_model_at_band_centers(scan: ScanAnalysis) -> np.ndarray:
+    """Per-(ant, pol, band) smooth-model phase on the refcal SQL band grid.
+
+    Samples the widget's shared analytic phase fit (Chebyshev for Ant 1,
+    linear/poly2/poly3 for Ant 2+) at each band center. Ant 2+ fits the
+    ``vis_ant / vis_ref`` ratio, so the reference's absolute model is added
+    back in so every entry is an **absolute** phase directly comparable to
+    the NPZ-persisted band-averaged vis phase.
+
+    :param scan: Analyzed refcal scan whose smooth model should be sampled.
+    :type scan: ScanAnalysis
+    :returns: Array of shape ``(nant, 2, maxnbd)``. Entries are NaN where
+        the smooth model is not defined (missing band, no masked-in
+        channels in the band, or non-solar antennas).
+    :rtype: numpy.ndarray
+    """
+
+    nant = int(scan.layout.nant)
+    nsolant = int(scan.layout.nsolant)
+    maxnbd = int(scan.layout.maxnbd)
+    out = np.full((nant, 2, maxnbd), np.nan, dtype=float)
+    if scan.delay_solution is None or not scan.raw:
+        return out
+    context = _inband_diag_context(scan)
+    band_values = np.asarray(context["band_values"], dtype=int)
+    band_indices = context["band_indices"]
+
+    ref_payload = _inband_diagnostic_for_antenna(scan, 0, context=context)
+    ref_model = [
+        np.asarray(ref_payload["panels"][pol]["relative_model_phase"], dtype=float)
+        for pol in range(2)
+    ]
+    ref_mask = [
+        np.asarray(ref_payload["panels"][pol]["relative_model_mask"], dtype=bool)
+        for pol in range(2)
+    ]
+
+    def _band_circ_mean(model_phase: np.ndarray, mask: np.ndarray, idx: np.ndarray) -> float:
+        m = mask[idx] & np.isfinite(model_phase[idx])
+        if not np.any(m):
+            return np.nan
+        z = np.sum(np.exp(1j * model_phase[idx][m]))
+        return float(np.angle(z))
+
+    for ant in range(nsolant):
+        if ant == 0:
+            panels = ref_payload["panels"]
+        else:
+            payload = _inband_diagnostic_for_antenna(scan, ant, context=context)
+            panels = payload["panels"]
+        for pol in range(2):
+            rel_model = np.asarray(panels[pol]["relative_model_phase"], dtype=float)
+            rel_mask = np.asarray(panels[pol]["relative_model_mask"], dtype=bool)
+            if ant == 0:
+                abs_model = rel_model
+                abs_mask = rel_mask
+            else:
+                # Relative fit (ant/ref) + reference's absolute fit = absolute
+                # smooth phase at each channel. Mask only where BOTH fits
+                # define a value, so the wrapped sum is meaningful.
+                abs_model = rel_model + ref_model[pol]
+                abs_mask = rel_mask & ref_mask[pol]
+            for band_value in band_values:
+                b = int(band_value) - 1
+                if not (0 <= b < maxnbd):
+                    continue
+                idx = band_indices.get(int(band_value))
+                if idx is None or idx.size == 0:
+                    continue
+                out[ant, pol, b] = _band_circ_mean(abs_model, abs_mask, idx)
+    return out
+
+
 def _inband_cache_key(scan: ScanAnalysis, use_lobe: bool = False, refcal: Optional[ScanAnalysis] = None) -> str:
     """Build a compact cache key for overview payloads.
 
@@ -2608,6 +2653,7 @@ def sum_amp_payload(scan: Optional[ScanAnalysis]) -> Dict[str, Any]:
         panels,
     )
     payload["legend"] = []
+    payload["column_controls"] = _shared_column_controls(scan)
     return payload
 
 
@@ -2649,6 +2695,7 @@ def sum_phase_payload(scan: Optional[ScanAnalysis], use_lobe: bool = False) -> D
         auto_scale_rows=True,
     )
     payload["legend"] = []
+    payload["column_controls"] = _shared_column_controls(scan)
     return payload
 
 
@@ -2722,6 +2769,7 @@ def inband_fit_payload(scan: Optional[ScanAnalysis]) -> Dict[str, Any]:
     )
     payload["legend"] = [{"label": "Fit", "color": "#c43c35", "mode": "line"}]
     payload["band_edges"] = diag["band_edges"]
+    payload["column_controls"] = _shared_column_controls(scan)
     return payload
 
 
@@ -2793,6 +2841,7 @@ def inband_applied_payload(scan: Optional[ScanAnalysis], refcal: Optional[ScanAn
     )
     payload["legend"] = []
     payload["band_edges"] = diag["band_edges"]
+    payload["column_controls"] = _shared_column_controls(scan)
     return payload
 
 
@@ -3085,6 +3134,7 @@ def inband_residual_delay_band_payload(scan: Optional[ScanAnalysis]) -> Dict[str
     )
     payload["legend"] = [{"label": "All-band residual delay", "color": "#c43c35", "mode": "line"}]
     payload["band_edges"] = diag["band_edges"]
+    payload["column_controls"] = _shared_column_controls(scan)
     return payload
 
 
@@ -4206,22 +4256,6 @@ def _phacal_effective_model_phase(scan: ScanAnalysis, ant: int, pol: int, freq_g
     delay_ns = float(state.auto_delay_ns[ant_i, pol_i] + state.applied_delay_ns[ant_i, pol_i])
     offset_rad = float(state.auto_offset_rad[ant_i, pol_i] + state.applied_offset_rad[ant_i, pol_i])
     f = np.asarray(freq_ghz, dtype=float)
-    if ant_i == 12 and pol_i == 0:
-        import sys
-        print(
-            "[SLOPEDIAG-render] ant={0} "
-            "auto_delay_ns={1} applied_delay_ns={2} "
-            "auto_offset_rad={3} applied_offset_rad={4} "
-            "effective_delay_ns={5:.6f} effective_offset_rad={6:.6f}".format(
-                ant_i,
-                np.asarray(state.auto_delay_ns[ant_i], dtype=float).tolist(),
-                np.asarray(state.applied_delay_ns[ant_i], dtype=float).tolist(),
-                np.asarray(state.auto_offset_rad[ant_i], dtype=float).tolist(),
-                np.asarray(state.applied_offset_rad[ant_i], dtype=float).tolist(),
-                delay_ns, offset_rad,
-            ),
-            file=sys.stderr, flush=True,
-        )
     return 2.0 * np.pi * f * delay_ns + offset_rad
 
 
@@ -4377,10 +4411,22 @@ def phacal_anchor_phase_payload(
     context = _phacal_plot_context(scan, refcal)
     disabled_antennas = _effective_disabled_antennas(scan)
     manual_disabled_antennas = _manual_disabled_antennas(scan)
+    state = ensure_phacal_solve_state(scan)
     freq_ghz = np.asarray(context["freq_ghz"], dtype=float)
     all_x = freq_ghz[np.isfinite(freq_ghz)]
     sparse_antennas = _phacal_sparse_antennas(scan, antenna_indices)
     panels = [[None] * scan.layout.nsolant for _ in range(3)]
+
+    def _fallback_badge(ant_i: int) -> Optional[Dict[str, str]]:
+        if ant_i >= state.fallback_used.size or not bool(state.fallback_used[ant_i]):
+            return None
+        parts = ["temp fallback"]
+        if ant_i < state.ant1_self_reference_used.size and bool(state.ant1_self_reference_used[ant_i]):
+            parts.append("Ant 1 self-ref")
+        if ant_i < state.manual_anchor_fallback_override.size and bool(state.manual_anchor_fallback_override[ant_i]):
+            parts.append("manual override")
+        return {"symbol": "⚑", "tooltip": " · ".join(parts)}
+
     for pol in range(2):
         for ant_idx in sparse_antennas:
             vis, valid = _phacal_base_vis(scan, ant_idx, pol, context)
@@ -4433,6 +4479,7 @@ def phacal_anchor_phase_payload(
                 "kept_ranges": _phacal_kept_ranges_payload(scan, ant_idx, pol),
                 "disabled": bool(disabled_antennas[ant_idx]),
                 "series": series_list,
+                "header_badge": _fallback_badge(ant_idx),
             }
     for ant_idx in sparse_antennas:
         vis_x, valid_x = _phacal_base_vis(scan, ant_idx, 0, context)
@@ -4491,6 +4538,7 @@ def phacal_anchor_phase_payload(
             "kept_ranges": _phacal_kept_ranges_payload(scan, ant_idx, 0),
             "disabled": bool(disabled_antennas[ant_idx]),
             "series": series_list,
+            "header_badge": _fallback_badge(ant_idx),
         }
     payload = _panel_grid_payload(
         "Anchor-Referenced Phase",
@@ -4544,6 +4592,18 @@ def phacal_phase_compare_payload(
     patch_methods = list((scan.scan_meta or {}).get("patch_method", ["none"] * scan.layout.nsolant))
     donor_patch_used = np.asarray((scan.scan_meta or {}).get("patched_antennas", []), dtype=int)
     donor_patch_set = {int(value) for value in donor_patch_used.tolist()}
+    promoted_meta = (refcal.scan_meta or {}).get("promoted_antennas") if refcal is not None else None
+    promoted_meta = promoted_meta or {}
+
+    def _promoted_badge(ant_i: int) -> Optional[Dict[str, str]]:
+        entry = promoted_meta.get(str(ant_i))
+        if not entry:
+            return None
+        iso = entry.get("from_phacal_timestamp_iso") or ""
+        hhmmss = iso[11:19] if len(iso) >= 19 else iso
+        tooltip = "promoted from phacal {0}".format(hhmmss) if hhmmss else "promoted from phacal"
+        return {"symbol": "↑", "tooltip": tooltip}
+
     for row_idx, (source_key, pol, _label) in enumerate(row_sources):
         for ant_idx in sparse_antennas:
             vis = np.asarray(context[source_key][ant_idx, pol], dtype=np.complex128)
@@ -4574,11 +4634,13 @@ def phacal_phase_compare_payload(
             annotation = None
             if row_idx == 0 and ant_idx in donor_patch_set:
                 annotation = "secondary donor ({0})".format(str(patch_methods[ant_idx]))
+            badge = _promoted_badge(ant_idx) if row_idx < 2 else None
             panels[row_idx][ant_idx] = {
                 "title": "Ant {0:d}".format(ant_idx + 1),
                 "annotation": annotation,
                 "disabled": False,
                 "series": series_list,
+                "header_badge": badge,
             }
     payload = _panel_grid_payload(
         "Refcal vs Phacal Phase",
@@ -4590,6 +4652,7 @@ def phacal_phase_compare_payload(
         panels,
         auto_scale_rows=False,
     )
+    payload["column_controls"] = _shared_column_controls(scan)
     payload["sparse_antennas"] = sparse_antennas
     return payload
 

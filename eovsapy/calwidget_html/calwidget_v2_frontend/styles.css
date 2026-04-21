@@ -1362,9 +1362,20 @@ button:disabled {
   fill: #24404c;
 }
 
+.mini-panel-badge {
+  font-size: 0.78rem;
+  font-weight: 700;
+  fill: #b65c00;
+  cursor: help;
+}
+
 .mini-annotation {
   font-size: 0.58rem;
   fill: #45606c;
+}
+
+.mini-plot-shell.selected-column .mini-plot {
+  box-shadow: inset 0 0 0 1.5px rgba(0, 113, 227, 0.55);
 }
 
 .mini-empty-label {
@@ -1800,6 +1811,15 @@ button:disabled {
 .panel-grid-column-control-text {
   pointer-events: none;
   user-select: none;
+}
+
+.panel-grid-column-control-badge {
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: #b65c00;
+  cursor: help;
+  user-select: none;
+  line-height: 1;
 }
 
 .panel-grid-column-control input {

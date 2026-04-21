@@ -44,6 +44,7 @@ from .calwidget_v2_analysis import (
     sql2refcalX,
     sql_phacal_to_scan,
     sql_refcal_to_scan,
+    sync_phacal_saved_products,
     ensure_phacal_solve_state,
     write_sidecar,
     yx_residual_threshold,
@@ -76,6 +77,7 @@ from .calwidget_v2_plots import (
     _phacal_residual_panel_meta,
     refresh_model_flag_state,
     refcal_compare_payload,
+    refcal_smooth_model_at_band_centers,
     relative_delay_editor_meta,
     render_heatmap,
     render_tab,
@@ -626,6 +628,18 @@ class WidgetSession:
         self.selected_ant = min(self.selected_ant, max(result.layout.nsolant - 1, 0))
         self.status_message = "Set scan {0} as canonical anchor refcal.".format(scan_id)
 
+    def clear_refcal(self) -> None:
+        """Clear the active canonical refcal (and secondary). Phacals that depend
+        on the current refcal are invalidated so the session returns to a state
+        where a new anchor can be chosen."""
+
+        self.secondary_ref_scan_id = None
+        self.staged_secondary_patch_antennas = []
+        self.secondary_patch_antennas = []
+        self._invalidate_analyzed_phacals()
+        self.ref_scan_id = None
+        self.status_message = "Cleared the canonical anchor refcal."
+
     def set_secondary_refcal(self, scan_id: Optional[int]) -> None:
         """Set or clear the optional same-feed secondary anchor."""
 
@@ -867,41 +881,9 @@ class WidgetSession:
             offset_raw = target_offset - float(state.auto_offset_rad[ant, pol])
             # wrap to (-π, π] matching the convention used by other edit paths
             state.applied_offset_rad[ant, pol] = float(np.angle(np.exp(1j * offset_raw)))
-        if ant == 12:
-            import sys
-            print(
-                "[SLOPEDIAG-post-set] ant={0} fallback_used={1} ant1_self_ref={2} "
-                "seed_delay_ns={3:.6f} seed_offset_rad={4:.6f} "
-                "auto_delay_ns={5} applied_delay_ns={6} "
-                "auto_offset_rad={7} applied_offset_rad={8}".format(
-                    ant,
-                    bool(state.fallback_used[ant]),
-                    bool(state.ant1_self_reference_used[ant]),
-                    target_delay, target_offset,
-                    np.asarray(state.auto_delay_ns[ant], dtype=float).tolist(),
-                    np.asarray(state.applied_delay_ns[ant], dtype=float).tolist(),
-                    np.asarray(state.auto_offset_rad[ant], dtype=float).tolist(),
-                    np.asarray(state.applied_offset_rad[ant], dtype=float).tolist(),
-                ),
-                file=sys.stderr, flush=True,
-            )
         # Re-run the plain solve so suggested_* reflects the residual between
         # the newly-set target line and the data (what M would apply on top).
         _solve_phacal_against_anchor(scan, refcal)
-        if ant == 12:
-            import sys
-            print(
-                "[SLOPEDIAG-post-solve2] ant={0} "
-                "auto_delay_ns={1} applied_delay_ns={2} "
-                "auto_offset_rad={3} applied_offset_rad={4}".format(
-                    ant,
-                    np.asarray(state.auto_delay_ns[ant], dtype=float).tolist(),
-                    np.asarray(state.applied_delay_ns[ant], dtype=float).tolist(),
-                    np.asarray(state.auto_offset_rad[ant], dtype=float).tolist(),
-                    np.asarray(state.applied_offset_rad[ant], dtype=float).tolist(),
-                ),
-                file=sys.stderr, flush=True,
-            )
         if scan.raw:
             scan.raw.pop("overview_payload_cache", None)
             scan.raw.pop("residual_diagnostics_cache", None)
@@ -2262,6 +2244,12 @@ class WidgetSession:
                 continue
             if analysis.mbd is None or analysis.mbd_flag is None or analysis.offsets is None:
                 continue
+            applied_ref_id = analysis.applied_ref_id if analysis.applied_ref_id is not None else ref_id
+            try:
+                anchor = self._ensure_refcal_analysis(int(applied_ref_id))
+            except CalWidgetV2Error:
+                anchor = refcal
+            sync_phacal_saved_products(analysis, anchor)
             payload = analysis.to_phacal_sql()
             phacal_payloads[int(scan_id)] = payload
             phacal_ids.append(int(scan_id))
@@ -2285,6 +2273,31 @@ class WidgetSession:
             "refcal__flag": np.asarray(ref_payload["flag"], dtype=np.int32),
             "refcal__sigma": np.asarray(ref_payload["sigma"], dtype=np.float64),
             "refcal__fghz": np.asarray(ref_payload["fghz"], dtype=np.float64),
+            "refcal__active_ns": np.asarray(
+                refcal.delay_solution.active_ns if refcal.delay_solution is not None else np.zeros((0, 2)),
+                dtype=np.float64,
+            ),
+            "refcal__per_band_delay_ns": np.asarray(
+                refcal.delay_solution.per_band_delay_ns if refcal.delay_solution is not None else np.zeros((0, 2, 0)),
+                dtype=np.float64,
+            ),
+            "refcal__per_band_phase0": np.asarray(
+                refcal.delay_solution.per_band_phase0 if refcal.delay_solution is not None else np.zeros((0, 2, 0)),
+                dtype=np.float64,
+            ),
+            "refcal__band_centers_ghz": np.asarray(
+                refcal.delay_solution.band_centers_ghz if refcal.delay_solution is not None else np.zeros(0),
+                dtype=np.float64,
+            ),
+            # Smooth analytic-fit phase per antenna/pol at each SQL band center
+            # (Chebyshev for Ant 1, polynomial for Ant 2+, absolute — Ant 2+
+            # adds back the reference model). Consumers overlay this on the
+            # band-averaged vis phase as a continuous fitted curve; the older
+            # per-band (phi0, delay) reconstruction wraps many times per band
+            # and is not a usable visual of the fit.
+            "refcal__model_pha": np.asarray(
+                refcal_smooth_model_at_band_centers(refcal), dtype=np.float64,
+            ),
             "refcal__promoted_antennas_json": np.asarray(
                 json.dumps(promoted_meta, separators=(",", ":"))
             ),
@@ -2606,6 +2619,17 @@ def build_app() -> FastAPI:
             scan, refcal = _overview_context(session)
             response["overview"] = overview_payloads(scan, refcal=refcal, use_lobe=session.use_lobe)
         return response
+
+    @app.post("/api/refcal/clear")
+    def clear_refcal(payload: SessionRequest) -> Dict:
+        """Clear the active refcal."""
+
+        session = _get_session(payload.session_id)
+        try:
+            session.clear_refcal()
+        except CalWidgetV2Error as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"state": session.state()}
 
     @app.post("/api/refcal/secondary")
     def select_secondary_refcal(payload: OptionalScanRequest) -> Dict:

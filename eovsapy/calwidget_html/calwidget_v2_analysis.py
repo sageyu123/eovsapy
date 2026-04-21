@@ -1315,6 +1315,10 @@ def _apply_feed_rotation(
     times, chi = db.get_chi(trange)
     if times is None or len(times) == 0:
         return vis
+    # eovsapy.dbutil.get_chi returns ParallacticAngle in degrees (via util.azel_from_sqldict
+    # which divides by dtor); legacy /repos/eovsa/dbutil.get_chi returns radians. Convert here
+    # so downstream trig and the Ant-4 wrap gate both operate in radians.
+    chi = np.deg2rad(chi)
     tchi = times.jd
     idx = nearest_val_idx(raw_out["time"], tchi)
     pa = chi[idx]
@@ -1513,6 +1517,8 @@ def _legacy_band_time_vis(raw_out: Dict[str, Any], layout: LayoutInfo, fix_drift
     if mjd <= Time("2025-07-15").mjd:
         trange = Time(raw_out["time"][[0, -1]], format="jd")
         times, chi = db.get_chi(trange)
+        # eovsapy.dbutil.get_chi returns degrees; convert to radians for PA trig below.
+        chi = np.deg2rad(chi)
         tchi = times.jd
         if len(raw_out["time"]) > 0:
             vis2 = deepcopy(vis)
@@ -1543,6 +1549,8 @@ def _legacy_band_time_vis(raw_out: Dict[str, Any], layout: LayoutInfo, fix_drift
     if mjd >= Time("2025-08-08").mjd:
         trange = Time(raw_out["time"][[0, -1]], format="jd")
         times, chi = db.get_chi(trange)
+        # eovsapy.dbutil.get_chi returns degrees; convert to radians for the Ant-4 wrap gate.
+        chi = np.deg2rad(chi)
         tchi = times.jd
         if len(raw_out["time"]) > 0:
             idx = nearest_val_idx(raw_out["time"], tchi)
